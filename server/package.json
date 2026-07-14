@@ -1,0 +1,17 @@
+{
+  "name": "fund-proxy-server",
+  "version": "1.0.0",
+  "type": "module",
+  "description": "tyingfund.com 后端代理服务 - 基金数据抓取与缓存",
+  "main": "server.mjs",
+  "scripts": {
+    "start": "node server.mjs",
+    "dev": "node --watch server.mjs",
+    "scrape": "node scrape-funds.mjs"
+  },
+  "dependencies": {
+    "express": "^4.21.0",
+    "http-proxy-middleware": "^3.0.0",
+    "node-cron": "^3.0.3"
+  }
+}

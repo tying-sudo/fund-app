@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <meta charset="UTF-8">
+  <title>测试重仓股数据</title>
+</head>
+<body>
+  <div id="result"></div>
+  <script>
+    async function test() {
+      const code = '018524';
+      const resultDiv = document.getElementById('result');
+      
+      try {
+        const curUrl = `https://fundf10.eastmoney.com/FundArchivesDatas.aspx?type=jjcc&code=${code}&topline=10&_=${Date.now()}`;
+        const s = document.createElement('script');
+        s.src = curUrl;
+        
+        s.onload = () => {
+          resultDiv.innerHTML += '<p>脚本加载成功</p>';
+          if (typeof apidata !== 'undefined') {
+            resultDiv.innerHTML += `<p>apidata 存在: ${JSON.stringify(apidata).substring(0, 500)}</p>`;
+          } else {
+            resultDiv.innerHTML += '<p>apidata 未定义</p>';
+          }
+        };
+        
+        s.onerror = () => {
+          resultDiv.innerHTML += '<p>脚本加载失败</p>';
+        };
+        
+        document.head.appendChild(s);
+      } catch(e) {
+        resultDiv.innerHTML += `<p>错误: ${e.message}</p>`;
+      }
+    }
+    test();
+  </script>
+</body>
+</html>

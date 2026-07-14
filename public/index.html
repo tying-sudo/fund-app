@@ -1,0 +1,4067 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=no">
+<title>基金估值助手</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+:root{--bg:#f0f2f5;--card:#fff;--text:#1a1a2e;--sub:#888;--red:#e74c3c;--green:#27ae60;--blue:#3498db;--border:#e8e8e8;--purple:#6c5ce7}
+body{font-family:-apple-system,BlinkMacSystemFont,"PingFang SC",sans-serif;background:var(--bg);color:var(--text);max-width:480px;margin:0 auto;min-height:100vh;overflow-x:hidden}
+
+/* 顶部资产卡片 */
+.header{padding:0;position:sticky;top:0;z-index:50}
+.asset-card{background:linear-gradient(135deg,#ff6b6b,#ee5a5a);border-radius:8px;padding:10px;color:#fff;margin:4px 8px;position:relative;box-shadow:0 4px 15px rgba(238,90,90,.3)}
+.asset-card:active{transform:scale(0.98);transition:transform .1s}
+.asset-label{font-size:11px;opacity:.9;margin-bottom:2px;letter-spacing:0.5px}
+.asset-amount{font-size:20px;font-weight:700;letter-spacing:-1px;margin-bottom:6px}
+.asset-row{display:flex;justify-content:space-between;margin-top:4px}
+.asset-item{flex:1;text-align:center}
+.asset-item-label{font-size:9px;opacity:.8;margin-bottom:1px}
+.asset-item-value{font-size:12px;font-weight:600}
+.asset-item-sub{font-size:9px;opacity:.8;margin-top:1px}
+
+/* 设置按钮 */
+.settings-btn{position:absolute;top:8px;right:36px;width:28px;height:28px;border-radius:50%;background:rgba(255,255,255,.2);border:none;color:#fff;font-size:14px;cursor:pointer;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(4px);transition:all .2s}
+.settings-btn:active{transform:scale(0.9);background:rgba(255,255,255,.3)}
+.settings-btn:hover{background:rgba(255,255,255,.3)}
+
+/* 刷新按钮 */
+.refresh-btn{position:absolute;top:8px;right:8px;width:28px;height:28px;border-radius:50%;background:rgba(255,255,255,.2);border:none;color:#fff;font-size:14px;cursor:pointer;display:flex;align-items:center;justify-content:center;backdrop-filter:blur(4px);transition:all .2s;animation:none}
+.refresh-btn:active{transform:scale(0.9);background:rgba(255,255,255,.3)}
+.refresh-btn:hover{background:rgba(255,255,255,.3)}
+.refresh-btn.spinning{animation:spin 1s linear infinite}
+@keyframes spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}
+
+
+
+
+
+/* 输入区 */
+.input-area{background:var(--card);padding:4px 10px;border-bottom:1px solid var(--border)}
+.input-row{display:flex;gap:4px;align-items:center}
+.input-row input{flex:1;padding:4px 6px;border:1px solid var(--border);border-radius:4px;font-size:11px;outline:none}
+.input-row input:focus{border-color:var(--blue);background:#fff}
+.btn-sm{padding:4px 10px;border:none;border-radius:4px;font-size:11px;font-weight:600;cursor:pointer;background:var(--blue);color:#fff;white-space:nowrap}
+.btn-sm:active{opacity:.85;transform:scale(0.97)}
+.ctrl-row{display:flex;justify-content:space-between;align-items:center;margin-top:2px}
+.ctrl-left{display:flex;align-items:center}
+.ctrl-right{display:flex;align-items:center;gap:6px}
+.ctrl-select{padding:3px 6px;border:1px solid var(--border);border-radius:4px;font-size:10px;background:var(--card);cursor:pointer;color:var(--text);appearance:none;-webkit-appearance:none;background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6'%3E%3Cpath d='M0 0l5 6 5-6z' fill='%23888'/%3E%3C/svg%3E");background-repeat:no-repeat;background-position:right 4px center;padding-right:16px;min-width:60px}
+.ctrl-select:focus{outline:none;border-color:var(--blue)}
+.ctrl-btn{padding:3px 8px;border:1px solid var(--border);border-radius:4px;font-size:10px;background:var(--card);cursor:pointer;color:var(--text)}
+.ctrl-btn.active{background:var(--blue);color:#fff;border-color:var(--blue)}
+.ctrl-label{font-size:10px;color:var(--sub)}
+
+/* 加载条 */
+.loading-bar{text-align:center;padding:3px;font-size:10px;color:var(--sub);background:var(--card);border-bottom:1px solid var(--border);display:none}
+.loading-bar.show{display:block}
+
+/* 基金卡片 - 横向布局 */
+.list-header{display:flex;align-items:center;padding:6px 10px;font-size:10px;color:var(--sub);border-bottom:1px solid var(--border);margin:0 6px}
+.lh-name{flex:1;min-width:0;font-weight:500}
+.lh-center{text-align:right;flex-shrink:0;font-weight:500}
+.lh-right{text-align:right;flex-shrink:0;min-width:70px;font-weight:500}
+.fund-list{padding:2px 6px}
+.fund-card-wrap{position:relative;margin-bottom:3px;overflow:hidden;border-radius:6px}
+.fund-card{background:var(--card);border-radius:6px;padding:8px 10px;box-shadow:0 1px 2px rgba(0,0,0,.04);display:flex;align-items:center;justify-content:space-between;gap:4px;position:relative;z-index:2;transition:transform .25s ease;-webkit-user-select:none;user-select:none}
+.fund-card.swiping{transition:none}
+/* 左滑操作按钮 */
+.fc-actions{position:absolute;top:0;right:0;height:100%;display:flex;z-index:1}
+.fc-action{height:100%;display:flex;align-items:center;justify-content:center;font-size:10px;color:#fff;border:none;cursor:pointer;padding:0 14px;font-weight:600}
+.fc-action.edit{background:var(--blue)}
+.fc-action.trade{background:var(--purple)}
+.fc-action.delete{background:var(--red)}
+/* 左滑菜单中的上下箭头容器 */
+.sort-btns{display:flex;flex-direction:column;height:100%}
+.fc-action.move-up,.fc-action.move-down{background:#666;font-size:12px;padding:0 10px;flex:1;border:none;color:#fff;cursor:pointer}
+.fc-action.move-up:disabled,.fc-action.move-down:disabled{opacity:.3;cursor:default}
+
+.fc-left{flex:1;min-width:0}
+.fc-name{font-size:12px;font-weight:600;line-height:1.2;width:8em;min-width:8em;max-width:8em;display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;word-break:break-all}
+.fc-code{font-size:10px;color:var(--sub);margin-top:1px;display:inline-block;padding:0 3px;border-radius:2px;cursor:pointer}
+.fc-code:active{background:rgba(52,152,219,.15)}
+.fc-center{text-align:right;flex-shrink:0}
+.fc-amount{font-size:12px;font-weight:600}
+.fc-amount-sub{font-size:10px;margin-top:1px}
+.fc-right{text-align:right;flex-shrink:0;min-width:75px}
+.fc-profit{font-size:12px;font-weight:700;padding:3px 6px;border-radius:3px;display:inline-block}
+.fc-profit.up{background:rgba(231,76,60,.12);color:var(--red)}
+.fc-profit.down{background:rgba(39,174,96,.12);color:var(--green)}
+.fc-profit-pct{font-size:9px;margin-top:1px}
+
+/* 调仓区 - 简化 */
+
+/* 走势图 */
+.chart-wrap{margin-top:6px;background:var(--bg);border-radius:4px;padding:6px;position:relative}
+.chart-wrap canvas{width:100%;height:120px;display:block}
+.chart-legend{display:flex;justify-content:center;gap:12px;margin-top:3px;font-size:9px;color:var(--sub)}
+
+/* FAB */
+.fab{position:fixed;bottom:12px;right:12px;width:36px;height:36px;border-radius:50%;background:linear-gradient(135deg,#667eea,#764ba2);color:#fff;font-size:20px;display:flex;align-items:center;justify-content:center;box-shadow:0 3px 10px rgba(102,126,234,.4);cursor:pointer;z-index:100;border:none}
+
+.fab:active{transform:scale(0.92)}
+
+/* 弹窗 */
+.overlay{display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:200;align-items:flex-end;justify-content:center}
+.overlay.show{display:flex}
+.sheet{background:var(--card);width:100%;max-width:480px;border-radius:10px 10px 0 0;padding:12px 10px 16px;max-height:85vh;overflow-y:auto}
+.sheet-title{font-size:13px;font-weight:700;margin-bottom:10px;display:flex;justify-content:space-between;align-items:center}
+.sheet-close{font-size:18px;cursor:pointer;color:var(--sub);background:none;border:none}
+
+.fg{margin-bottom:8px}
+.fl{font-size:10px;color:var(--sub);margin-bottom:3px;display:block}
+.fi2{width:100%;padding:5px 6px;border:1px solid var(--border);border-radius:4px;font-size:11px;outline:none}
+.fi2:focus{border-color:var(--blue)}
+.frow{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.brow{display:flex;gap:6px;margin-top:10px}
+.btn{flex:1;padding:6px;border:none;border-radius:5px;font-size:11px;font-weight:600;cursor:pointer}
+.btn-cancel{background:var(--bg);color:var(--sub)}
+
+.btn-ok{background:linear-gradient(135deg,#667eea,#764ba2);color:#fff}
+
+
+/* 日历弹窗 */
+.cal-grid{display:grid;grid-template-columns:repeat(7,1fr);gap:0;text-align:center}
+.cal-head{font-size:9px;color:var(--sub);padding:3px 0}
+.cal-day{padding:4px 0;font-size:10px;border-radius:3px;cursor:pointer}
+.cal-day:hover{background:var(--bg)}
+.cal-day.today{background:var(--blue);color:#fff;font-weight:600}
+.cal-day.selected{background:var(--purple);color:#fff}
+.cal-day.other{color:#ccc}
+.cal-nav{display:flex;justify-content:space-between;align-items:center;margin-bottom:4px}
+.cal-nav .month{font-size:12px;font-weight:600}
+.cal-nav button{background:none;border:none;font-size:14px;cursor:pointer;padding:2px 4px}
+
+
+/* 颜色 */
+.up{color:var(--red)}.down{color:var(--green)}.neutral{color:var(--sub)}
+
+/* 提示 */
+.toast{position:fixed;top:10px;left:50%;transform:translateX(-50%) translateY(-50px);background:rgba(0,0,0,.8);color:#fff;padding:5px 12px;border-radius:12px;font-size:10px;z-index:300;transition:transform .3s;max-width:200px;text-align:center}
+.toast.show{transform:translateX(-50%) translateY(0)}
+
+/* 空状态 */
+.empty{text-align:center;padding:30px 16px;color:var(--sub)}
+.empty-icon{font-size:36px;margin-bottom:8px}
+.empty-txt{font-size:11px}
+
+/* 旧的 fc-acts 已被 fc-actions 替代 */
+
+/* 基金详情页 */
+.detail-mask{position:fixed;top:0;left:0;right:0;bottom:0;background:rgba(0,0,0,.5);z-index:999;display:none;opacity:0;transition:opacity .3s}
+.detail-mask.show{display:flex;opacity:1;align-items:flex-end}
+.detail-panel{width:100%;max-height:90vh;background:var(--card);border-radius:10px 10px 0 0;overflow-y:auto;transform:translateY(100%);transition:transform .3s}
+.detail-mask.show .detail-panel{transform:translateY(0)}
+.detail-header{position:sticky;top:0;background:var(--card);padding:8px 10px;border-bottom:1px solid var(--border);display:flex;justify-content:space-between;align-items:center;z-index:1}
+.detail-close{width:24px;height:24px;border-radius:50%;background:var(--bg);border:none;font-size:16px;cursor:pointer;display:flex;align-items:center;justify-content:center}
+
+.detail-body{padding:10px}
+.detail-title{font-size:14px;font-weight:600;margin-bottom:2px}
+.detail-code{font-size:10px;color:var(--sub);margin-bottom:8px;display:inline-block;padding:1px 3px;border-radius:2px;cursor:pointer}
+.detail-code:active{background:rgba(52,152,219,.15)}
+.detail-section{margin-bottom:12px}
+.detail-section-title{font-size:12px;font-weight:600;margin-bottom:6px;padding-bottom:3px;border-bottom:2px solid var(--blue)}
+.section-arrow{display:inline-block;transition:transform 0.2s;font-size:14px;color:var(--sub)}
+.trend-tab{flex:1;padding:8px 0;border:none;background:transparent;font-size:12px;color:var(--sub);cursor:pointer;border-bottom:2px solid transparent;transition:all 0.2s}
+.trend-tab.active{color:var(--blue);border-bottom-color:var(--blue);font-weight:600}
+.detail-grid{display:grid;grid-template-columns:1fr 1fr;gap:6px}
+.detail-item{background:var(--bg);border-radius:4px;padding:6px}
+.detail-item-label{font-size:9px;color:var(--sub);margin-bottom:1px}
+.detail-item-value{font-size:11px;font-weight:600}
+.detail-item-value.red{color:var(--red)}
+.detail-item-value.green{color:var(--green)}
+.holding-bar{height:12px;background:#eee;border-radius:2px;overflow:hidden;margin-top:3px}
+.holding-bar-fill{height:100%;border-radius:3px;transition:width .3s}
+.manager-tag{display:inline-block;padding:1px 5px;background:var(--blue);color:#fff;border-radius:2px;font-size:9px;margin-right:3px;margin-bottom:2px}
+.detail-loading{text-align:center;padding:20px;color:var(--sub)}
+.detail-loading .spinner{width:16px;height:16px;border:2px solid #eee;border-top-color:var(--blue);border-radius:50%;animation:spin .8s linear infinite;margin:0 auto 8px}
+@keyframes spin{to{transform:rotate(360deg)}}
+.detail-action-btn{padding:2px 6px;border:1px solid var(--border);border-radius:3px;font-size:10px;background:var(--card);cursor:pointer;color:var(--text)}
+
+.detail-action-btn.delete{color:var(--red);border-color:var(--red)}
+
+.clickable{cursor:pointer}
+.clickable:active{background:var(--border)!important}
+
+
+
+</style>
+</head>
+<body>
+
+<div class="header">
+  <div class="asset-card" id="assetCard">
+    <button class="refresh-btn" onclick="manualRefresh()" title="刷新">↻</button>
+<button class="settings-btn" onclick="openSettings()" title="设置">⚙</button>
+    <div class="asset-label">总资产</div>
+    <div class="asset-amount" id="totalValue">--</div>
+    <div class="asset-row">
+      <div class="asset-item">
+        <div class="asset-item-label">持有收益</div>
+        <div class="asset-item-value" id="totalProfit">--</div>
+        <div class="asset-item-sub" id="totalProfitPct">--</div>
+      </div>
+      <div class="asset-item">
+        <div class="asset-item-label">昨日收益</div>
+        <div class="asset-item-value" id="yesterdayProfit">--</div>
+      </div>
+      <div class="asset-item">
+        <div class="asset-item-label">当日收益</div>
+        <div class="asset-item-value" id="todayProfit">--</div>
+        <div class="asset-item-sub" id="todayProfitPct">--</div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 控制栏 -->
+<div class="input-area">
+  <div class="ctrl-row">
+    <div class="ctrl-left">
+      <span style="font-size:13px;color:#666;">基金列表</span>
+    </div>
+    <div class="ctrl-right">
+            <select class="ctrl-select" id="sortSelect" onchange="setSort(this.value)">
+        <option value="custom">自定义排序</option>
+        <option value="profit">持有收益</option>
+        <option value="profitPct">持有收益率</option>
+        <option value="amount">金额</option>
+        <option value="dayProfit">日收益</option>
+        <option value="dayPct">日收益率</option>
+        <option value="time">更新时间</option>
+      </select>
+      <select class="ctrl-select" id="typeSelect" onchange="setTypeFilter(this.value)">
+        <option value="all">类型</option>
+        <option value="stock">偏股</option>
+        <option value="bond">偏债</option>
+        <option value="index">指数</option>
+        <option value="gold">黄金</option>
+        <option value="global">全球</option>
+      </select>
+    </div>
+  </div>
+</div>
+
+<div class="loading-bar" id="loadingBar">● 正在获取实时估值...</div>
+<div class="list-header">
+    <div class="lh-name">基金</div>
+  <div class="lh-center">持仓金额/最新收益</div>
+  <div class="lh-right">持有收益/率</div>
+  <div class="lh-right">当日收益/率</div>
+</div>
+<div class="fund-list" id="fundList"></div>
+
+<!-- 添加/调仓弹窗 -->
+<div class="overlay" id="addSheet">
+  <div class="sheet">
+    <div class="sheet-title">
+      <span id="sheetTitle">添加基金</span>
+      <button class="sheet-close" onclick="closeSheet('addSheet')">×</button>
+    </div>
+    <div class="fg">
+      <label class="fl">基金代码</label>
+      <input class="fi2" id="sCode" placeholder="6位数字" inputmode="numeric" maxlength="6">
+    </div>
+    <div class="frow">
+      <div class="fg">
+        <label class="fl">持有份额</label>
+        <input class="fi2" id="sShares" placeholder="份" inputmode="decimal" oninput="calcAmount('shares')">
+      </div>
+      <div class="fg">
+        <label class="fl">成本价 (元/份)</label>
+        <input class="fi2" id="sCost" placeholder="买入均价" inputmode="decimal" oninput="calcAmount('cost')">
+      </div>
+    </div>
+    <div class="frow">
+      <div class="fg">
+        <label class="fl">持仓金额 (元)</label>
+        <input class="fi2" id="sAmount" placeholder="自动计算或手动输入" inputmode="decimal" oninput="calcAmount('amount')">
+      </div>
+            <div class="fg">
+        <label class="fl">买入日期</label>
+        <input class="fi2" id="sDate" type="date" onchange="onAddDateChange()">
+      </div>
+    </div>
+    <div class="brow">
+      <button class="btn btn-cancel" onclick="closeSheet('addSheet')">取消</button>
+      <button class="btn btn-ok" onclick="saveFund()">保存</button>
+    </div>
+  </div>
+</div>
+
+<!-- 调仓弹窗 -->
+<div class="overlay" id="tradeSheet">
+  <div class="sheet">
+    <div class="sheet-title">
+      <span>调仓记录</span>
+      <button class="sheet-close" onclick="closeSheet('tradeSheet')">×</button>
+    </div>
+    <div id="tradeFundName" style="font-size:14px;font-weight:600;margin-bottom:12px"></div>
+    <div id="tradeNV" style="font-size:11px;color:var(--sub);margin-bottom:10px">当前净值: --</div>
+    <div class="frow">
+      <div class="fg">
+        <label class="fl">类型</label>
+        <select class="fi2" id="tType" onchange="toggleTradeType()">
+          <option value="buy">买入</option>
+          <option value="sell">卖出</option>
+        </select>
+      </div>
+            <div class="fg">
+        <label class="fl">日期</label>
+        <input class="fi2" id="tDate" type="date" onchange="onTradeDateChange()">
+      </div>
+    </div>
+        <div id="tradeBuyFields">
+      <div class="fg">
+        <label class="fl">买入金额 (元)</label>
+        <input class="fi2" id="tAmount" placeholder="输入金额自动计算份额" inputmode="decimal" oninput="calcTradeAmount()">
+      </div>
+      <div class="fg" style="display:flex;align-items:center;gap:6px;margin-top:4px">
+        <input type="checkbox" id="tAfter15" style="width:14px;height:14px">
+        <label for="tAfter15" style="font-size:11px;color:#888;cursor:pointer">15:00后买入（T+2确认）</label>
+      </div>
+    </div>
+    <div id="tradeSellFields" style="display:none">
+      <div class="fg">
+        <label class="fl">卖出份额</label>
+        <input class="fi2" id="tSellShares" placeholder="输入份额" inputmode="decimal" oninput="calcTradeAmount()">
+      </div>
+    </div>
+    <div class="frow">
+      <div class="fg">
+        <label class="fl">份额</label>
+        <input class="fi2" id="tShares" placeholder="自动计算" inputmode="decimal" readonly style="background:#f5f5f5">
+      </div>
+      <div class="fg">
+        <label class="fl">净值 (元/份)</label>
+        <input class="fi2" id="tNav" placeholder="成交净值" inputmode="decimal" oninput="calcTradeAmount()">
+      </div>
+    </div>
+        <div style="display:flex;flex-direction:column;gap:6px;margin:8px 0;padding:8px;background:#f8f9fa;border-radius:6px">
+    <div style="display:flex;align-items:center;gap:6px">
+      <input type="checkbox" id="tLogRecord" checked style="width:15px;height:15px;accent-color:#5b7bf7">
+      <label for="tLogRecord" style="font-size:12px;color:#555;cursor:pointer">✓ 记录到调仓记录</label>
+    </div>
+    <div style="display:flex;align-items:center;gap:6px">
+      <input type="checkbox" id="tPickDate" style="width:15px;height:15px;accent-color:#5b7bf7">
+      <label for="tPickDate" style="font-size:12px;color:#555;cursor:pointer">📅 选择买入日期（用于成本计算）</label>
+    </div>
+  </div>
+    <div style="font-size:11px;color:#888;margin:8px 0" id="tradeHint">输入金额后自动按净值计算份额 · 15:00后买入收益计算延后一个交易日</div>
+    <div class="brow">
+      <button class="btn btn-cancel" onclick="closeSheet('tradeSheet')">取消</button>
+      <button class="btn btn-ok" onclick="saveTrade()">记录</button>
+    </div>
+    <div id="tradeHistory" style="margin-top:16px"></div>
+  </div>
+</div>
+
+<!-- 日历弹窗 -->
+<div class="overlay" id="calSheet">
+  <div class="sheet">
+    <div class="sheet-title">
+      <span>选择日期</span>
+      <button class="sheet-close" onclick="closeSheet('calSheet')">×</button>
+    </div>
+    <div class="cal-nav">
+      <button onclick="calNav(-1)">‹</button>
+      <span class="month" id="calMonth"></span>
+      <button onclick="calNav(1)">›</button>
+    </div>
+    <div class="cal-grid" id="calGrid"></div>
+    <div style="text-align:center;margin-top:12px">
+      <button class="btn btn-ok" style="max-width:160px" onclick="closeSheet('calSheet')">回到今天</button>
+    </div>
+  </div>
+</div>
+
+<div class="overlay" id="editSheet">
+  <div class="sheet">
+    <div class="sheet-title"><span>编辑持仓</span><button class="sheet-close" onclick="closeSheet('editSheet')">×</button></div>
+    <div id="eFN" style="font-size:14px;font-weight:600;margin-bottom:12px;color:var(--blue)"></div>
+    <div id="eNV" style="font-size:11px;color:var(--sub);margin-bottom:10px">当前净值: --</div>
+    <div class="fg">
+      <label class="fl">持仓金额 (元)</label>
+      <input class="fi2" id="eAm" placeholder="输入金额自动计算份额" inputmode="decimal" oninput="calcEditAmount('amount')">
+    </div>
+    <div class="frow">
+      <div class="fg"><label class="fl">持有份额</label><input class="fi2" id="eSh" inputmode="decimal" oninput="calcEditAmount('shares')"></div>
+      <div class="fg"><label class="fl">成本价</label><input class="fi2" id="eCo" inputmode="decimal" oninput="calcEditAmount('cost')"></div>
+    </div>
+        <div class="fg">
+      <label class="fl">买入日期</label>
+      <input class="fi2" id="eDa" type="date" onchange="onEditDateChange()">
+    </div>
+    <div style="font-size:11px;color:#888;margin:8px 0" id="editDateHint">选择日期后自动获取净值</div>
+    <div class="brow"><button class="btn btn-cancel" onclick="closeSheet('editSheet')">取消</button><button class="btn btn-ok" onclick="saveEdit()">保存</button></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<!-- 设置弹窗 -->
+<div class="overlay" id="settingsSheet">
+  <div class="sheet">
+    <div class="sheet-title">
+      <span>设置</span>
+      <button class="sheet-close" onclick="closeSheet('settingsSheet')">×</button>
+    </div>
+    <div style="padding:10px 0">
+      <div style="font-size:12px;font-weight:600;margin-bottom:12px;color:var(--text)">缓存管理</div>
+      <div style="display:flex;flex-direction:column;gap:10px">
+        <button class="btn btn-ok" onclick="clearAppCache()" style="flex:none;padding:10px 16px;font-size:12px;text-align:left;display:flex;align-items:center;gap:8px">
+          <span style="font-size:16px">🗑️</span>
+          <div>
+            <div style="font-weight:600">清除App缓存</div>
+            <div style="font-size:10px;opacity:.8;margin-top:2px">清除本地存储的基金数据和设置</div>
+          </div>
+        </button>
+        <button class="btn btn-ok" onclick="clearApiCache()" style="flex:none;padding:10px 16px;font-size:12px;text-align:left;display:flex;align-items:center;gap:8px;background:linear-gradient(135deg,#27ae60,#2ecc71)">
+          <span style="font-size:16px">🔄</span>
+          <div>
+            <div style="font-weight:600">清除接口缓存</div>
+            <div style="font-size:10px;opacity:.8;margin-top:2px">清除内存中的基金净值缓存，下次刷新重新获取</div>
+          </div>
+        </button>
+      </div>
+      <div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border)">
+        <div style="font-size:12px;font-weight:600;margin-bottom:8px;color:var(--text)">关于</div>
+        <div style="font-size:11px;color:var(--sub);line-height:1.6">
+          <div>基金估值助手 v1.0</div>
+          <div>数据来源：天天基金</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>
+
+<!-- 基金详情页 -->
+<div class="detail-mask" id="detailMask" onclick="if(event.target===this)closeDetail()">
+  <div class="detail-panel">
+    <div class="detail-header">
+      <div>
+        <div class="detail-title" id="detailTitle">--</div>
+        <div class="detail-code" id="detailCode" onclick="openJdFinance(currentDetailCode)" style="cursor:pointer;color:var(--blue)">--</div>
+      </div>
+      <div style="display:flex;gap:6px;align-items:center">
+        <button class="detail-action-btn" id="detailEditBtn" onclick="toggleDetailEdit()">编辑</button>
+                <button class="detail-action-btn" onclick="closeDetail();openTradeSheet(currentDetailCode)">调仓</button>
+        <button class="detail-action-btn delete" onclick="deleteFund(currentDetailCode);closeDetail()">删除</button>
+        <button class="detail-close" onclick="closeDetail()">×</button>
+      </div>
+    </div>
+    <div class="detail-body" id="detailBody">
+      <div class="detail-loading"><div class="spinner"></div>加载中...</div>
+    </div>
+    <!-- 内联编辑表单 -->
+    <div class="detail-edit-form" id="detailEditForm" style="display:none;padding:12px;border-top:1px solid var(--border)">
+      <div style="font-size:12px;font-weight:600;margin-bottom:10px">编辑持仓</div>
+      <div id="deNV" style="font-size:11px;color:var(--sub);margin-bottom:10px">当前净值: --</div>
+      <div class="fg">
+        <label class="fl">持仓金额 (元)</label>
+        <input class="fi2" id="deAmount" placeholder="输入金额自动计算份额" inputmode="decimal" oninput="calcDetailAmount('amount')">
+      </div>
+      <div class="frow">
+        <div class="fg">
+          <label class="fl">持有份额</label>
+          <input class="fi2" id="deShares" placeholder="持有份额" inputmode="decimal" oninput="calcDetailAmount('shares')">
+        </div>
+        <div class="fg">
+          <label class="fl">成本价 (元/份)</label>
+          <input class="fi2" id="deCost" placeholder="成本价" inputmode="decimal" oninput="calcDetailAmount('cost')">
+        </div>
+      </div>
+      <div class="fg">
+        <label class="fl">买入日期</label>
+        <input class="fi2" id="deDate" type="date">
+      </div>
+      <div style="font-size:11px;color:#888;margin:8px 0">输入金额后自动按当前净值计算份额</div>
+      <div style="display:flex;gap:8px;margin-top:12px">
+        <button class="btn btn-cancel" onclick="toggleDetailEdit()" style="flex:1">取消</button>
+        <button class="btn btn-ok" onclick="saveDetailEdit()" style="flex:1">保存</button>
+      </div>
+    </div>
+  </div>
+</div>
+
+<script>
+// ==========================================
+// 全局状态
+// ==========================================
+const STORE_KEY = 'fund_v3';
+let fundDataCache = {};    // {code: {fundcode,name,jzrq,dwjz,gsz,gszzl,gztime}}
+let sortMode = 'custom';     // custom | profit | profitPct | amount | dayProfit | dayPct | time
+let typeFilterMode = 'all';  // all | stock | bond | index | gold | global
+let editingFund = null;    // 当前编辑调仓的基金code
+let calYear, calMonth, calOnPick;
+// ==========================================
+// JSONP 串行请求队列（主源 + 备用源）
+// ==========================================
+const _fetchQueue = [];
+let _fetchRunning = false;
+
+// 主源：天天基金实时估值
+function _fetchPrimary(code) {
+  return new Promise((resolve) => {
+    const t = setTimeout(() => { _cleanup(); resolve(null); }, 4000);
+    let s;
+    function _cleanup() {
+      try { delete window.jsonpgz; } catch(e) { window.jsonpgz = undefined; }
+      try { if (s && s.parentNode) s.parentNode.removeChild(s); } catch(e) {}
+    }
+    window.jsonpgz = (d) => {
+      clearTimeout(t);
+      _cleanup();
+      resolve(d);
+    };
+    s = document.createElement('script');
+    s.src = `https://fundgz.1234567.com.cn/js/${code}.js?rt=${Date.now()}`;
+    s.onerror = () => { clearTimeout(t); _cleanup(); resolve(null); };
+    document.head.appendChild(s);
+  });
+}
+
+// 备用源：天天基金移动端 API（JSONP）
+function _fetchBackup(code) {
+  return new Promise((resolve) => {
+    const cb = `_backupFundCb_${Date.now()}`;
+    const t = setTimeout(() => { _cleanup(); resolve(null); }, 4000);
+    let s;
+    function _cleanup() {
+      try { delete window[cb]; } catch(e) { window[cb] = undefined; }
+      try { if (s && s.parentNode) s.parentNode.removeChild(s); } catch(e) {}
+    }
+    window[cb] = (d) => {
+      clearTimeout(t);
+      _cleanup();
+      let arr = d;
+      if (d && d.Datas) arr = d.Datas;
+      if (Array.isArray(arr) && arr.length > 0) {
+        const item = arr[0];
+        resolve({
+          fundcode: item.FCODE,
+          name: item.SHORTNAME,
+          jzrq: item.PDATE,
+          dwjz: item.NAV,
+          gsz: item.GSZ || item.NAV,
+          gszzl: item.GSZZL || item.NAVCHGRT || '0',
+          gztime: item.GZTIME || item.PDATE
+        });
+      } else {
+        resolve(null);
+      }
+    };
+    s = document.createElement('script');
+    s.src = `https://fundmobapi.eastmoney.com/FundMNewApi/FundMNFInfo?pageIndex=1&pageSize=1&plat=Android&appType=ttjj&product=EFund&Version=1&deviceid=openclaw&Fcodes=${code}&callback=${cb}`;
+    s.onerror = () => { clearTimeout(t); _cleanup(); resolve(null); };
+    document.head.appendChild(s);
+  });
+}
+
+function _processQueue() {
+  if (_fetchRunning || _fetchQueue.length === 0) return;
+  _fetchRunning = true;
+  const { code, resolve } = _fetchQueue.shift();
+
+  _fetchPrimary(code).then(d => {
+    if (d && d.fundcode) { _fetchRunning = false; resolve(d); _processQueue(); return; }
+    _fetchBackup(code).then(b => {
+      _fetchRunning = false;
+      resolve(b);
+      _processQueue();
+    });
+  });
+}
+
+function fetchOne(code) {
+  return new Promise((resolve) => {
+    _fetchQueue.push({ code, resolve });
+    _processQueue();
+  });
+}
+
+async function fetchAll(codes) {
+  const results = {};
+  const promises = codes.map(async code => {
+    const d = await fetchOne(code);
+    if (d && d.fundcode) {
+      results[code] = {
+        fundcode: d.fundcode, name: d.name, jzrq: d.jzrq,
+        dwjz: +d.dwjz, gsz: +d.gsz, gszzl: +d.gszzl, gztime: d.gztime
+      };
+    }
+  });
+  
+  const checker = setInterval(() => {
+    const done = Object.keys(results).length;
+    document.getElementById('loadingBar').textContent = `● 已获取 ${done}/${codes.length} 只基金...`;
+    if (done >= codes.length) clearInterval(checker);
+  }, 100);
+  
+  await Promise.allSettled(promises);
+  clearInterval(checker);
+  return results;
+}
+
+// ==========================================
+// 持仓存储
+// ==========================================
+function loadPf() { return JSON.parse(localStorage.getItem(STORE_KEY) || '[]'); }
+function savePf(d) { localStorage.setItem(STORE_KEY, JSON.stringify(d)); }
+
+// ==========================================
+// 计算（修复操作收益计算）
+// ==========================================
+// 判断今天是否是交易日（周一到周五，简单判断）
+function isTodayTradingDay() {
+  const now = new Date();
+  const day = now.getDay(); // 0=Sun, 1=Mon, ..., 6=Sat
+  return day >= 1 && day <= 5; // 周一到周五
+}
+
+// 获取下一个交易日
+function getNextTradingDay(d) {
+  const next = new Date(d);
+  next.setDate(next.getDate() + 1);
+  const day = next.getDay();
+  // 跳过周末
+  if (day === 0) next.setDate(next.getDate() + 1); // 周日 → 周一
+  if (day === 6) next.setDate(next.getDate() + 2); // 周六 → 周一
+  return next;
+}
+
+// 计算基金买入的收益开始计算日期
+// 规则：
+// - 15:00前买入：按当日净值确认，次日(T+1)开始计算收益
+// - 15:00后买入：按次日净值确认，后日(T+2)开始计算收益
+//   周五15:00后 → 周一确认，周二计算收益
+//   周六/周日买入 → 周一确认，周二计算收益
+function getProfitStartDate(dateStr, after15) {
+  const d = new Date(dateStr + 'T00:00:00');
+  const day = d.getDay(); // 0=Sun, 1=Mon, ..., 6=Sat
+
+  if (after15) {
+    // 15:00后买入：按次日净值确认，后日(T+2)开始计算收益
+    // 先找确认日（次日净值），再找收益开始日（确认日的下一个交易日）
+    let confirmNavDay = getNextTradingDay(d); // 次日净值
+    return getNextTradingDay(confirmNavDay);   // 后日开始计算收益
+  } else {
+    // 15:00前买入：按当日净值确认，次日(T+1)开始计算收益
+    return getNextTradingDay(d);
+  }
+}
+
+function calcFund(h, fd) {
+  if (!fd) return null;
+  const trades = h.trades || [];
+
+    // 计算已确认份额：只有份额确认后才计入当日收益
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const sortedTrades = [...trades].sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+  let confirmedShares = 0;
+  let confirmedCost = 0;
+  sortedTrades.forEach(t => {
+    if (!t.date) return;
+    const profitStart = getProfitStartDate(t.date, t.after15);
+    if (t.type === 'buy') {
+      if (today >= profitStart) {
+        confirmedShares += t.shares;
+        confirmedCost += t.nav * t.shares;
+      }
+    } else if (t.type === 'sell') {
+      if (today >= profitStart) {
+        confirmedShares = Math.max(0, confirmedShares - t.shares);
+      }
+    }
+  });
+
+    // 无交易记录时默认全部已确认（兼容旧数据）
+  if (trades.length === 0) {
+    // 如果shares为0但有holdAmount，用holdAmount/nav计算
+    let shares = h.shares || 0;
+    let costPer = h.costPer || 0;
+    if (shares === 0 && h.holdAmount > 0) {
+      const nav = fd.gsz || fd.dwjz || 0;
+      if (nav > 0) {
+        shares = h.holdAmount / nav;
+        if (costPer === 0) costPer = nav;
+      }
+    }
+    confirmedShares = shares;
+    confirmedCost = costPer * shares;
+  }
+
+    // 计算全部份额（含未确认）用于显示
+  let allShares = 0;
+  let allCost = 0;
+  sortedTrades.forEach(t => {
+    if (t.type === 'buy') {
+      allShares += t.shares;
+      allCost += t.nav * t.shares;
+    } else if (t.type === 'sell') {
+      allShares = Math.max(0, allShares - t.shares);
+      allCost -= t.nav * t.shares;
+    }
+  });
+  if (sortedTrades.length === 0) {
+    allShares = confirmedShares;
+    allCost = confirmedCost;
+  }
+
+  // 使用全部份额计算持仓金额和收益（显示用）
+  // 收益计算仅使用已确认份额（避免未确认份额显示虚假收益）
+  const totalCost = confirmedCost;
+  const curVal = fd.gsz * confirmedShares;
+  const profit = curVal - totalCost;
+  const profitPct = totalCost > 0 ? profit / totalCost * 100 : 0;
+
+  // 显示用全部份额的持仓金额（含未确认）
+  // 持仓金额：已确认份额用市值，未确认份额用成本（避免显示虚假盈亏）
+  // 持仓金额：已确认份额用市值，未确认份额用成本（避免显示虚假盈亏）
+  const displayValue = Math.round((confirmedShares > 0 ? fd.gsz * confirmedShares : allCost) * 100) / 100;
+  const dayPct = fd.gszzl || 0;
+
+  // 非交易日当日收益为0（当日收益仍使用已确认份额）
+  const dayProfit = isTodayTradingDay() && confirmedShares > 0 ? (fd.gsz - fd.dwjz) * confirmedShares : 0;
+  
+  // 修复：操作收益使用每笔交易的实际成本计算
+  let opProfit = 0;
+  // 计算加权平均成本历史
+  let runningShares = 0;
+  let runningCost = 0;
+  trades.forEach(t => {
+    if (t.type === 'buy') {
+      runningCost += t.nav * t.shares;
+      runningShares += t.shares;
+    } else if (t.type === 'sell') {
+      const avgCost = runningShares > 0 ? runningCost / runningShares : h.costPer;
+      opProfit += (t.nav - avgCost) * t.shares;
+      runningCost = Math.max(0, runningCost - avgCost * t.shares);
+      runningShares = Math.max(0, runningShares - t.shares);
+    }
+  });
+  
+      // 计算持有天数
+  let holdDays = 0;
+  if (h.buyDate) {
+    const buyDate = new Date(h.buyDate);
+    const today = new Date();
+    today.setHours(0, 0, 0, 0);
+    buyDate.setHours(0, 0, 0, 0);
+    holdDays = Math.floor((today - buyDate) / (1000 * 60 * 60 * 24));
+  }
+
+    return {
+    ...h, shares: allShares, name: fd.name, nav: fd.gsz, navPrev: fd.dwjz,
+    jzrq: fd.jzrq, gztime: fd.gztime,
+    dayPct, dayProfit, totalCost: allCost, currentValue: displayValue,
+    profit, profitPct, opProfit, trades, confirmedShares, holdDays
+  };
+}
+
+function calcTotal(funds) {
+  let tv = 0, tc = 0, tdp = 0, top = 0, topc = 0;
+  funds.forEach(f => { tv += f.currentValue; tc += f.totalCost; tdp += f.dayProfit; top += f.opProfit; topc += f.totalCost; });
+  return {
+    totalValue: tv, totalCost: tc, totalDayProfit: tdp, totalOpProfit: top, totalOpCost: topc,
+    totalPct: tc > 0 ? (tv - tc) / tc * 100 : 0,
+    dayPct: tv - tdp > 0 ? tdp / (tv - tdp) * 100 : 0,
+  };
+}
+
+// ==========================================
+// 配仓占比
+// ==========================================
+function calcAlloc(funds, totalValue) {
+  return funds.map(f => ({
+    ...f,
+    alloc: totalValue > 0 ? (f.currentValue / totalValue * 100) : 0
+  }));
+}
+
+// ==========================================
+// 走势图 (Canvas)
+// ==========================================
+function drawChart(canvas, data, color) {
+  const ctx = canvas.getContext('2d');
+  const W = canvas.width = canvas.offsetWidth * 2;
+  const H = canvas.height = 280;
+  ctx.scale(1, 1);
+  ctx.clearRect(0, 0, W, H);
+
+  if (!data || data.length < 2) {
+    ctx.fillStyle = '#999';
+    ctx.font = '24px sans-serif';
+    ctx.textAlign = 'center';
+    ctx.fillText('暂无走势数据', W / 2, H / 2);
+    return;
+  }
+
+  const vals = data.map(d => d.val);
+  const min = Math.min(...vals) * 0.998;
+  const max = Math.max(...vals) * 1.002;
+  const pad = { t: 20, b: 30, l: 10, r: 10 };
+  const cw = W - pad.l - pad.r;
+  const ch = H - pad.t - pad.b;
+
+  const xStep = cw / (data.length - 1);
+  const yScale = ch / (max - min);
+
+  // 网格线
+  ctx.strokeStyle = '#eee';
+  ctx.lineWidth = 1;
+  for (let i = 0; i < 5; i++) {
+    const y = pad.t + ch * i / 4;
+    ctx.beginPath(); ctx.moveTo(pad.l, y); ctx.lineTo(W - pad.r, y); ctx.stroke();
+  }
+
+  // 价格标签
+  ctx.fillStyle = '#999';
+  ctx.font = '18px sans-serif';
+  ctx.textAlign = 'right';
+  for (let i = 0; i < 5; i++) {
+    const y = pad.t + ch * i / 4;
+    const v = max - (max - min) * i / 4;
+    ctx.fillText(v.toFixed(2), W - 4, y - 4);
+  }
+
+  // 日期标签
+  ctx.textAlign = 'center';
+  const step = Math.max(1, Math.floor(data.length / 5));
+  for (let i = 0; i < data.length; i += step) {
+    const x = pad.l + i * xStep;
+    ctx.fillText(data[i].date, x, H - 6);
+  }
+
+  // 面积
+  const grad = ctx.createLinearGradient(0, pad.t, 0, H - pad.b);
+  grad.addColorStop(0, color + '30');
+  grad.addColorStop(1, color + '05');
+  ctx.beginPath();
+  ctx.moveTo(pad.l, pad.t + (max - vals[0]) * yScale);
+  for (let i = 1; i < vals.length; i++) {
+    ctx.lineTo(pad.l + i * xStep, pad.t + (max - vals[i]) * yScale);
+  }
+  ctx.lineTo(pad.l + (vals.length - 1) * xStep, H - pad.b);
+  ctx.lineTo(pad.l, H - pad.b);
+  ctx.closePath();
+  ctx.fillStyle = grad;
+  ctx.fill();
+
+  // 线
+  ctx.beginPath();
+  ctx.moveTo(pad.l, pad.t + (max - vals[0]) * yScale);
+  for (let i = 1; i < vals.length; i++) {
+    ctx.lineTo(pad.l + i * xStep, pad.t + (max - vals[i]) * yScale);
+  }
+  ctx.strokeStyle = color;
+  ctx.lineWidth = 2;
+  ctx.stroke();
+
+  // 最新点
+  const lastX = pad.l + (vals.length - 1) * xStep;
+    const lastY = pad.t + (max - vals[vals.length - 1]) * yScale;
+  ctx.beginPath();
+  ctx.arc(lastX, lastY, 5, 0, Math.PI * 2);
+  ctx.fillStyle = color;
+  ctx.fill();
+  ctx.beginPath();
+  ctx.arc(lastX, lastY, 8, 0, Math.PI * 2);
+  ctx.strokeStyle = color + '40';
+  ctx.lineWidth = 3;
+  ctx.stroke();
+}
+
+// ==========================================
+// 渲染
+// ==========================================
+function colorClass(v) { return v > 0.001 ? 'up' : v < -0.001 ? 'down' : 'neutral'; }
+function fmt(n, d = 2) { 
+  if (n === null || n === undefined || isNaN(n)) return '--';
+  return n.toLocaleString('zh-CN', { minimumFractionDigits: d, maximumFractionDigits: d }); 
+}
+
+function renderAll() {
+  const pf = loadPf();
+  const funds = pf.map(h => calcFund(h, fundDataCache[h.code])).filter(Boolean);
+
+    // 排序
+  if (sortMode === 'profit') funds.sort((a, b) => b.profit - a.profit);
+  else if (sortMode === 'profitPct') funds.sort((a, b) => b.profitPct - a.profitPct);
+  else if (sortMode === 'amount') funds.sort((a, b) => b.currentValue - a.currentValue);
+  else if (sortMode === 'dayProfit') funds.sort((a, b) => b.dayProfit - a.dayProfit);
+  else if (sortMode === 'dayPct') funds.sort((a, b) => b.dayPct - a.dayPct);
+  else if (sortMode === 'time') funds.sort((a, b) => (b.gztime || '').localeCompare(a.gztime || ''));
+  // custom 模式不排序，保持原始顺序
+
+  // 基金类型过滤
+  const displayFunds = funds.filter(f => {
+    if (typeFilterMode === 'all') return true;
+    const fundType = getFundType(f.name);
+    return fundType === typeFilterMode;
+  });
+
+    const total = calcTotal(funds);
+
+  // 顶部资产卡片
+  document.getElementById('totalValue').textContent = `¥${fmt(total.totalValue)}`;
+  
+  // 持有收益
+  const tp = document.getElementById('totalProfit');
+  tp.textContent = `${total.totalOpProfit >= 0 ? '+' : ''}${fmt(total.totalOpProfit)}`;
+  tp.style.color = total.totalOpProfit >= 0 ? '#fff' : '#90EE90';
+  const tpPct = document.getElementById('totalProfitPct');
+  const totalOpPct = total.totalOpCost > 0 ? (total.totalOpProfit / total.totalOpCost * 100) : 0;
+  tpPct.textContent = `${totalOpPct >= 0 ? '+' : ''}${totalOpPct.toFixed(2)}%`;
+  tpPct.style.color = total.totalOpProfit >= 0 ? '#fff' : '#90EE90';
+  
+  // 昨日收益（总日收益 - 当日预估收益）
+  const yp = document.getElementById('yesterdayProfit');
+  yp.textContent = '--';
+  yp.style.color = '#fff';
+  
+  // 当日收益
+  const dp = document.getElementById('todayProfit');
+  dp.textContent = `${total.totalDayProfit >= 0 ? '+' : ''}${fmt(total.totalDayProfit)}`;
+  dp.style.color = total.totalDayProfit >= 0 ? '#fff' : '#90EE90';
+  const dpPct = document.getElementById('todayProfitPct');
+  const dayPct = total.totalValue > 0 ? (total.totalDayProfit / total.totalValue * 100) : 0;
+  dpPct.textContent = `${dayPct >= 0 ? '+' : ''}${dayPct.toFixed(2)}%`;
+  dpPct.style.color = total.totalDayProfit >= 0 ? '#fff' : '#90EE90';
+
+      // 卡片
+  const list = document.getElementById('fundList');
+  
+  if (displayFunds.length === 0) {
+    list.innerHTML = '<div class="empty"><div class="empty-icon">📊</div><div class="empty-txt">还没有持仓<br>输入基金代码后点添加</div></div>';
+    return;
+  }
+
+  
+    list.innerHTML = displayFunds.map((f, idx) => {
+        const amountDisplay = fmt(f.currentValue);
+    // 浮亏显示：前日收益（最新确认的净值变动）
+    const profitDisplay = f.dayProfit !== null && f.dayProfit !== 0 ? `前日 ${f.dayProfit >= 0 ? '+' : ''}${fmt(f.dayProfit)}` : '-';
+    const profitPctDisplay = f.profitPct !== null ? `${f.profitPct >= 0 ? '+' : ''}${fmt(f.profitPct)}%` : '-';
+        const isTradingDay = isTodayTradingDay() && f.nav !== f.navPrev && f.dayPct !== 0;
+    const hasEstData = f.dayProfit !== null && isTradingDay;
+    const estProfit = hasEstData ? `${f.dayProfit >= 0 ? '+' : ''}${fmt(f.dayProfit)}` : '';
+    const estPct = hasEstData && f.nav > 0 ? `${f.dayPct >= 0 ? '+' : ''}${fmt(f.dayPct)}%` : '';
+
+    
+
+        return `<div class="fund-card-wrap" data-idx="${idx}" data-code="${f.code}">
+      <div class="fund-card" onclick="openDetail('${f.code}','${f.name}')" data-code="${f.code}">
+                        <div class="fc-left">
+          <div class="fc-name">${f.name}</div>
+          <div class="fc-code" onclick="event.stopPropagation();event.preventDefault();openJdFinance('${f.code}')">${f.code}</div>
+        </div>
+        <div class="fc-center">
+          <div class="fc-amount">${amountDisplay}</div>
+          <div class="fc-amount-sub ${colorClass(f.profit)}">${profitDisplay}</div>
+        </div>
+        <div class="fc-right">
+          <div class="fc-profit ${colorClass(f.profit)}">${profitPctDisplay}</div>
+          <div class="fc-profit-pct ${colorClass(f.dayPct)}">${estProfit}</div>
+        </div>
+        <div class="fc-right">
+          <div class="fc-profit ${colorClass(f.dayPct)}">${estProfit}</div>
+          <div class="fc-profit-pct ${colorClass(f.dayPct)}">${estPct}</div>
+        </div>
+      </div>
+                        <div class="fc-actions">
+        <div class="sort-btns">
+          <button class="fc-action move-up" onclick="event.stopPropagation();moveFund(${idx},-1)" ${idx===0?'disabled':''}>▲</button>
+          <button class="fc-action move-down" onclick="event.stopPropagation();moveFund(${idx},1)" ${idx===displayFunds.length-1?'disabled':''}>▼</button>
+        </div>
+        <button class="fc-action edit" onclick="event.stopPropagation();closeDetail();showEditSheet('${f.code}')">编辑</button>
+        <button class="fc-action trade" onclick="event.stopPropagation();closeDetail();openTradeSheet('${f.code}')">调仓</button>
+        <button class="fc-action delete" onclick="event.stopPropagation();deleteFund('${f.code}')">删除</button>
+      </div>
+    </div>`;
+  }).join('');
+
+    // 绑定左滑事件
+  bindSwipeAndLongPress();
+
+  
+}
+
+// 生成走势数据（基于当前净值和历史趋势模拟）
+function generateChartData(fund) {
+  // 如果有缓存的历史数据就用
+  if (fund._chartData) return fund._chartData;
+
+  const data = [];
+  const cur = fund.nav;
+  const days = 30;
+  const volatility = 0.02;
+
+  // 从30天前到现在，生成合理的走势
+  let base = cur * (1 - (Math.random() * 0.15 - 0.03));
+  for (let i = days; i >= 0; i--) {
+    const d = new Date();
+    d.setDate(d.getDate() - i);
+    const dateStr = `${d.getMonth() + 1}/${d.getDate()}`;
+
+    if (i === 0) {
+      data.push({ date: dateStr, val: cur });
+    } else {
+      base += (Math.random() - 0.48) * cur * volatility;
+      base = Math.max(base, cur * 0.85);
+      base = Math.min(base, cur * 1.15);
+      data.push({ date: dateStr, val: +base.toFixed(4) });
+    }
+  }
+  fund._chartData = data;
+  return data;
+}
+
+// ==========================================
+// 交互
+// ==========================================
+function setSort(mode) {
+  sortMode = mode;
+  renderAll();
+}
+
+function setTypeFilter(mode) {
+  typeFilterMode = mode;
+  renderAll();
+}
+
+
+
+// 上下移动基金
+function moveFund(idx, dir) {
+  const pf = loadPf();
+  const newIdx = idx + dir;
+  if (newIdx < 0 || newIdx >= pf.length) return;
+  // 交换位置
+  [pf[idx], pf[newIdx]] = [pf[newIdx], pf[idx]];
+  savePf(pf);
+  renderAll();
+}
+
+// 左滑事件绑定
+function bindSwipeAndLongPress() {
+  const wraps = document.querySelectorAll('.fund-card-wrap');
+  wraps.forEach(wrap => {
+    const card = wrap.querySelector('.fund-card');
+        let startX = 0, dx = 0, isSwiping = false;
+    const isOpen = () => card.style.transform === 'translateX(-220px)';
+
+    // 触摸事件
+    card.addEventListener('touchstart', (e) => {
+      const t = e.touches[0];
+      startX = t.clientX;
+      dx = 0;
+      isSwiping = false;
+    }, { passive: true });
+
+    card.addEventListener('touchmove', (e) => {
+      const t = e.touches[0];
+      const diffX = t.clientX - startX;
+      if (!isSwiping && (diffX < -10 || diffX > 10)) {
+        isSwiping = true;
+      }
+      if (isSwiping) {
+        e.preventDefault();
+        if (isOpen()) {
+          // 已展开状态：只允许右滑（关闭），从 -220 到 0
+          dx = Math.min(0, -220 + Math.max(0, diffX));
+        } else {
+          // 收起状态：只允许左滑（展开），从 0 到 -220
+          dx = Math.min(0, diffX);
+        }
+        card.style.transform = `translateX(${dx}px)`;
+        card.classList.add('swiping');
+      }
+    }, { passive: false });
+
+    card.addEventListener('touchend', () => {
+      if (isSwiping) {
+        card.classList.remove('swiping');
+        const threshold = -80;
+        if (isOpen()) {
+          // 已展开：右滑超过一半就关闭
+          card.style.transform = dx > -110 ? '' : 'translateX(-220px)';
+        } else {
+          // 收起：左滑超过阈值就展开
+          card.style.transform = dx < threshold ? 'translateX(-220px)' : '';
+        }
+        // 重置其他卡片
+        wraps.forEach(w => {
+          if (w !== wrap) {
+            const c = w.querySelector('.fund-card');
+            if (c) { c.style.transform = ''; c.classList.remove('swiping'); }
+          }
+        });
+      }
+      isSwiping = false;
+      dx = 0;
+    });
+
+    // 点击已展开的卡片任意空白区域也能回弹
+    card.addEventListener('click', (e) => {
+      if (!isOpen()) return;
+      // 如果点击的是按钮本身，不回弹
+      if (e.target.closest('.fc-action')) return;
+      card.style.transform = '';
+    });
+
+    card.addEventListener('touchcancel', () => {
+      card.classList.remove('swiping');
+      card.style.transform = '';
+      isSwiping = false;
+    });
+
+    // 鼠标事件（桌面端模拟）
+    card.addEventListener('mousedown', (e) => {
+      startX = e.clientX;
+      dx = 0;
+      isSwiping = false;
+
+      const onMove = (ev) => {
+        const diffX = ev.clientX - startX;
+        if (!isSwiping && diffX < -10) {
+          isSwiping = true;
+        }
+        if (isSwiping) {
+          dx = Math.min(0, diffX);
+          card.style.transform = `translateX(${dx}px)`;
+          card.classList.add('swiping');
+        }
+      };
+      const onUp = () => {
+        document.removeEventListener('mousemove', onMove);
+        document.removeEventListener('mouseup', onUp);
+        if (isSwiping) {
+          card.classList.remove('swiping');
+          if (dx < -80) {
+            card.style.transform = 'translateX(-220px)';
+          } else {
+            card.style.transform = '';
+          }
+          wraps.forEach(w => {
+            if (w !== wrap) {
+              const c = w.querySelector('.fund-card');
+              if (c) { c.style.transform = ''; c.classList.remove('swiping'); }
+            }
+          });
+        }
+        isSwiping = false;
+        dx = 0;
+      };
+      document.addEventListener('mousemove', onMove);
+      document.addEventListener('mouseup', onUp);
+    });
+
+    // 点击其他区域收起左滑
+    card.addEventListener('click', (e) => {
+      if (card.style.transform && card.style.transform !== '') {
+        e.stopPropagation();
+        card.style.transform = '';
+      }
+    });
+  });
+}
+
+// 基金类型判断（基于基金名称关键词）
+function getFundType(name) {
+  if (!name) return 'other';
+  const n = name.toLowerCase();
+  // 黄金
+  if (n.includes('黄金') || n.includes('gold')) return 'gold';
+  // 全球/QDII
+  if (n.includes('全球') || n.includes('国际') || n.includes('qdii') || n.includes('海外') || n.includes('美国') || n.includes('纳斯达克') || n.includes('标普') || n.includes('恒生') || n.includes('港股') || n.includes('德国') || n.includes('日本') || n.includes('越南') || n.includes('印度')) return 'global';
+  // 指数/ETF
+  if (n.includes('指数') || n.includes('etf') || n.includes('联接') || n.includes('500') || n.includes('300') || n.includes('1000') || n.includes('中证') || n.includes('沪深') || n.includes('科创') || n.includes('创业板') || n.includes('红利')) return 'index';
+  // 偏债
+  if (n.includes('债券') || n.includes('债') || n.includes('稳健') || n.includes('收益') || n.includes('短债') || n.includes('中短债') || n.includes('信用债') || n.includes('利率债') || n.includes('可转债') || n.includes('增强') && n.includes('债')) return 'bond';
+  // 偏股（默认混合/股票型）
+  if (n.includes('股票') || n.includes('混合') || n.includes('成长') || n.includes('价值') || n.includes('蓝筹') || n.includes('大盘') || n.includes('小盘') || n.includes('灵活') || n.includes('配置') || n.includes('平衡')) return 'stock';
+  // 默认归为偏股
+  return 'stock';
+}
+
+function showAddSheet() {
+  document.getElementById('sCode').value = '';
+  document.getElementById('sShares').value = '';
+  document.getElementById('sCost').value = '';
+  document.getElementById('sAmount').value = '';
+  document.getElementById('sDate').value = new Date().toISOString().slice(0, 10);
+  document.getElementById('sheetTitle').textContent = '添加基金';
+  openSheet('addSheet');
+}
+
+// 智能换算：份额 × 成本价 = 持仓金额
+function calcAmount(changed) {
+  const sharesEl = document.getElementById('sShares');
+  const costEl = document.getElementById('sCost');
+  const amountEl = document.getElementById('sAmount');
+  
+  const shares = parseFloat(sharesEl.value) || 0;
+  const cost = parseFloat(costEl.value) || 0;
+  const amount = parseFloat(amountEl.value) || 0;
+  
+  if (changed === 'shares' || changed === 'cost') {
+    // 份额或成本变化 → 计算金额
+    if (shares > 0 && cost > 0) {
+      amountEl.value = (shares * cost).toFixed(2);
+    }
+  } else if (changed === 'amount') {
+    // 金额变化 → 反算份额（如果有成本价）
+    if (amount > 0 && cost > 0) {
+      sharesEl.value = (amount / cost).toFixed(2);
+    } else if (amount > 0 && shares > 0) {
+      // 有份额无成本 → 算成本
+      costEl.value = (amount / shares).toFixed(4);
+    }
+  }
+}
+
+// 添加基金时日期变化，自动获取净值
+async function onAddDateChange() {
+  const code = document.getElementById('sCode').value.trim();
+  const date = document.getElementById('sDate').value;
+  if (!code || code.length !== 6 || !date) return;
+  
+  const costEl = document.getElementById('sCost');
+  const amountEl = document.getElementById('sAmount');
+  const sharesEl = document.getElementById('sShares');
+  
+  const nav = await getSmartNav(code, date);
+  if (nav !== null) {
+    costEl.value = nav.toFixed(4);
+    // 如果有金额，用新的成本价重新计算份额
+    const amount = parseFloat(amountEl.value) || 0;
+    if (amount > 0 && nav > 0) {
+      sharesEl.value = (amount / nav).toFixed(2);
+    }
+  }
+}
+
+async function batchAdd() {
+  const input = document.getElementById('codeInput').value.trim();
+  if (!input) { showToast('请输入基金代码'); return; }
+  const codes = input.split(/[\s,，]+/).filter(c => /^\d{6}$/.test(c));
+  if (codes.length === 0) { showToast('请输入有效的6位基金代码'); return; }
+
+  showLoading(true);
+  const pf = loadPf();
+  let added = 0;
+
+  for (const code of codes) {
+    if (pf.find(p => p.code === code)) continue;
+    const d = await fetchOne(code);
+    if (d && d.fundcode) {
+      pf.push({ code, shares: 0, costPer: 0, buyDate: new Date().toISOString().slice(0, 10), trades: [] });
+      added++;
+    }
+  }
+
+  savePf(pf);
+  document.getElementById('codeInput').value = '';
+  showLoading(false);
+  if (added > 0) {
+    showToast(`已添加 ${added} 只基金`);
+    await refreshAll();
+  } else {
+    showToast('未找到有效基金或已存在');
+  }
+}
+
+async function saveFund() {
+  const code = document.getElementById('sCode').value.trim();
+  let shares = parseFloat(document.getElementById('sShares').value) || 0;
+  let cost = parseFloat(document.getElementById('sCost').value) || 0;
+  let amount = parseFloat(document.getElementById('sAmount').value) || 0;
+  const date = document.getElementById('sDate').value;
+
+  if (!code || code.length !== 6) { showToast('请输入6位基金代码'); return; }
+
+  showLoading(true);
+  const d = await fetchOne(code);
+  showLoading(false);
+
+  if (!d || !d.fundcode) { showToast('未找到该基金'); return; }
+
+  // 获取当前净值用于计算
+  const nav = parseFloat(d.gsz) || parseFloat(d.dwjz) || 0;
+
+  // 智能计算逻辑：根据用户输入推算缺失值
+  if (amount > 0 && shares === 0) {
+    // 有金额无份额：用金额/净值计算份额，用净值作为成本价
+    if (nav > 0) {
+      shares = amount / nav;
+      if (cost === 0) cost = nav;
+    }
+  } else if (shares > 0 && amount === 0) {
+    // 有份额无金额：用份额*净值计算金额
+    if (nav > 0) {
+      amount = shares * nav;
+      if (cost === 0) cost = nav;
+    }
+  } else if (shares > 0 && cost > 0 && amount === 0) {
+    // 有份额和成本但无金额：用份额*成本计算金额
+    amount = shares * cost;
+  }
+
+    const pf = loadPf();
+  const idx = pf.findIndex(p => p.code === code);
+  const item = {
+    code,
+    shares: shares || 0,
+    costPer: cost || 0,
+    buyDate: date || '',
+    holdAmount: amount || 0
+  };
+  if (idx >= 0) {
+    pf[idx] = { ...pf[idx], ...item };
+  } else {
+    // 新基金：自动创建调仓记录
+    const trades = [];
+    if (shares > 0 && date) {
+      trades.push({
+        type: 'buy',
+        date: date,
+        shares: shares,
+        nav: cost || nav,
+        after15: false
+      });
+    }
+    pf.push({ ...item, trades });
+  }
+  savePf(pf);
+  closeSheet('addSheet');
+  showToast(`已保存: ${d.name}`);
+  await refreshAll();
+}
+
+function openTradeSheet(code) {
+  editingFund = code;
+  const pf = loadPf();
+  const h = pf.find(p => p.code === code);
+  if (!h) return;
+  
+  document.getElementById('tradeFundName').textContent = `${fundDataCache[code]?.name || code} (持有 ${fmt(h.shares)} 份)`;
+  
+  // 显示当前净值
+  const nv = fundDataCache[code]?.dwjz || fundDataCache[code]?.gsz || '--';
+  document.getElementById('tradeNV').textContent = `当前净值: ${nv}`;
+  
+  document.getElementById('tType').value = 'buy';
+  document.getElementById('tDate').value = new Date().toISOString().slice(0, 10);
+  document.getElementById('tShares').value = '';
+  document.getElementById('tNav').value = '';
+  document.getElementById('tAmount').value = '';
+  document.getElementById('tSellShares').value = '';
+  
+  // 设置默认净值
+  if (nv !== '--') {
+    document.getElementById('tNav').value = typeof nv === 'number' ? nv.toFixed(4) : nv;
+  }
+  
+  toggleTradeType();
+  renderTradeHistory(code);
+  
+  // 绑定日期选择勾选框
+  const pickDateCb = document.getElementById('tPickDate');
+  const dateInput = document.getElementById('tDate');
+  if (pickDateCb && dateInput) {
+    pickDateCb.onchange = function() {
+      dateInput.style.borderColor = this.checked ? '#5b7bf7' : '#ddd';
+      dateInput.style.backgroundColor = this.checked ? '#eef1ff' : '#fff';
+      if (this.checked) showToast('请选择准确的买入日期，系统将用该日净值计算成本');
+    };
+  }
+  
+  // 重置勾选状态
+  document.getElementById('tLogRecord').checked = true;
+  document.getElementById('tPickDate').checked = false;
+  
+  openSheet('tradeSheet');
+}
+
+// 获取历史净值
+async function fetchHistoryNav(code, date) {
+  return new Promise((resolve) => {
+    const callbackName = `_histNavCb_${Date.now()}`;
+    const s = document.createElement('script');
+    s.src = `https://api.fund.eastmoney.com/f10/lsjz?fundCode=${code}&pageIndex=1&pageSize=1&startDate=${date}&endDate=${date}&callback=${callbackName}`;
+    
+    window[callbackName] = (data) => {
+      delete window[callbackName];
+      document.head.removeChild(s);
+      if (data && data.Data && data.Data.LSJZList && data.Data.LSJZList.length > 0) {
+        resolve(+data.Data.LSJZList[0].DWJZ);
+      } else {
+        resolve(null);
+      }
+    };
+    
+    s.onerror = () => {
+      delete window[callbackName];
+      document.head.removeChild(s);
+      resolve(null);
+    };
+    
+    document.head.appendChild(s);
+  });
+}
+
+// 日期变化时自动获取净值
+async function onTradeDateChange() {
+  const code = editingFund;
+  const date = document.getElementById('tDate').value;
+  if (!code || !date) return;
+  
+  const navInput = document.getElementById('tNav');
+  const hint = document.getElementById('tradeHint');
+  
+  hint.textContent = '正在获取历史净值...';
+  navInput.value = '';
+  
+  const nav = await fetchHistoryNav(code, date);
+  
+  if (nav !== null) {
+    navInput.value = nav;
+    hint.textContent = `已获取 ${date} 的净值`;
+    calcTradeAmount();
+  } else {
+    hint.textContent = '未找到该日期净值，请手动输入';
+  }
+}
+
+// 判断是否是交易日（简单判断：周一到周五）
+function isTradeDay(dateStr) {
+  const d = new Date(dateStr);
+  const day = d.getDay();
+  return day >= 1 && day <= 5;
+}
+
+// 根据日期和时间智能获取净值
+async function getSmartNav(code, dateStr) {
+  if (!dateStr) return null;
+  
+  const now = new Date();
+  const buyDate = new Date(dateStr);
+  const today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  const buyDay = new Date(buyDate.getFullYear(), buyDate.getMonth(), buyDate.getDate());
+  
+  // 如果是今天
+  if (buyDay.getTime() === today.getTime()) {
+    const hour = now.getHours();
+    const minute = now.getMinutes();
+    
+    // 15:00前：使用昨天的净值（如果昨天是交易日）
+    if (hour < 15 || (hour === 15 && minute === 0)) {
+      // 获取昨天的日期
+      const yesterday = new Date(buyDate);
+      yesterday.setDate(yesterday.getDate() - 1);
+      
+      // 如果昨天是周末，往前找最近的交易日
+      while (!isTradeDay(yesterday.toISOString().slice(0, 10))) {
+        yesterday.setDate(yesterday.getDate() - 1);
+      }
+      
+      return await fetchHistoryNav(code, yesterday.toISOString().slice(0, 10));
+    } else {
+      // 15:00后：使用今天的净值
+      return await fetchHistoryNav(code, dateStr);
+    }
+  }
+  
+  // 如果是历史日期，直接获取该日期的净值
+  return await fetchHistoryNav(code, dateStr);
+}
+
+// 编辑持仓日期变化时自动获取净值
+async function onEditDateChange() {
+  const code = eEF;
+  const date = document.getElementById('eDa').value;
+  if (!code || !date) return;
+  
+  const costEl = document.getElementById('eCo');
+  const amountEl = document.getElementById('eAm');
+  const sharesEl = document.getElementById('eSh');
+  const hint = document.getElementById('editDateHint');
+  
+  hint.textContent = '正在获取净值...';
+  
+  const nav = await getSmartNav(code, date);
+  
+  if (nav !== null) {
+    costEl.value = nav.toFixed(4);
+    hint.textContent = `已获取 ${date} 的净值`;
+    
+    // 如果有持仓金额，用新的成本价重新计算份额
+    const amount = parseFloat(amountEl.value) || 0;
+    if (amount > 0 && nav > 0) {
+      sharesEl.value = (amount / nav).toFixed(2);
+    }
+  } else {
+    hint.textContent = '未找到该日期净值，请手动输入';
+  }
+}
+
+function toggleTradeType() {
+  const type = document.getElementById('tType').value;
+  const buyFields = document.getElementById('tradeBuyFields');
+  const sellFields = document.getElementById('tradeSellFields');
+  const hint = document.getElementById('tradeHint');
+  
+  if (type === 'buy') {
+    buyFields.style.display = 'block';
+    sellFields.style.display = 'none';
+    hint.textContent = '输入金额后自动按净值计算份额';
+  } else {
+    buyFields.style.display = 'none';
+    sellFields.style.display = 'block';
+    hint.textContent = '输入份额后自动计算金额';
+  }
+  
+  calcTradeAmount();
+}
+
+function calcTradeAmount() {
+  const type = document.getElementById('tType').value;
+  const nav = parseFloat(document.getElementById('tNav').value) || 0;
+  const sharesEl = document.getElementById('tShares');
+  
+  if (type === 'buy') {
+    const amount = parseFloat(document.getElementById('tAmount').value) || 0;
+    if (amount > 0 && nav > 0) {
+      sharesEl.value = (amount / nav).toFixed(2);
+    } else {
+      sharesEl.value = '';
+    }
+  } else {
+    const shares = parseFloat(document.getElementById('tSellShares').value) || 0;
+    sharesEl.value = shares > 0 ? shares.toFixed(2) : '';
+  }
+}
+
+function renderTradeHistory(code) {
+  const pf = loadPf();
+  const h = pf.find(p => p.code === code);
+  const el = document.getElementById('tradeHistory');
+  if (!h || !h.trades || h.trades.length === 0) {
+    el.innerHTML = '<div style="font-size:12px;color:var(--sub)">暂无调仓记录</div>';
+    return;
+  }
+    el.innerHTML = `<div style="font-size:12px;font-weight:600;margin-bottom:6px">历史记录</div>` +
+    h.trades.map((t, idx) =>
+      `<div class="trade-item"><span class="td-date">${t.date}</span><span class="td-type ${t.type}">${t.type==='buy'?'买入':'卖出'}</span><span class="td-amount">${fmt(t.shares)}份 × ${typeof t.nav==="number"?t.nav.toFixed(4):t.nav}${t.after15?' <span style="color:#f59e0b;font-size:10px">15:后</span>':''}</span><span class="td-edit" onclick="editTrade('${code}',${idx})" style="cursor:pointer;color:#666;margin-left:8px">✎</span><span class="td-del" onclick="delTrade('${code}','${t.date}','${t.type}')">×</span></div>`
+    ).join('');
+}
+
+// 从交易记录计算已确认的持仓（只有确认日已过的份额才计入）
+function calcConfirmedPosition(h) {
+  const trades = h.trades || [];
+  if (trades.length === 0) return { shares: h.shares || 0, costPer: h.costPer || 0 };
+
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+
+  let confirmedShares = 0;
+  let totalCost = 0;
+
+  const sorted = [...trades].sort((a, b) => (a.date || '').localeCompare(b.date || ''));
+  sorted.forEach(t => {
+    if (!t.date) return;
+    const profitStart = getProfitStartDate(t.date, t.after15);
+    if (t.type === 'buy') {
+      if (today >= profitStart) {
+        // 份额已确认，计入持仓
+        confirmedShares += t.shares;
+        totalCost += t.nav * t.shares;
+      }
+    } else if (t.type === 'sell') {
+      // 卖出：如果确认日已过，减少份额
+      if (today >= profitStart) {
+        confirmedShares = Math.max(0, confirmedShares - t.shares);
+      }
+    }
+  });
+
+  const costPer = confirmedShares > 0 ? totalCost / confirmedShares : 0;
+  return { shares: confirmedShares, costPer };
+}
+
+function saveTrade() {
+  // 检查是否记录到调仓记录
+  const doLog = document.getElementById('tLogRecord').checked;
+  if (!doLog) { showToast('已取消（未勾选记录）'); closeSheet('tradeSheet'); return; }
+
+  const type = document.getElementById('tType').value;
+  const date = document.getElementById('tDate').value;
+  const nav = parseFloat(document.getElementById('tNav').value);
+  const shares = parseFloat(document.getElementById('tShares').value);
+
+  if (!date || !shares || !nav) { showToast('请填写完整信息'); return; }
+
+  const pf = loadPf();
+  const h = pf.find(p => p.code === editingFund);
+  if (!h) return;
+
+  if (!h.trades) h.trades = [];
+  const after15 = document.getElementById('tAfter15').checked;
+  h.trades.push({ type, date, shares, nav, after15: type === 'buy' ? after15 : undefined });
+
+  // 从交易记录重新计算已确认的持仓（只有确认日已过的份额才计入）
+  const result = calcConfirmedPosition(h);
+  h.shares = result.shares;
+  h.costPer = result.costPer;
+
+  savePf(pf);
+  showToast(type === 'buy' ? '买入记录已保存' : '卖出记录已保存');
+  
+  // 清空输入
+  document.getElementById('tShares').value = '';
+  document.getElementById('tAmount').value = '';
+  document.getElementById('tSellShares').value = '';
+  
+  // 更新显示
+  document.getElementById('tradeFundName').textContent = `${fundDataCache[editingFund]?.name || editingFund} (持有 ${fmt(h.shares)} 份)`;
+  renderTradeHistory(editingFund);
+  renderAll();
+}
+
+function delTrade(code, date, type) {
+  if (!confirm('确认删除这条调仓记录？')) return;
+  const pf = loadPf();
+  const h = pf.find(p => p.code === code);
+  if (!h || !h.trades) return;
+  h.trades = h.trades.filter(t => !(t.date === date && t.type === type));
+  // 重新计算已确认持仓
+  const result = calcConfirmedPosition(h);
+  h.shares = result.shares;
+  h.costPer = result.costPer;
+  savePf(pf);
+  renderTradeHistory(code);
+  renderAll();
+}
+
+// 编辑调仓记录
+let editingTradeIdx = -1;
+function editTrade(code, idx) {
+  const pf = loadPf();
+  const h = pf.find(p => p.code === code);
+  if (!h || !h.trades || !h.trades[idx]) return;
+  
+  const t = h.trades[idx];
+  editingTradeIdx = idx;
+  
+  // 填充表单
+  document.getElementById('tType').value = t.type;
+  document.getElementById('tDate').value = t.date;
+  document.getElementById('tShares').value = t.shares;
+  document.getElementById('tNav').value = typeof t.nav === 'number' ? t.nav.toFixed(4) : t.nav;
+  document.getElementById('tAfter15').checked = t.after15 || false;
+  
+  toggleTradeType();
+  
+  // 修改保存按钮为更新
+  const saveBtn = document.querySelector('#tradeSheet .btn-ok');
+  saveBtn.textContent = '更新';
+  saveBtn.onclick = updateTrade;
+  
+  showToast('编辑模式：修改后点击更新');
+}
+
+function updateTrade() {
+  if (editingTradeIdx < 0) return;
+  
+  const type = document.getElementById('tType').value;
+  const date = document.getElementById('tDate').value;
+  const nav = parseFloat(document.getElementById('tNav').value);
+  const shares = parseFloat(document.getElementById('tShares').value);
+
+  if (!date || !shares || !nav) { showToast('请填写完整信息'); return; }
+
+  const pf = loadPf();
+  const h = pf.find(p => p.code === editingFund);
+  if (!h || !h.trades) return;
+
+  const after15 = document.getElementById('tAfter15').checked;
+  h.trades[editingTradeIdx] = { type, date, shares, nav, after15: type === 'buy' ? after15 : undefined };
+
+  // 重新计算已确认持仓
+  const result = calcConfirmedPosition(h);
+  h.shares = result.shares;
+  h.costPer = result.costPer;
+
+  savePf(pf);
+  showToast('调仓记录已更新');
+  
+  // 恢复保存按钮
+  const saveBtn = document.querySelector('#tradeSheet .btn-ok');
+  saveBtn.textContent = '保存';
+  saveBtn.onclick = saveTrade;
+  
+  // 清空输入
+  document.getElementById('tShares').value = '';
+  document.getElementById('tAmount').value = '';
+  document.getElementById('tSellShares').value = '';
+  
+  editingTradeIdx = -1;
+  
+  // 更新显示
+  document.getElementById('tradeFundName').textContent = `${fundDataCache[editingFund]?.name || editingFund} (持有 ${fmt(h.shares)} 份)`;
+  renderTradeHistory(editingFund);
+  renderAll();
+}
+
+// 内联编辑功能
+let isDetailEditing = false;
+
+function toggleDetailEdit() {
+  isDetailEditing = !isDetailEditing;
+  const editForm = document.getElementById('detailEditForm');
+  const editBtn = document.getElementById('detailEditBtn');
+  const body = document.getElementById('detailBody');
+
+  if (isDetailEditing) {
+    // 显示编辑表单，隐藏详情内容
+    const p = loadPf();
+    const h = p.find(x => x.code === currentDetailCode);
+    if (h) {
+      // 显示当前净值
+      const nv = fundDataCache[currentDetailCode]?.dwjz || fundDataCache[currentDetailCode]?.gsz || '--';
+      document.getElementById('deNV').textContent = `当前净值: ${nv}`;
+      
+      document.getElementById('deShares').value = h.shares || '';
+      document.getElementById('deCost').value = h.costPer || '';
+      document.getElementById('deDate').value = h.buyDate || '';
+      // 计算持仓金额
+      const amount = (h.shares || 0) * (h.costPer || 0);
+      document.getElementById('deAmount').value = amount > 0 ? amount.toFixed(2) : '';
+    }
+    editForm.style.display = 'block';
+    body.style.display = 'none';
+    editBtn.textContent = '取消';
+    editBtn.onclick = toggleDetailEdit;
+  } else {
+    // 隐藏编辑表单，显示详情内容
+    editForm.style.display = 'none';
+    body.style.display = 'block';
+    editBtn.textContent = '编辑';
+    editBtn.onclick = toggleDetailEdit;
+  }
+}
+
+// 内联编辑的智能换算
+function calcDetailAmount(changed) {
+  const sharesEl = document.getElementById('deShares');
+  const costEl = document.getElementById('deCost');
+  const amountEl = document.getElementById('deAmount');
+  
+  const shares = parseFloat(sharesEl.value) || 0;
+  const cost = parseFloat(costEl.value) || 0;
+  const amount = parseFloat(amountEl.value) || 0;
+  
+  // 获取当前净值
+  const nv = parseFloat(fundDataCache[currentDetailCode]?.dwjz) || parseFloat(fundDataCache[currentDetailCode]?.gsz) || 0;
+  
+  if (changed === 'amount') {
+    // 输入金额 → 自动计算份额（按当前净值）
+    if (amount > 0 && nv > 0) {
+      sharesEl.value = (amount / nv).toFixed(2);
+      // 成本价设为当前净值
+      if (!cost || cost === 0) {
+        costEl.value = nv.toFixed(4);
+      }
+    }
+  } else if (changed === 'shares') {
+    // 输入份额 → 自动计算金额
+    if (shares > 0 && nv > 0) {
+      amountEl.value = (shares * nv).toFixed(2);
+      // 成本价设为当前净值
+      if (!cost || cost === 0) {
+        costEl.value = nv.toFixed(4);
+      }
+    }
+  } else if (changed === 'cost') {
+    // 输入成本 → 自动计算金额
+    if (shares > 0 && cost > 0) {
+      amountEl.value = (shares * cost).toFixed(2);
+    }
+  }
+}
+
+function saveDetailEdit() {
+  const shares = parseFloat(document.getElementById('deShares').value) || 0;
+  const cost = parseFloat(document.getElementById('deCost').value) || 0;
+  const date = document.getElementById('deDate').value;
+
+  const p = loadPf();
+  const i = p.findIndex(x => x.code === currentDetailCode);
+  if (i < 0) return;
+
+  const h = p[i];
+  if (h.trades && h.trades.length > 0) {
+    const result = calcConfirmedPosition(h);
+    const currentShares = result.shares;
+    const currentCost = result.costPer;
+    const deltaShares = shares - currentShares;
+
+    if (Math.abs(deltaShares) > 0.01) {
+      const tradeDate = date || new Date().toISOString().slice(0, 10);
+      const tradeNav = cost || currentCost || 0;
+      if (deltaShares > 0) {
+        h.trades.push({ type: 'buy', date: tradeDate, shares: deltaShares, nav: tradeNav, after15: false });
+      } else {
+        h.trades.push({ type: 'sell', date: tradeDate, shares: Math.abs(deltaShares), nav: tradeNav });
+      }
+      const newResult = calcConfirmedPosition(h);
+      h.shares = newResult.shares;
+      h.costPer = newResult.costPer;
+    }
+  } else {
+    h.shares = shares;
+    h.costPer = cost;
+  }
+  h.buyDate = date;
+  savePf(p);
+
+  showToast('持仓已更新');
+  toggleDetailEdit();
+  renderAll();
+}
+
+let eEF = null;
+function showEditSheet(code) {
+  eEF = code;
+  const p = loadPf(), h = p.find(x => x.code === code);
+  if (!h) return;
+  document.getElementById('eFN').textContent = fundDataCache[code]?.name || code;
+  
+  // 显示当前净值
+  const nv = fundDataCache[code]?.dwjz || fundDataCache[code]?.gsz || '--';
+  document.getElementById('eNV').textContent = `当前净值: ${nv}`;
+  
+  document.getElementById('eSh').value = h.shares || '';
+  document.getElementById('eCo').value = h.costPer || '';
+  document.getElementById('eDa').value = h.buyDate || '';
+  
+  // 计算持仓金额
+  const amount = (h.shares || 0) * (h.costPer || 0);
+  document.getElementById('eAm').value = amount > 0 ? amount.toFixed(2) : '';
+  
+  // 如果有买入日期，自动获取净值
+  if (h.buyDate) {
+    onEditDateChange();
+  } else {
+    document.getElementById('editDateHint').textContent = '选择日期后自动获取净值';
+  }
+  
+  openSheet('editSheet');
+}
+
+// 编辑弹窗的智能换算
+function calcEditAmount(changed) {
+  const sharesEl = document.getElementById('eSh');
+  const costEl = document.getElementById('eCo');
+  const amountEl = document.getElementById('eAm');
+  
+  const shares = parseFloat(sharesEl.value) || 0;
+  const cost = parseFloat(costEl.value) || 0;
+  const amount = parseFloat(amountEl.value) || 0;
+  
+  // 获取当前净值和成本价（买入日期净值）
+  const code = eEF;
+  const nv = parseFloat(fundDataCache[code]?.dwjz) || parseFloat(fundDataCache[code]?.gsz) || 0;
+  const costNav = cost || nv; // 优先使用成本价（买入日期净值），否则用当前净值
+  
+  if (changed === 'amount') {
+    // 输入金额 → 自动计算份额（优先用成本价/买入日期净值）
+    if (amount > 0 && costNav > 0) {
+      sharesEl.value = (amount / costNav).toFixed(2);
+      // 成本价设为买入日期净值（如果还没设置）
+      if (!cost || cost === 0) {
+        costEl.value = nv.toFixed(4);
+      }
+    }
+  } else if (changed === 'shares') {
+    // 输入份额 → 自动计算金额（用成本价）
+    if (shares > 0 && costNav > 0) {
+      amountEl.value = (shares * costNav).toFixed(2);
+      // 成本价设为当前净值（如果还没设置）
+      if (!cost || cost === 0) {
+        costEl.value = nv.toFixed(4);
+      }
+    }
+  } else if (changed === 'cost') {
+    // 输入成本 → 自动重新计算份额（用新成本价）
+    if (amount > 0 && cost > 0) {
+      sharesEl.value = (amount / cost).toFixed(2);
+    }
+  }
+}
+
+function saveEdit() {
+  const s = parseFloat(document.getElementById('eSh').value) || 0;
+  const c = parseFloat(document.getElementById('eCo').value) || 0;
+  const d = document.getElementById('eDa').value;
+  const p = loadPf(), i = p.findIndex(x => x.code === eEF);
+  if (i < 0) return;
+  
+  // 如果有交易记录，需要同步更新
+  const h = p[i];
+  if (h.trades && h.trades.length > 0) {
+    // 计算当前已确认的持仓
+    const result = calcConfirmedPosition(h);
+    const currentShares = result.shares;
+    const currentCost = result.costPer;
+    
+    // 如果用户修改了份额或成本价，需要创建新的交易记录
+    if (Math.abs(s - currentShares) > 0.01 || Math.abs(c - currentCost) > 0.01) {
+      // 计算需要调整的份额
+      const deltaShares = s - currentShares;
+      
+      if (Math.abs(deltaShares) > 0.01) {
+        // 创建新的交易记录
+        const tradeDate = d || new Date().toISOString().slice(0, 10);
+        const tradeNav = c || currentCost || 0;
+        
+        if (deltaShares > 0) {
+          // 买入
+          h.trades.push({
+            type: 'buy',
+            date: tradeDate,
+            shares: deltaShares,
+            nav: tradeNav,
+            after15: false
+          });
+        } else {
+          // 卖出
+          h.trades.push({
+            type: 'sell',
+            date: tradeDate,
+            shares: Math.abs(deltaShares),
+            nav: tradeNav
+          });
+        }
+        
+        // 重新计算持仓
+        const newResult = calcConfirmedPosition(h);
+        h.shares = newResult.shares;
+        h.costPer = newResult.costPer;
+      }
+    }
+  } else {
+    // 没有交易记录，直接更新
+    h.shares = s;
+    h.costPer = c;
+  }
+  
+  h.buyDate = d;
+  savePf(p); closeSheet('editSheet'); showToast('持仓已更新'); renderAll();
+}
+function deleteFund(code) {
+  if (!confirm('确认删除这只基金？')) return;
+  // 修复：删除时清理缓存
+  delete fundDataCache[code];
+  savePf(loadPf().filter(p => p.code !== code));
+  showToast('已删除'); refreshAll();
+}
+
+function exportData() {
+  const pf = loadPf();
+  const text = JSON.stringify(pf, null, 2);
+  const blob = new Blob([text], { type: 'application/json' });
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(blob);
+  a.download = `fund_portfolio_${new Date().toISOString().slice(0, 10)}.json`;
+  a.click();
+  showToast('持仓数据已导出');
+}
+
+// ==========================================
+// 弹窗/日历
+// ==========================================
+function openSheet(id) { document.getElementById(id).classList.add('show'); }
+function closeSheet(id) { document.getElementById(id).classList.remove('show'); }
+document.querySelectorAll('.overlay').forEach(el => {
+  el.addEventListener('click', function(e) { if (e.target === this) this.classList.remove('show'); });
+});
+
+function showLoading(show) {
+  document.getElementById('loadingBar').className = show ? 'loading-bar show' : 'loading-bar';
+}
+
+function showToast(msg) {
+  const t = document.getElementById('toast');
+  t.textContent = msg;
+  t.classList.add('show');
+  setTimeout(() => t.classList.remove('show'), 2000);
+}
+
+// ==========================================
+// 设置功能
+// ==========================================
+// 详情页区块折叠/展开
+function toggleDetailSection(titleEl) {
+  const content = titleEl.nextElementSibling;
+  const arrow = titleEl.querySelector('.section-arrow');
+  if (content.style.display === 'none') {
+    content.style.display = 'block';
+    arrow.style.transform = 'rotate(90deg)';
+  } else {
+    content.style.display = 'none';
+    arrow.style.transform = 'rotate(0deg)';
+  }
+}
+
+// 持仓信息展开/收起
+function toggleHolding() {
+  const detail = document.getElementById('holdDetail');
+  const arrow = document.getElementById('holdArrow');
+  if (detail.style.display === 'none') {
+    detail.style.display = 'block';
+    arrow.style.transform = 'rotate(180deg)';
+  } else {
+    detail.style.display = 'none';
+    arrow.style.transform = 'rotate(0deg)';
+  }
+}
+
+// 详情页Tab切换
+function switchDetailTab(btn, tabName) {
+  // 更新按钮状态
+  document.querySelectorAll('.detail-tab').forEach(b => {
+    b.classList.remove('active');
+    b.style.background = 'transparent';
+    b.style.color = '#999';
+  });
+  btn.classList.add('active');
+  btn.style.background = '#fff';
+  btn.style.color = '#333';
+  btn.style.boxShadow = '0 2px 8px rgba(0,0,0,0.08)';
+
+  // 更新面板显示
+  document.querySelectorAll('.tab-panel').forEach(p => p.style.display = 'none');
+  const panel = document.getElementById('tab-' + tabName);
+  if (panel) {
+    panel.style.display = 'block';
+    // NX Tab 启动实时刷新，其它 Tab 停止
+    if (tabName === 'nx') {
+      startNXAutoRefresh(currentDetailCode);
+    } else {
+      stopNXAutoRefresh(currentDetailCode);
+    }
+        // 如果是业绩走势Tab，需要重绘图表
+    if (tabName === 'trend') {
+      setTimeout(() => {
+        const activeBtn = document.querySelector('.trend-tab.active');
+        if (activeBtn) {
+          const period = activeBtn.getAttribute('data-period');
+          switchTrendPeriod(activeBtn, period);
+        }
+      }, 100);
+    }
+        // 如果是重仓股票Tab，启动涨跌幅实时刷新和占比季变5分钟刷新
+    if (tabName === 'holdings') {
+      startHoldingsRealtimeRefresh();
+      startHoldingsDataRefresh(currentDetailCode);
+    } else {
+      stopHoldingsRealtimeRefresh();
+      stopHoldingsDataRefresh();
+    }
+  }
+}
+
+// ==========================================
+// 重仓股票折叠/展开功能
+// ==========================================
+let holdingsExpanded = false;
+
+function toggleHoldings() {
+  holdingsExpanded = !holdingsExpanded;
+  const rows = document.querySelectorAll('.holding-row');
+  const toggleBtn = document.getElementById('holdings-toggle');
+  
+  rows.forEach((row, i) => {
+    if (i >= 5) {
+      row.style.display = holdingsExpanded ? '' : 'none';
+    }
+  });
+  
+  if (toggleBtn) {
+    toggleBtn.innerHTML = holdingsExpanded 
+      ? '收起 <span style="font-size:10px">▲</span>'
+      : '展开全部 <span style="font-size:10px">▼</span>';
+  }
+}
+
+// ==========================================
+// 重仓股票涨跌幅实时刷新（1.5秒）
+// ==========================================
+let holdingsRefreshTimer = null;
+
+function startHoldingsRealtimeRefresh() {
+  stopHoldingsRealtimeRefresh();
+  holdingsRefreshTimer = setInterval(() => {
+    refreshHoldingsChanges();
+  }, 1500); // 1.5秒刷新一次
+}
+
+function stopHoldingsRealtimeRefresh() {
+  if (holdingsRefreshTimer) {
+    clearInterval(holdingsRefreshTimer);
+    holdingsRefreshTimer = null;
+  }
+}
+
+async function refreshHoldingsChanges() {
+  const cells = document.querySelectorAll('#holdings-tbody td[data-stock]');
+  if (cells.length === 0) return;
+  
+  // 收集所有股票代码
+  const secids = [];
+  cells.forEach(cell => {
+    const stockCode = cell.getAttribute('data-stock');
+    if (stockCode) secids.push(stockCode);
+  });
+  
+  if (secids.length === 0) return;
+  
+  try {
+    const stkUrl = `https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&fields=f3,f12,f14&secids=${secids.join(',')}`;
+    const response = await fetch(stkUrl);
+    const json = await response.json();
+    
+    if (json && json.data && json.data.diff) {
+      const map = {};
+      json.data.diff.forEach(d => { map[d.f12] = d.f3; });
+      
+      cells.forEach(cell => {
+        const stockCode = cell.getAttribute('data-stock');
+        const sc = stockCode.split('.')[1];
+        const change = map[sc];
+        if (change != null) {
+          const changeText = change > 0 ? `+${change}%` : `${change}%`;
+          const changeColor = change > 0 ? '#e74c3c' : change < 0 ? '#27ae60' : '#999';
+          cell.textContent = changeText;
+          cell.style.color = changeColor;
+        }
+      });
+    }
+  } catch (e) {
+    // 静默失败
+  }
+}
+
+// NX交易法 - 根据历史净值自动计算N值
+// N = 近一年最大单日涨幅绝对值（取整），代表该基金的"正常波动边界"
+// 备用金固定值管理
+function getNXManualReserve(code) {
+  if (!window._nxManualReserve) {
+    try {
+      window._nxManualReserve = JSON.parse(localStorage.getItem('nx_manual_reserve') || '{}');
+    } catch (e) {
+      window._nxManualReserve = {};
+    }
+  }
+  let val = window._nxManualReserve[code];
+  if (val === undefined || val === null || isNaN(val) || val <= 0) val = 5000;
+  return val;
+}
+
+function saveNXManualReserve(code, val) {
+  if (!window._nxManualReserve) window._nxManualReserve = {};
+  window._nxManualReserve[code] = val;
+  try {
+    localStorage.setItem('nx_manual_reserve', JSON.stringify(window._nxManualReserve));
+  } catch (e) {}
+}
+
+// N值手动覆盖（localStorage 持久化）
+function getNXManualN(code) {
+  let map = {};
+  try { map = JSON.parse(localStorage.getItem('nx_manual_n') || '{}'); } catch(e) {}
+  const val = map[code];
+  if (val !== undefined && val !== null && !isNaN(val) && val >= 1 && val <= 10) return val;
+  return null; // null 表示未手动设置，使用自动计算值
+}
+
+function saveNXManualN(code, n) {
+  let map = {};
+  try { map = JSON.parse(localStorage.getItem('nx_manual_n') || '{}'); } catch(e) {}
+  if (n === null || n === undefined) {
+    delete map[code]; // 清除手动值，恢复自动计算
+  } else {
+    map[code] = Math.max(1, Math.min(10, Math.round(n)));
+  }
+  try { localStorage.setItem('nx_manual_n', JSON.stringify(map)); } catch(e) {}
+  // 更新全局 _nxNValues
+  if (window._nxNValues) {
+    if (n === null || n === undefined) {
+      // 恢复自动值
+      const nd = window._nxNData && window._nxNData[code];
+      window._nxNValues[code] = nd ? nd.n : 5;
+    } else {
+      window._nxNValues[code] = Math.max(1, Math.min(10, Math.round(n)));
+    }
+  }
+}
+
+function updateNXManualN(code, val) {
+  const num = parseInt(val);
+  if (isNaN(num) || num < 1 || num > 10) return; // 无效输入不保存
+  // Update select element if exists
+  const selectEl = document.getElementById('nx-select-n-' + code);
+  if (selectEl && selectEl.value !== String(num)) selectEl.value = num;
+  saveNXManualN(code, num);
+  // 更新显示
+  const n = num;
+  const adjustRatio = 25 / n;
+  const el = document.getElementById('nx-n-display-' + code);
+  if (el) el.textContent = n + 'X';
+  const ratioEl = document.getElementById('nx-adjust-ratio-' + code);
+  if (ratioEl) ratioEl.textContent = '（每变化±1%，调仓±' + adjustRatio.toFixed(1) + '%）';
+  // 更新策略描述
+  const nxStrategyMap = {1:'货币/黄金基金',2:'稳健指数',3:'宽基指数',4:'行业指数',5:'高波动行业',6:'较高波动',7:'高波动',8:'很高波动',9:'极高波动',10:'超高波动'};
+  const strategyEl = document.getElementById('nx-strategy-' + code);
+  if (strategyEl) {
+    const strategy = nxStrategyMap[n] || '自定义';
+    const nd = window._nxNData && window._nxNData[code];
+    const autoN = nd ? nd.n : 5;
+    const tag = n !== autoN ? '（手动）' : '';
+    strategyEl.innerHTML = '<span style="font-size:12px;color:#2e7d32">📊 策略类型：' + strategy + tag + '</span>';
+  }
+  // 重新计算买卖建议
+  calcNXTrade(code);
+  if (typeof refreshNXAutoData === 'function') refreshNXAutoData(code);
+}
+
+function clearNXManualN(code) {
+  saveNXManualN(code, null);
+  // 恢复自动值
+  const nd = window._nxNData && window._nxNData[code];
+  const autoN = nd ? nd.n : 5;
+  const adjustRatio = 25 / autoN;
+  const ratioEl = document.getElementById('nx-adjust-ratio-' + code);
+  if (ratioEl) ratioEl.textContent = '每变化±1%，调仓±' + adjustRatio.toFixed(2) + '%';
+  // Reset select to autoN
+  const selectEl = document.getElementById('nx-select-n-' + code);
+  if (selectEl) selectEl.value = autoN;
+  const nxStrategyMap = {1:'货币/黄金基金',2:'稳健指数',3:'宽基指数',4:'行业指数',5:'高波动行业',6:'较高波动',7:'高波动',8:'很高波动',9:'极高波动',10:'超高波动'};
+  const strategyEl = document.getElementById('nx-strategy-' + code);
+  if (strategyEl) {
+    const strategy = nxStrategyMap[autoN] || '自定义';
+    strategyEl.innerHTML = '<span style="font-size:12px;color:#2e7d32">📊 策略类型：' + strategy + '</span>';
+  }
+  calcNXTrade(code);
+  if (typeof refreshNXAutoData === 'function') refreshNXAutoData(code);
+}
+
+// 手动设置固定备用金
+
+// 清除手动备用金，恢复默认5000
+
+// 刷新实时估值卡片的备用金显示
+
+// 手动固定备用金
+
+function updateNXValue(code, newN) {
+  const n = parseInt(newN);
+  if (n < 1 || n > 10) return;
+  
+  // 更新N值
+  window._nxNValues[code] = n;
+  
+  // 更新显示
+  const ratioEl = document.getElementById('nx-ratio-' + code);
+  if (ratioEl) {
+    const adjustRatio = 25 / n;
+    ratioEl.textContent = `（每变化±1%，调仓±${adjustRatio.toFixed(1)}%）`;
+  }
+  
+  // 更新策略类型
+  const nxStrategyMap = {
+    1: '货币/黄金基金',
+    2: '稳健指数',
+    3: '宽基指数',
+    4: '行业指数',
+    5: '高波动行业',
+    6: '较高波动',
+    7: '高波动',
+    8: '很高波动',
+    9: '极高波动',
+    10: '超高波动'
+  };
+  const strategyEl = document.getElementById('nx-strategy-' + code);
+  if (strategyEl) {
+    const strategy = nxStrategyMap[n] || '自定义';
+    strategyEl.innerHTML = `<span style="font-size:12px;color:#2e7d32">📊 策略类型：${strategy}</span>`;
+  }
+  
+  // 重新计算买卖建议
+  calcNXTrade(code);
+}
+
+// 手动固定备用金
+
+// NX交易法 - 根据近一月净值走势自动计算N值
+// N = 近一月最大单日涨幅绝对值（取整），代表该基金的"正常波动边界"
+// 判断方法：看近1月上下价格波动范围，向上取整
+function calcNXAutoN(netWorthTrend, code) {
+  if (!netWorthTrend || netWorthTrend.length < 2) return 5;
+  // 取近一月数据（约22个交易日）
+  const monthData = netWorthTrend.slice(-Math.min(22, netWorthTrend.length));
+  if (monthData.length < 2) return 5;
+
+  const baseVal = parseFloat(monthData[0].y);
+  if (!baseVal || baseVal <= 0 || !isFinite(baseVal)) return 5;
+
+  // 计算每个交易日相对于起点（首日）的累计收益率
+  const cumReturns = [];
+  for (let i = 0; i < monthData.length; i++) {
+    const val = parseFloat(monthData[i].y);
+    if (val > 0 && isFinite(val)) {
+      const ret = (val - baseVal) / baseVal * 100;
+      if (isFinite(ret)) cumReturns.push(ret);
+    }
+  }
+
+  if (cumReturns.length < 2) return 5;
+
+  // 找极值：最高点涨幅 和 最低点涨幅
+  const highPct = Math.max(...cumReturns);   // 例：+8.55%
+  const lowPct = Math.min(...cumReturns);     // 例：-2.30%
+
+  // 算波动：高点到低点（总波动范围）
+  // 例：最高+12.96%，最低-5.69%，range = 12.96 - (-5.69) = 18.65
+  const range = highPct - lowPct;
+
+  // 定N值：按 NX 交易法档位，每 ±5% 为一档，总范围每 10% 升一档
+  // 1x = ±5%（总范围10%），2x = ±10%（总范围20%），... 10x = ±50%（总范围100%）
+  // 例：18.65% → 18.65/10 = 1.865 → 向上取整 = 2x
+  const n = Math.max(1, Math.min(10, Math.ceil(range / 10)));
+
+  console.log(`[NX] base=${baseVal}, high=${highPct.toFixed(2)}%, low=${lowPct.toFixed(2)}%, range=${range.toFixed(2)}%, N=${n}`);
+
+  // 存储波动数据供显示用
+  if (!window._nxNData) window._nxNData = {};
+  if (code) window._nxNData[code] = { n, highPct, lowPct, range, baseVal };
+  return n;
+}
+
+
+// NX交易法计算 - 生成完整买卖金额对照表
+
+// 刷新实时估值卡片的备用金显示
+function refreshNXReserveDisplay(code) {
+  if (!code) return;
+  const reserveCapital = getNXManualReserve(code);
+  const el = document.getElementById('nx-est-reserve-' + code);
+  if (el) el.textContent = '¥' + fmt(reserveCapital);
+}
+
+// 手动设置固定备用金
+function updateNXManualReserve(code, val) {
+  const num = parseFloat(val);
+  const reserve = isNaN(num) || num <= 0 ? 5000 : num;
+  saveNXManualReserve(code, reserve);
+  // 同步显示输入框
+  const input = document.getElementById('nx-manual-reserve-' + code);
+  if (input && input.value !== String(reserve)) input.value = reserve;
+  calcNXTrade(code);
+  if (typeof refreshNXAutoData === 'function') refreshNXAutoData(code);
+  refreshNXReserveDisplay(code);
+}
+
+// 清除手动备用金，恢复默认5000
+function clearNXManualReserve(code) {
+  saveNXManualReserve(code, 5000);
+  const input = document.getElementById('nx-manual-reserve-' + code);
+  if (input) input.value = '5000';
+  calcNXTrade(code);
+  if (typeof refreshNXAutoData === 'function') refreshNXAutoData(code);
+  refreshNXReserveDisplay(code);
+}
+
+// NX交易法计算 - 生成完整买卖金额对照表
+function calcNXTrade(code) {
+  const resultDiv = document.getElementById('nx-result-' + code);
+  if (!resultDiv) return;
+
+  const n = (window._nxNValues && window._nxNValues[code]) || 5;
+  const adjustRatio = 25 / n;
+
+  const portfolio = loadPf();
+  const h = portfolio.find(x => x.code === code);
+  const fd = fundDataCache[code];
+  if (!fd) return;
+
+  // 使用已确认份额计算NX交易（未确认份额不参与交易计算）
+  const shares = (h && h.confirmedShares > 0) ? h.confirmedShares : 0;
+  const nav = fd.gsz || fd.dwjz || 0;
+  const posValue = shares > 0 ? Math.round(shares * nav * 100) / 100 : ((h && h.totalCost) || 0);
+  const dayPct = fd.gszzl || 0;
+
+  // 备用金固定为5000元，可手动编辑并持久化保存
+  const reserveCapital = getNXManualReserve(code);
+  const todayEstimate = nav * (1 + dayPct / 100);
+
+  // 交易参数
+  const MIN_BUY_AMOUNT = 10;   // 最小申购金额
+  const MIN_SELL_AMOUNT = 10;  // 最小卖出金额
+  const FEE_RATE = 0.001;      // 申购费率 0.1%
+
+  // 买入计算：金额不能超过备用金，不足最小申购额不操作
+  function calcBuy(pct) {
+    let amount = (adjustRatio / 100) * pct * reserveCapital;
+    amount = Math.min(amount, reserveCapital); // 不能超过备用金
+    if (amount < MIN_BUY_AMOUNT) amount = 0;   // 不足最小申购额不操作
+    const fee = amount * FEE_RATE;
+    const netAmount = amount - fee;
+    const buyShares = todayEstimate > 0 ? netAmount / todayEstimate : 0;
+    return { amount, fee, netAmount, buyShares: Math.floor(buyShares * 100) / 100 };
+  }
+
+  // 卖出计算：份额不超过持仓，金额不足最小卖出额不操作
+  function calcSell(pct) {
+    let sellShares = shares * (adjustRatio / 100) * pct;
+    sellShares = Math.min(sellShares, shares); // 不能超过持仓
+    let amount = sellShares * todayEstimate;
+    if (amount < MIN_SELL_AMOUNT && amount > 0) {
+      sellShares = 0;
+      amount = 0;
+    }
+    return { sellShares: Math.floor(sellShares * 100) / 100, amount };
+  }
+
+  // 当前建议
+  let currentAction = '';
+  if (dayPct < 0) {
+    const absPct = Math.min(Math.abs(dayPct), n);
+    const buy = calcBuy(absPct);
+    const reserveAfter = reserveCapital - buy.amount;
+    if (buy.amount <= 0) {
+      currentAction = `<div style="background:#fff3e0;border:1px solid #ffe0b2;border-radius:10px;padding:12px;margin-bottom:12px;text-align:center">
+        <span style="font-size:15px;font-weight:700;color:#f57c00">⏸ 暂不买入</span>
+        <div style="font-size:12px;color:#999;margin-top:4px">今日跌 ${dayPct.toFixed(2)}%，但计算金额不足 ${MIN_BUY_AMOUNT} 元最小申购额</div>
+      </div>`;
+    } else {
+      currentAction = `<div style="background:#e8f5e9;border:1px solid #c8e6c9;border-radius:10px;padding:12px;margin-bottom:12px">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+          <span style="font-size:15px;font-weight:700;color:#27ae60">📈 建议买入</span>
+          <span style="font-size:13px;color:#666">今日跌 ${dayPct.toFixed(2)}%</span>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px">
+          <div style="text-align:center"><div style="font-size:10px;color:#999">买入金额</div><div style="font-size:15px;font-weight:700;color:#27ae60">¥${fmt(buy.amount)}</div></div>
+          <div style="text-align:center"><div style="font-size:10px;color:#999">买入份额</div><div style="font-size:15px;font-weight:700;color:#333">${buy.buyShares.toFixed(2)}份</div></div>
+          <div style="text-align:center"><div style="font-size:10px;color:#999">备用金变化</div><div style="font-size:15px;font-weight:700;color:#e74c3c">-¥${fmt(buy.amount)}</div></div>
+          <div style="text-align:center"><div style="font-size:10px;color:#999">操作后备用金</div><div style="font-size:15px;font-weight:700;color:#333">¥${fmt(reserveAfter)}</div></div>
+        </div>
+        <div style="margin-top:8px;font-size:11px;color:#666;text-align:center">
+          备用金: ¥${fmt(reserveCapital)} | 每变化±1%，调仓±${adjustRatio.toFixed(2)}% | 持仓: ${shares.toFixed(2)}份
+        </div>
+      </div>`;
+    }
+  } else if (dayPct > 0) {
+    const absPct = Math.min(Math.abs(dayPct), n);
+    const sell = calcSell(absPct);
+    const reserveAfter = reserveCapital + sell.amount;
+    if (sell.amount <= 0) {
+      currentAction = `<div style="background:#fff3e0;border:1px solid #ffe0b2;border-radius:10px;padding:12px;margin-bottom:12px;text-align:center">
+        <span style="font-size:15px;font-weight:700;color:#f57c00">⏸ 暂不卖出</span>
+        <div style="font-size:12px;color:#999;margin-top:4px">今日涨 +${dayPct.toFixed(2)}%，但计算金额不足 ${MIN_SELL_AMOUNT} 元最小卖出额</div>
+      </div>`;
+    } else {
+      currentAction = `<div style="background:#ffebee;border:1px solid #ffcdd2;border-radius:10px;padding:12px;margin-bottom:12px">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:6px">
+          <span style="font-size:15px;font-weight:700;color:#e74c3c">📉 建议卖出</span>
+          <span style="font-size:13px;color:#666">今日涨 +${dayPct.toFixed(2)}%</span>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px">
+          <div style="text-align:center"><div style="font-size:10px;color:#999">卖出金额</div><div style="font-size:15px;font-weight:700;color:#e74c3c">¥${fmt(sell.amount)}</div></div>
+          <div style="text-align:center"><div style="font-size:10px;color:#999">卖出份额</div><div style="font-size:15px;font-weight:700;color:#333">${sell.sellShares.toFixed(2)}份</div></div>
+          <div style="text-align:center"><div style="font-size:10px;color:#999">备用金变化</div><div style="font-size:15px;font-weight:700;color:#27ae60">+¥${fmt(sell.amount)}</div></div>
+          <div style="text-align:center"><div style="font-size:10px;color:#999">操作后备用金</div><div style="font-size:15px;font-weight:700;color:#333">¥${fmt(reserveAfter)}</div></div>
+        </div>
+        <div style="margin-top:8px;font-size:11px;color:#666;text-align:center">
+          备用金: ¥${fmt(reserveCapital)} | 每变化±1%，调仓±${adjustRatio.toFixed(2)}% | 持仓: ${shares.toFixed(2)}份
+        </div>
+      </div>`;
+    }
+  } else {
+    currentAction = `<div style="background:#f3e5f5;border:1px solid #e1bee7;border-radius:10px;padding:12px;margin-bottom:12px;text-align:center">
+      <span style="font-size:15px;font-weight:700;color:#9b59b6">⏸ 持有不动</span>
+      <div style="font-size:12px;color:#999;margin-top:4px">净值无变化，无需操作</div>
+    </div>`;
+  }
+
+  resultDiv.innerHTML = `
+    ${currentAction}
+    <div style="margin-top:10px;padding:10px;background:#f8f9fa;border-radius:8px;font-size:11px;color:#666">
+      <div style="margin-bottom:4px"><strong>💡 NX交易法说明：</strong></div>
+      <div>• 备用金 = 固定值（默认5000元，可手动编辑并保存）= ¥${fmt(reserveCapital)}</div>
+      <div>• 每变化±1%，调仓±${adjustRatio.toFixed(2)}%（调仓比例 = 25% ÷ N = 25% ÷ ${n}）</div>
+      <div>• 买入金额 = (25/N)% × |涨跌幅%| × 备用金，不足${MIN_BUY_AMOUNT}元或超过备用金时不操作</div>
+      <div>• 卖出份额 = 持仓份额 × (25/N)% × 涨跌幅%，最多不超过持仓份额，卖出金额不足${MIN_SELL_AMOUNT}元时不操作</div>
+      <div>• 份额保留两位小数，买入金额已考虑${(FEE_RATE*100).toFixed(1)}%申购费率</div>
+    </div>
+  `;
+}
+
+// NX自动计算控制
+function toggleNXAutoCalc(code) {
+  if (!window._nxAutoTimers) window._nxAutoTimers = {};
+  const btn = document.getElementById('nx-auto-btn-' + code);
+  const status = document.getElementById('nx-auto-status-' + code);
+  if (!btn || !status) return;
+
+  if (window._nxAutoTimers[code]) {
+    clearInterval(window._nxAutoTimers[code]);
+    delete window._nxAutoTimers[code];
+    btn.textContent = '启动';
+    btn.style.background = '#ff9800';
+    status.textContent = '已停止';
+    status.style.color = '#999';
+  } else {
+    refreshNXAutoData(code);
+    window._nxAutoTimers[code] = setInterval(() => refreshNXAutoData(code), 1000);
+    btn.textContent = '停止';
+    btn.style.background = '#999';
+    status.textContent = '每秒刷新';
+    status.style.color = '#ff9800';
+  }
+}
+
+function startNXAutoRefresh(code) {
+  if (!code) return;
+  if (!window._nxAutoTimers) window._nxAutoTimers = {};
+  stopNXAutoRefresh(code);
+  refreshNXAutoData(code);
+  window._nxAutoTimers[code] = setInterval(() => refreshNXAutoData(code), 1000);
+}
+
+function stopNXAutoRefresh(code) {
+  if (!code || !window._nxAutoTimers) return;
+  if (window._nxAutoTimers[code]) {
+    clearInterval(window._nxAutoTimers[code]);
+    delete window._nxAutoTimers[code];
+  }
+}
+
+async function refreshNXAutoData(code) {
+  // 后台每秒拉取该基金最新实时估值
+  const latest = await fetchOne(code);
+  if (latest && latest.fundcode) {
+    fundDataCache[code] = {
+      fundcode: latest.fundcode, name: latest.name, jzrq: latest.jzrq,
+      dwjz: +latest.dwjz, gsz: +latest.gsz, gszzl: +latest.gszzl, gztime: latest.gztime
+    };
+  }
+  const fd = fundDataCache[code];
+  if (!fd) return;
+  const portfolio = loadPf();
+  const h = portfolio.find(x => x.code === code);
+  const shares = h ? (h.shares || 0) : 0;
+  const nav = fd.gsz || fd.dwjz || 0;
+  const posValue = shares * nav;
+  const dayPct = fd.gszzl || 0;
+  const n = (window._nxNValues && window._nxNValues[code]) || 5;
+  const reserveCapital = getNXManualReserve(code);
+
+  const estNav = document.getElementById('nx-est-nav-' + code);
+  const estPct = document.getElementById('nx-est-pct-' + code);
+  const estPos = document.getElementById('nx-est-pos-' + code);
+  const estReserve = document.getElementById('nx-est-reserve-' + code);
+  const estTime = document.getElementById('nx-est-time-' + code);
+
+  if (estNav) estNav.textContent = nav.toFixed(4);
+  if (estPct) {
+    estPct.textContent = (dayPct >= 0 ? '+' : '') + dayPct.toFixed(2) + '%';
+    estPct.style.color = dayPct >= 0 ? '#e74c3c' : '#27ae60';
+  }
+  if (estPos) estPos.textContent = '¥' + fmt(posValue);
+  if (estReserve) estReserve.textContent = '¥' + fmt(reserveCapital);
+  if (estTime) {
+    const now = new Date();
+    estTime.textContent = now.getHours().toString().padStart(2,'0') + ':' + now.getMinutes().toString().padStart(2,'0') + ':' + now.getSeconds().toString().padStart(2,'0');
+  }
+
+  calcNXTrade(code);
+}
+
+// 走势图周期切换
+function switchTrendPeriod(btn, period) {
+  // 更新按钮状态
+  document.querySelectorAll('.trend-tab').forEach(b => b.classList.remove('active'));
+  btn.classList.add('active');
+
+  const allData = window._trendData;
+  const returns = window._trendReturns;
+  if (!allData || allData.length === 0) return;
+
+  // 根据周期截取数据
+  const periodDays = { '1m': 23, '3m': 66, '6m': 132, '1y': 250, '3y': 750, 'all': allData.length };
+  const days = periodDays[period] || 30;
+  const sliced = allData.slice(-Math.min(days, allData.length));
+  // 更新当前显示的数据，用于高低点计算
+  window._currentTrendData = sliced;
+
+  // 更新收益率显示
+  const startDateEl = document.getElementById('trendStartDate');
+  const hoverDateEl = document.getElementById('trendHoverDate');
+  const endDateEl = document.getElementById('trendEndDate');
+  if (startDateEl && endDateEl) {
+    // 使用实时计算的值，确保与图表数据一致
+    const start_val = sliced[0]?.y || 0;
+    const end_val = sliced[sliced.length-1]?.y || 0;
+    const period_return = start_val > 0 ? ((end_val - start_val) / start_val * 100) : 0;
+    const ret = period_return; // 统一使用实时计算值
+    startDateEl.textContent = `${period_return >= 0 ? '+' : ''}${period_return.toFixed(2)}%`;
+    startDateEl.style.color = period_return >= 0 ? 'var(--red)' : 'var(--green)';
+    // 中间显示最新日期和涨跌幅
+    const latest_date = sliced[sliced.length-1]?.x ? new Date(sliced[sliced.length-1].x).toLocaleDateString('zh-CN',{month:'2-digit',day:'2-digit'}).replace(/\//g,'-') : '';
+    hoverDateEl.textContent = `${latest_date} ${ret >= 0 ? '+' : ''}${ret.toFixed(2)}%`;
+    hoverDateEl.style.color = ret >= 0 ? 'var(--red)' : 'var(--green)';
+    endDateEl.textContent = `${ret >= 0 ? '+' : ''}${ret.toFixed(2)}%`;
+    endDateEl.style.color = ret >= 0 ? 'var(--red)' : 'var(--green)';
+  }
+
+  // 重新绘制图表
+  drawTrendChart('trendChart', sliced);
+}
+
+function openSettings() {
+  document.getElementById('settingsSheet').classList.add('show');
+}
+
+function clearAppCache() {
+  if (confirm('确定要清除App缓存吗？这将删除所有本地存储的基金数据和设置。')) {
+    try {
+      localStorage.removeItem(STORE_KEY);
+      localStorage.removeItem('fund_sort');
+      localStorage.removeItem('fund_type_filter');
+      fundDataCache = {};
+      showToast('App缓存已清除');
+      closeSheet('settingsSheet');
+      renderAll();
+    } catch (e) {
+      showToast('清除失败: ' + e.message);
+    }
+  }
+}
+
+function clearApiCache() {
+  fundDataCache = {};
+  showToast('接口缓存已清除');
+  closeSheet('settingsSheet');
+  renderAll();
+}
+
+// ==========================================
+// 刷新逻辑
+// ==========================================
+let refreshInterval = null;
+
+async function refreshAll() {
+  const pf = loadPf();
+  if (pf.length === 0) { renderAll(); return; }
+
+  const bar = document.getElementById('loadingBar');
+  bar.className = 'loading-bar show';
+  bar.textContent = '● 正在获取实时估值...';
+
+  const codes = pf.map(p => p.code);
+  const data = await fetchAll(codes);
+
+  Object.assign(fundDataCache, data);
+
+  bar.className = 'loading-bar';
+  renderAll();
+}
+
+// 自动刷新（盘中每秒刷新）
+function startAutoRefresh() {
+  if (refreshInterval) clearInterval(refreshInterval);
+  refreshInterval = setInterval(() => {
+    const now = new Date();
+    const day = now.getDay();
+    const h = now.getHours(), m = now.getMinutes();
+    const totalMin = h * 60 + m;
+    const isTrading = day >= 1 && day <= 5 && (
+      (totalMin >= 565 && totalMin <= 695) || // 9:25 - 11:35
+      (totalMin >= 780 && totalMin <= 905)    // 13:00 - 15:05
+    );
+
+    if (isTrading) {
+      refreshAll();
+    }
+  }, 1000);
+}
+
+// 手动刷新（任何时间都可触发）
+async function manualRefresh() {
+  const btn = document.querySelector('.refresh-btn');
+  if (btn) btn.classList.add('spinning');
+  showToast('正在刷新...');
+  try {
+    await refreshAll();
+    showToast('刷新完成');
+  } catch (e) {
+    showToast('刷新失败: ' + e.message);
+  } finally {
+    setTimeout(() => { if (btn) btn.classList.remove('spinning'); }, 500);
+  }
+}
+
+// 下拉刷新
+let touchStartY = 0;
+let isPulling = false;
+
+function initPullRefresh() {
+  const list = document.getElementById('fundList');
+  
+  list.addEventListener('touchstart', (e) => {
+    if (window.scrollY === 0) {
+      touchStartY = e.touches[0].clientY;
+      isPulling = true;
+    }
+  });
+  
+  list.addEventListener('touchmove', (e) => {
+    if (!isPulling) return;
+    const diff = e.touches[0].clientY - touchStartY;
+    if (diff > 0 && diff < 150) {
+      list.style.transform = `translateY(${diff * 0.4}px)`;
+      list.style.transition = 'none';
+    }
+  });
+  
+  list.addEventListener('touchend', (e) => {
+    if (!isPulling) return;
+    isPulling = false;
+    const diff = e.changedTouches[0].clientY - touchStartY;
+    list.style.transition = 'transform 0.3s';
+    list.style.transform = '';
+    
+    if (diff > 80) {
+      refreshAll();
+      showToast('刷新中...');
+    }
+  });
+}
+
+// ==========================================
+// 初始化
+// ==========================================
+(async function init() {
+  // 清空旧的预置数据（首次安装时清空）
+  const pf = loadPf();
+  if (pf.length > 0 && pf[0].code === '024434') {
+    // 检测到旧的预置数据，清空它
+    savePf([]);
+  }
+  
+  const currentPf = loadPf();
+  if (currentPf.length === 0) {
+    // 空持仓，等待用户添加
+  }
+
+  await refreshAll();
+  startAutoRefresh();
+  initPullRefresh();
+})();
+
+// ===== 京东金融跳转 =====
+async function openJdFinance(code) {
+  // 优先使用自定义插件直接唤起京东金融App
+  if (window.Capacitor && window.Capacitor.Plugins && window.Capacitor.Plugins.JdFinance) {
+    try {
+      const result = await window.Capacitor.Plugins.JdFinance.open({ fundCode: code });
+      console.log('京东金融打开方式:', result.method);
+      return;
+    } catch(e) {
+      console.warn('插件调用失败，回退到scheme:', e);
+    }
+  }
+  // 京东金融App scheme: jdmobile:// (不是 openapp.jdmobile:// 那是京东购物)
+  // jumpUrl 用 lc.jr.jd.com 域名（App内信任域名，m.jdjr.com 会被安全拦截）
+  var fundUrl = 'https://lc.jr.jd.com/finance/funddetail/home/?fundCode=' + code + '&fundUtmSource=340&fundUtmParam=AppShare';
+  var jrScheme = 'jdmobile://share?jumpType=7&jumpUrl=' + encodeURIComponent(fundUrl);
+  window.location.href = jrScheme;
+}
+
+// ===== 基金详情页（直连天天基金，无需 Worker 代理） =====
+
+// 通过 fetch + Function 解析 pingzhongdata（彻底避免 script 缓存问题）
+function loadPingzhongData(code) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('详情数据加载超时')), 15000);
+    const url = `https://fund.eastmoney.com/pingzhongdata/${code}.js?_=${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    fetch(url, { cache: 'no-store', headers: { 'Cache-Control': 'no-cache' } })
+      .then(r => r.text())
+      .then(text => {
+        clearTimeout(timeout);
+        // 用 Function 构造器在隔离作用域执行，避免污染全局变量
+        const varNames = [
+          'Data_assetAllocation','Data_fluctuationScale','Data_currentFundManager',
+          'Data_holderStructure','Data_netWorthTrend','Data_grandTotal',
+          'syl_1n','syl_1y','syl_3y','syl_6y','syl_1z','syl_1zy',
+          'fS_name','fS_code','fund_sourceRate','fund_Rate','fund_minsg'
+        ];
+        const returnStr = 'return {' + varNames.join(',') + '}';
+        const fn = new Function(text + ';\n' + returnStr);
+        const r = fn();
+        // 校验基金代码
+        if (r.fS_code && r.fS_code !== code) {
+          reject(new Error('数据不匹配'));
+          return;
+        }
+        resolve(r);
+      })
+      .catch(e => {
+        clearTimeout(timeout);
+        // fetch 失败（如 CORS），回退到 script 注入
+        _loadPingzhongDataFallback(code).then(resolve).catch(reject);
+      });
+  });
+}
+
+// script 注入回退方案（当 fetch 被 CORS 阻止时）
+let _pzLoadId = 0;
+function _loadPingzhongDataFallback(code) {
+  return new Promise((resolve, reject) => {
+    const timeout = setTimeout(() => reject(new Error('详情数据加载超时')), 15000);
+    const varNames = [
+      'Data_assetAllocation','Data_fluctuationScale','Data_currentFundManager',
+      'Data_holderStructure','Data_netWorthTrend','Data_grandTotal',
+      'syl_1n','syl_1y','syl_3y','syl_6y','syl_1z','syl_1zy',
+      'fS_name','fS_code','fund_sourceRate','fund_Rate','fund_minsg'
+    ];
+    const saved = {};
+    varNames.forEach(v => { try { saved[v] = window[v]; } catch(e){} });
+    const s = document.createElement('script');
+    s.src = `https://fund.eastmoney.com/pingzhongdata/${code}.js?_=${++_pzLoadId}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    s.onload = () => {
+      clearTimeout(timeout);
+      const r = {};
+      varNames.forEach(v => { try { if (typeof window[v] !== 'undefined') r[v] = window[v]; } catch(e){} });
+      varNames.forEach(v => { try { if (saved[v] !== undefined) window[v] = saved[v]; else delete window[v]; } catch(e){} });
+      if (r.fS_code && r.fS_code !== code) {
+        reject(new Error('数据不匹配'));
+        return;
+      }
+      resolve(r);
+    };
+    s.onerror = () => {
+      clearTimeout(timeout);
+      varNames.forEach(v => { try { if (saved[v] !== undefined) window[v] = saved[v]; else delete window[v]; } catch(e){} });
+      reject(new Error('详情数据加载失败'));
+    };
+    document.head.appendChild(s);
+    setTimeout(() => { if (s.parentNode) s.parentNode.removeChild(s); }, 20000);
+  });
+}
+
+// 加载前十大重仓股（从 FundArchivesDatas 获取 HTML 并解析）
+let _holdLoadId = 0;
+function loadStockHoldings(code, _attempt) {
+  _attempt = _attempt || 0;
+  return new Promise((resolve) => {
+    const loadId = ++_holdLoadId;
+    const timeout = setTimeout(() => resolve([]), 15000);
+    let saved; try { saved = window.apidata; } catch(e){}
+    const curUrl = `https://fundf10.eastmoney.com/FundArchivesDatas.aspx?type=jjcc&code=${code}&topline=10&_=${loadId}_${_attempt}_${Date.now()}_${Math.random().toString(36).slice(2)}`;
+    const s = document.createElement('script');
+    s.src = curUrl;
+    s.onload = () => {
+      clearTimeout(timeout);
+      try {
+        if (typeof apidata !== 'undefined' && apidata.content) {
+          const doc = new DOMParser().parseFromString(apidata.content, 'text/html');
+          const holdings = [];
+          const secids = [];
+          doc.querySelectorAll('tbody tr').forEach(row => {
+            const c = row.querySelectorAll('td');
+            if (c.length >= 7) {
+              const name = c[2]?.textContent?.trim();
+              const pct = parseFloat(c[6]?.textContent?.trim());
+              let stockCode = '';
+              const link = c[1]?.querySelector('a');
+              if (link) {
+                const href = link.getAttribute('href') || '';
+                const m = href.match(/\/r\/(\d+\.\d+)/);
+                if (m) stockCode = m[1];
+              }
+              if (name && !isNaN(pct)) {
+                holdings.push({ name, percent: pct, stockCode });
+                if (stockCode) secids.push(stockCode);
+              }
+            }
+          });
+          if (saved !== undefined) window.apidata = saved; else delete window.apidata;
+          if (holdings.length === 0 && _attempt < 2) {
+            setTimeout(() => { loadStockHoldings(code, _attempt + 1).then(resolve); }, 50);
+            return;
+          }
+          if (secids.length > 0) {
+            const stkUrl = `https://push2.eastmoney.com/api/qt/ulist.np/get?fltt=2&fields=f3,f12,f14&secids=${secids.join(',')}`;
+            fetch(stkUrl).then(r => r.json()).then(json => {
+              if (json && json.data && json.data.diff) {
+                const map = {};
+                json.data.diff.forEach(d => { map[d.f12] = d.f3; });
+                holdings.forEach(h => {
+                  const sc = h.stockCode.split('.')[1];
+                  h.change = map[sc] != null ? map[sc] : null;
+                });
+              }
+              resolve(holdings);
+            }).catch(() => resolve(holdings));
+          } else {
+            resolve(holdings);
+          }
+        } else {
+          if (saved !== undefined) window.apidata = saved; else delete window.apidata;
+          resolve([]);
+        }
+      } catch(e) {
+        if (saved !== undefined) window.apidata = saved; else delete window.apidata;
+        resolve([]);
+      }
+    };
+        s.onerror = () => { clearTimeout(timeout); try { if (saved !== undefined) window.apidata = saved; else delete window.apidata; } catch(e){} resolve([]); };
+    document.head.appendChild(s);
+    setTimeout(() => { if (s.parentNode) s.parentNode.removeChild(s); }, 15000);
+  });
+}
+
+// ==========================================
+// 重仓股票占比和季变5分钟刷新
+// ==========================================
+let holdingsDataRefreshTimer = null;
+let currentHoldingsCode = null;
+
+function startHoldingsDataRefresh(code) {
+  stopHoldingsDataRefresh();
+  currentHoldingsCode = code;
+  holdingsDataRefreshTimer = setInterval(() => {
+    refreshHoldingsData(code);
+  }, 5 * 60 * 1000); // 5分钟刷新一次
+}
+
+function stopHoldingsDataRefresh() {
+  if (holdingsDataRefreshTimer) {
+    clearInterval(holdingsDataRefreshTimer);
+    holdingsDataRefreshTimer = null;
+  }
+  currentHoldingsCode = null;
+}
+
+async function refreshHoldingsData(code) {
+  try {
+    const holdings = await loadStockHoldings(code);
+    if (holdings && holdings.length > 0) {
+      // 更新占比和季变数据
+      const tbody = document.getElementById('holdings-tbody');
+      if (!tbody) return;
+      
+      const rows = tbody.querySelectorAll('.holding-row');
+      rows.forEach((row, i) => {
+        if (i < holdings.length) {
+          const h = holdings[i];
+          // 更新占比
+          const percentCell = row.querySelector('td:last-child');
+          if (percentCell) {
+            percentCell.textContent = `${h.percent}%`;
+          }
+        }
+      });
+    }
+  } catch (e) {
+    // 静默失败
+  }
+}
+
+// 基于已有数据生成趋势预测
+function generateTrendPrediction(pz, netWorthTrend) {
+  // 注意：syl_1n=近1年, syl_1y=近1月, syl_3y=近3月, syl_6y=近6月, syl_1z=今年来, syl_1zy=近1周
+  const year = parseFloat(pz.syl_1n) || 0, month = parseFloat(pz.syl_1y) || 0, m3 = parseFloat(pz.syl_3y) || 0, m6 = parseFloat(pz.syl_6y) || 0;
+
+  // --- 从净值序列提取价格数据 ---
+  const vals = (netWorthTrend && netWorthTrend.length > 0)
+    ? netWorthTrend.map(t => t.y).filter(v => v > 0)
+    : [];
+
+  // --- 技术指标计算辅助函数 ---
+  function calcEMA(data, period) {
+    if (data.length === 0) return [];
+    const k = 2 / (period + 1);
+    const ema = [data[0]];
+    for (let i = 1; i < data.length; i++) {
+      ema.push(data[i] * k + ema[i - 1] * (1 - k));
+    }
+    return ema;
+  }
+  function calcMA(data, period) {
+    const ma = [];
+    for (let i = 0; i < data.length; i++) {
+      if (i < period - 1) { ma.push(null); continue; }
+      let sum = 0;
+      for (let j = i - period + 1; j <= i; j++) sum += data[j];
+      ma.push(sum / period);
+    }
+    return ma;
+  }
+
+  // --- MACD 指标 ---
+  let macdData = null;
+  if (vals.length >= 26) {
+    const ema12 = calcEMA(vals, 12);
+    const ema26 = calcEMA(vals, 26);
+    const dif = ema12.map((v, i) => v - ema26[i]);
+    const dea = calcEMA(dif, 9);
+    const macdHist = dif.map((v, i) => (v - dea[i]) * 2);
+    const last = vals.length - 1;
+    const prev = last - 1;
+    // 金叉/死叉判断
+    const goldenCross = dif[prev] <= dea[prev] && dif[last] > dea[last];
+    const deathCross = dif[prev] >= dea[prev] && dif[last] < dea[last];
+    // 多头/空头区域
+    const bullZone = dif[last] > 0 && dea[last] > 0;
+    const bearZone = dif[last] < 0 && dea[last] < 0;
+    // 柱状图动能
+    const histRising = macdHist[last] > macdHist[prev];
+    macdData = { dif: dif[last], dea: dea[last], hist: macdHist[last], goldenCross, deathCross, bullZone, bearZone, histRising };
+  }
+
+  // --- MA5 / MA10 均线 ---
+  let maData = null;
+  if (vals.length >= 10) {
+    const ma5 = calcMA(vals, 5);
+    const ma10 = calcMA(vals, 10);
+    const last = vals.length - 1;
+    const prev = last - 1;
+    const curPrice = vals[last];
+    const ma5Val = ma5[last], ma10Val = ma10[last];
+    const prevMa5 = ma5[prev], prevMa10 = ma10[prev];
+    if (ma5Val !== null && ma10Val !== null && prevMa5 !== null && prevMa10 !== null) {
+      const goldenCross = prevMa5 <= prevMa10 && ma5Val > ma10Val;
+      const deathCross = prevMa5 >= prevMa10 && ma5Val < ma10Val;
+      // 价格与均线关系
+      let pricePosition = 'between';
+      if (curPrice > ma5Val && curPrice > ma10Val) pricePosition = 'above';
+      else if (curPrice < ma5Val && curPrice < ma10Val) pricePosition = 'below';
+      maData = { ma5: ma5Val, ma10: ma10Val, goldenCross, deathCross, pricePosition };
+    }
+  }
+
+  // --- 综合评分（满分100） ---
+  let score = 50;
+  // 短期动量（近1月）±20
+  score += Math.max(-20, Math.min(20, month * 1.5));
+  // 中期趋势（近1年）±12
+  score += Math.max(-12, Math.min(12, year * 0.15));
+  // 短期加速（近3月）±10
+  score += Math.max(-10, Math.min(10, m3 * 0.6));
+  // 中期动量（近6月）±8
+  score += Math.max(-8, Math.min(8, m6 * 0.1));
+  // MACD 加分
+  if (macdData) {
+    if (macdData.goldenCross) score += 5;
+    else if (macdData.deathCross) score -= 5;
+    if (macdData.bullZone) score += 3;
+    else if (macdData.bearZone) score -= 3;
+  }
+  // MA 加分
+  if (maData) {
+    if (maData.goldenCross) score += 4;
+    else if (maData.deathCross) score -= 4;
+    if (maData.pricePosition === 'above') score += 2;
+    else if (maData.pricePosition === 'below') score -= 2;
+  }
+  score = Math.max(10, Math.min(95, Math.round(score)));
+
+  // --- 趋势判断 ---
+  let trend, trendText;
+  if (score >= 65) { trend = 'bullish'; trendText = '上涨'; }
+  else if (score <= 35) { trend = 'bearish'; trendText = '下跌'; }
+  else { trend = 'neutral'; trendText = '震荡'; }
+
+  // --- 等级 ---
+  const grade = score >= 80 ? 'A' : score >= 65 ? 'B' : score >= 45 ? 'C' : score >= 30 ? 'D' : 'E';
+
+  // --- 置信度 ---
+  const confidence = Math.min(90, Math.max(35, Math.round(50 + Math.abs(month) * 2 + Math.abs(m3) * 0.8)));
+
+  // --- 支撑位 / 阻力位（从净值序列计算） ---
+  let support = '—', resistance = '—';
+  if (vals.length > 5) {
+    const cur = vals[vals.length - 1];
+    const recent = vals.slice(-60);
+    const sorted = [...recent].sort((a, b) => a - b);
+    const q25 = sorted[Math.floor(sorted.length * 0.25)];
+    const q75 = sorted[Math.floor(sorted.length * 0.75)];
+    if (cur > (q25 + q75) / 2) {
+      support = q25.toFixed(4);
+      resistance = q75.toFixed(4);
+    } else {
+      support = sorted[0].toFixed(4);
+      resistance = sorted[sorted.length - 1].toFixed(4);
+    }
+  }
+
+  // --- 买卖信号 ---
+  const signals = [];
+
+  // === 技术面信号（优先级最高） ===
+  // 0a. MACD 金叉/死叉
+  if (macdData) {
+    if (macdData.goldenCross) {
+      signals.push({ type: 'buy', title: 'MACD 金叉', desc: `DIF(${macdData.dif.toFixed(4)}) 上穿 DEA(${macdData.dea.toFixed(4)})，短期买入信号` });
+    } else if (macdData.deathCross) {
+      signals.push({ type: 'sell', title: 'MACD 死叉', desc: `DIF(${macdData.dif.toFixed(4)}) 下穿 DEA(${macdData.dea.toFixed(4)})，短期卖出信号` });
+    } else if (macdData.bullZone && macdData.histRising) {
+      signals.push({ type: 'buy', title: 'MACD 多头增强', desc: `DIF/DEA 均在零轴上方，柱状图放大，动能增强` });
+    } else if (macdData.bearZone && !macdData.histRising) {
+      signals.push({ type: 'sell', title: 'MACD 空头加速', desc: `DIF/DEA 均在零轴下方，柱状图扩大，下跌动能增强` });
+    } else if (macdData.bullZone && !macdData.histRising) {
+      signals.push({ type: 'neutral', title: 'MACD 多头衰减', desc: `DIF/DEA 在零轴上方但柱状图缩小，上涨动能减弱` });
+    } else if (macdData.bearZone && macdData.histRising) {
+      signals.push({ type: 'neutral', title: 'MACD 空头衰减', desc: `DIF/DEA 在零轴下方但柱状图收窄，下跌动能减弱` });
+    }
+  }
+
+  // 0b. MA5/MA10 均线交叉
+  if (maData) {
+    if (maData.goldenCross) {
+      signals.push({ type: 'buy', title: '均线金叉 (MA5上穿MA10)', desc: `MA5(${maData.ma5.toFixed(4)}) 上穿 MA10(${maData.ma10.toFixed(4)})，短期转强` });
+    } else if (maData.deathCross) {
+      signals.push({ type: 'sell', title: '均线死叉 (MA5下穿MA10)', desc: `MA5(${maData.ma5.toFixed(4)}) 下穿 MA10(${maData.ma10.toFixed(4)})，短期转弱` });
+    } else if (maData.pricePosition === 'above') {
+      signals.push({ type: 'buy', title: '价格站上双均线', desc: `当前净值在 MA5/MA10 上方，多头排列` });
+    } else if (maData.pricePosition === 'below') {
+      signals.push({ type: 'sell', title: '价格跌破双均线', desc: `当前净值在 MA5/MA10 下方，空头排列` });
+    } else {
+      signals.push({ type: 'neutral', title: '均线纠缠', desc: `MA5(${maData.ma5.toFixed(4)}) 与 MA10(${maData.ma10.toFixed(4)}) 接近，方向待选择` });
+    }
+  }
+
+  // === 基本面信号 ===
+  // 1. 均线排列信号（用近3月 vs 近1月判断）
+  if (m3 > 0 && month > 0) {
+    signals.push({ type: 'buy', title: '收益多头排列', desc: '短中长期收益均为正，趋势向上' });
+  } else if (m3 < 0 && month < 0) {
+    signals.push({ type: 'sell', title: '收益空头排列', desc: '短中长期收益均为负，趋势向下' });
+  } else if (month > 0 && m3 < 0) {
+    signals.push({ type: 'buy', title: '短期反弹信号', desc: '近期止跌回升，关注能否持续' });
+  } else if (month < 0 && m3 > 0) {
+    signals.push({ type: 'sell', title: '短期回调信号', desc: '上涨趋势中出现回调，注意风险' });
+  }
+  // 2. 动量信号（近1月）
+  if (Math.abs(month) > 5) {
+    signals.push({ type: month > 0 ? 'buy' : 'sell', title: month > 0 ? '强势上涨' : '加速下跌', desc: `近1月${month > 0 ? '上涨' : '下跌'} ${Math.abs(month).toFixed(2)}%，${month > 0 ? '动能充沛' : '注意止损'}` });
+  }
+  // 3. 中期趋势（近1年）
+  if (Math.abs(year) > 10) {
+    signals.push({ type: year > 0 ? 'buy' : 'sell', title: year > 0 ? '中期趋势向好' : '中期趋势走弱', desc: `近1年${year > 0 ? '上涨' : '下跌'} ${Math.abs(year).toFixed(2)}%` });
+  }
+  // 4. 波动信号
+  if (Math.abs(m6) > 15 && Math.abs(month) < 3) {
+    signals.push({ type: 'neutral', title: '横盘震荡', desc: '近期波动收窄，可能酝酿方向选择' });
+  }
+
+    // --- 评语 ---
+  let summary;
+  if (score >= 80) summary = '优秀基金，近期表现强劲，适合积极持有';
+  else if (score >= 65) summary = '良好基金，表现稳健，适合长期持有';
+  else if (score >= 45) summary = '表现一般，建议观望或少量配置';
+  else if (score >= 30) summary = '近期表现较弱，建议谨慎持有';
+  else summary = '表现不佳，建议考虑减仓或转换';
+
+  // --- 综合操作建议（基于技术面+基本面信号统计） ---
+  let buyCount = 0, sellCount = 0;
+  signals.forEach(s => { if (s.type === 'buy') buyCount++; else if (s.type === 'sell') sellCount++; });
+  let action, actionColor, actionDesc;
+  if (buyCount >= 3 && sellCount <= 1) {
+    action = '建议买入'; actionColor = '#e74c3c';
+    actionDesc = `${buyCount}个买入信号 vs ${sellCount}个卖出信号，技术面与基本面共振向好`;
+  } else if (buyCount > sellCount && score >= 55) {
+    action = '建议加仓'; actionColor = '#e67e22';
+    actionDesc = `${buyCount}个买入信号略占优势，可逢低分批建仓`;
+  } else if (sellCount >= 3 && buyCount <= 1) {
+    action = '建议卖出'; actionColor = '#27ae60';
+    actionDesc = `${sellCount}个卖出信号 vs ${buyCount}个买入信号，技术面与基本面共振走弱`;
+  } else if (sellCount > buyCount && score <= 45) {
+    action = '建议减仓'; actionColor = '#f39c12';
+    actionDesc = `${sellCount}个卖出信号略占优势，注意控制仓位风险`;
+  } else {
+    action = '建议持有观望'; actionColor = '#999';
+    actionDesc = `买卖信号胶着（买${buyCount}/卖${sellCount}），建议等待方向明确后再操作`;
+  }
+
+  return { trend, trendText, score, grade, confidence, support, resistance, signals, summary, macdData, maData, action, actionColor, actionDesc };
+}
+
+let currentDetailCode = null;
+
+async function openDetail(code, name) {
+  currentDetailCode = code;
+  const mask = document.getElementById('detailMask');
+  const body = document.getElementById('detailBody');
+  document.getElementById('detailTitle').textContent = name || fundDataCache[code]?.name || code;
+  document.getElementById('detailCode').textContent = code;
+  body.innerHTML = '<div class="detail-loading"><div class="spinner"></div>加载中...</div>';
+  mask.classList.add('show');
+  document.body.style.overflow = 'hidden';
+
+  try {
+    const [pz, holdings] = await Promise.all([
+      loadPingzhongData(code).catch(() => ({})),
+      loadStockHoldings(code).catch(() => [])
+    ]);
+
+            // 获取持仓数据
+    const pf = loadPf();
+    const holding = pf.find(h => h.code === code);
+    const fundCalc = holding ? calcFund(holding, fundDataCache[code]) : null;
+
+    // 组装 renderDetail 期望的数据格式
+    const data = {
+      name: pz.fS_name || name || fundDataCache[code]?.name || code,
+      manager: Array.isArray(pz.Data_currentFundManager)
+        ? pz.Data_currentFundManager.map(m => ({ name: m.name, workTime: m.workTime, fundSize: m.fundSize }))
+        : [],
+      basic: {
+        type: null, company: null, setupDate: null, riskLevel: null,
+        scale: pz.Data_fluctuationScale?.series?.length
+          ? pz.Data_fluctuationScale.series[pz.Data_fluctuationScale.series.length - 1]?.y + '亿'
+          : null
+      },
+      pzData: {
+        syl_1y: pz.syl_1y, syl_3y: pz.syl_3y, syl_6y: pz.syl_6y,
+        syl_1n: pz.syl_1n, syl_1z: pz.syl_1z, syl_1zy: pz.syl_1zy,
+        Data_assetAllocation: pz.Data_assetAllocation?.series
+          ? pz.Data_assetAllocation.series
+              .filter(s => s.name !== '净资产' && s.data?.length)
+              .map(s => ({ name: s.name, percent: s.data[s.data.length - 1] + '%' }))
+          : pz.Data_assetAllocation,
+        Data_netWorthTrend: pz.Data_netWorthTrend,
+        Data_grandTotal: pz.Data_grandTotal
+      },
+      holdings,
+      fundCalc,
+            trend: generateTrendPrediction(pz, pz.Data_netWorthTrend)
+    };
+
+    renderDetail(code, data);
+  } catch(e) {
+    body.innerHTML = `<div class="detail-loading">加载失败: ${e.message}<br><button onclick="openDetail('${code}','${name}')" style="margin-top:12px;padding:6px 16px;border:1px solid var(--blue);border-radius:6px;background:transparent;color:var(--blue);cursor:pointer">重试</button></div>`;
+  }
+}
+
+function closeDetail() {
+  stopNXAutoRefresh(currentDetailCode);
+  stopHoldingsRealtimeRefresh();
+  stopHoldingsDataRefresh();
+  document.getElementById('detailMask').classList.remove('show');
+  document.body.style.overflow = '';
+  // 重置编辑状态
+  if (isDetailEditing) {
+    isDetailEditing = false;
+    document.getElementById('detailEditForm').style.display = 'none';
+    document.getElementById('detailBody').style.display = 'block';
+    document.getElementById('detailEditBtn').textContent = '编辑';
+    document.getElementById('detailEditBtn').onclick = toggleDetailEdit;
+  }
+}
+
+function renderDetail(code, data) {
+  const body = document.getElementById('detailBody');
+  if (data.name) document.getElementById('detailTitle').textContent = data.name;
+  let html = '';
+
+    const pz = data.pzData || {};
+  const fc = data.fundCalc;
+  const netWorthTrend = pz.Data_netWorthTrend;
+
+  // ========== 卡片式顶部区域 ==========
+  if (fc) {
+    const dayPct = fc.dayPct || 0;
+    const estDate = fc.gztime ? fc.gztime.slice(0, 10) : fc.jzrq || '-';
+    const estDateShort = estDate !== '-' ? estDate.slice(5) : '-'; // MM-DD
+    const navDate = fc.jzrq ? fc.jzrq.slice(5) : '-';
+    const dayProfit = fc.dayProfit || 0;
+    const profit = fc.profit || 0;
+        const profitPct = fc.profitPct || 0;
+    
+        // 使用天天基金官方的近1年收益率 syl_1n
+    const yearReturn = pz.syl_1n != null ? (parseFloat(pz.syl_1n) >= 0 ? '+' : '') + parseFloat(pz.syl_1n).toFixed(2) + '%' : '--';
+
+        // ========== 顶部区域（重构版） ==========
+    // 第一行：当日涨幅 + 估算净值/昨日净值
+    const pctColor = dayPct >= 0 ? '#e74c3c' : '#27ae60';
+    const pctSign = dayPct >= 0 ? '+' : '';
+    html += `<div style="background:#fff;border-radius:16px;padding:16px;margin-bottom:12px;box-shadow:0 1px 4px rgba(0,0,0,0.04)">
+      <div style="display:flex;align-items:flex-end;justify-content:space-between;margin-bottom:12px">
+        <div>
+          <div style="font-size:12px;color:#999;margin-bottom:2px">当日涨幅 <span style="color:#bbb">${estDateShort}</span></div>
+          <div style="font-size:36px;font-weight:700;color:${pctColor};line-height:1.1">${pctSign}${fmt(dayPct)}%</div>
+        </div>
+        <div style="text-align:right">
+                    <div style="font-size:11px;color:#999;margin-bottom:2px">估算净值</div>
+          <div style="font-size:20px;font-weight:600;color:#333">${fmt(fc.nav, 4)}</div>
+        </div>
+      </div>
+      <div style="display:flex;gap:0;border-top:1px solid #f5f5f5;padding-top:12px">
+        <div style="flex:1;text-align:center;border-right:1px solid #f5f5f5">
+                    <div style="font-size:11px;color:#999;margin-bottom:2px">昨日净值</div>
+          <div style="font-size:15px;font-weight:600;color:#333">${fmt(fc.navPrev, 4)}</div>
+        </div>
+        <div style="flex:1;text-align:center;border-right:1px solid #f5f5f5">
+          <div style="font-size:11px;color:#999;margin-bottom:2px">近1年</div>
+          <div style="font-size:15px;font-weight:600;color:${yearReturn !== '--' && parseFloat(yearReturn) >= 0 ? '#e74c3c' : '#27ae60'}">${yearReturn}</div>
+        </div>
+        <div style="flex:1;text-align:center">
+          <div style="font-size:11px;color:#999;margin-bottom:2px">持有收益</div>
+          <div style="font-size:15px;font-weight:600;color:${profit >= 0 ? '#e74c3c' : '#27ae60'}">${profit >= 0 ? '+' : ''}¥${fmt(profit)}</div>
+        </div>
+      </div>
+        </div>`;
+
+    // ========== 持仓信息卡片（可展开） ==========
+    const hasHolding = fc.currentValue > 0 || profit !== 0;
+    if (hasHolding) {
+      const holdCost = fc.totalCost || 0;
+      const holdShares = fc.shares || 0;
+      const holdRatio = holdCost > 0 ? (fc.currentValue / holdCost * 100).toFixed(2) : '0';
+      const holdDays = fc.holdDays || 0;
+      
+      html += `<div style="background:#fff;border-radius:16px;margin-bottom:12px;box-shadow:0 1px 4px rgba(0,0,0,0.04);overflow:hidden">
+        <!-- 收起状态：一行显示 -->
+        <div id="holdBrief" onclick="toggleHolding()" style="display:flex;align-items:center;padding:14px 16px;cursor:pointer">
+          <div style="flex:1;display:flex;gap:16px">
+            <div>
+              <div style="font-size:11px;color:#999">持有金额</div>
+              <div style="font-size:16px;font-weight:600;color:#333">¥${fmt(fc.currentValue)}</div>
+            </div>
+            <div>
+              <div style="font-size:11px;color:#999">持有收益</div>
+              <div style="font-size:16px;font-weight:600;color:${profit >= 0 ? '#e74c3c' : '#27ae60'}">${profit >= 0 ? '+' : ''}¥${fmt(profit)}</div>
+            </div>
+            <div>
+              <div style="font-size:11px;color:#999">收益率</div>
+              <div style="font-size:16px;font-weight:600;color:${profitPct >= 0 ? '#e74c3c' : '#27ae60'}">${profitPct >= 0 ? '+' : ''}${fmt(profitPct)}%</div>
+            </div>
+          </div>
+          <div id="holdArrow" style="color:#ccc;font-size:18px;transition:transform 0.2s">∧</div>
+        </div>
+        <!-- 展开状态：详细信息 -->
+        <div id="holdDetail" style="display:none;padding:0 16px 14px;border-top:1px solid #f5f5f5">
+          <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px;padding-top:12px">
+            <div>
+              <div style="font-size:11px;color:#999">持有金额</div>
+              <div style="font-size:14px;font-weight:600;color:#333">¥${fmt(fc.currentValue)}</div>
+            </div>
+            <div>
+              <div style="font-size:11px;color:#999">持有份额</div>
+              <div style="font-size:14px;font-weight:600;color:#333">${fmt(holdShares)}</div>
+            </div>
+            <div>
+              <div style="font-size:11px;color:#999">持仓占比</div>
+              <div style="font-size:14px;font-weight:600;color:#333">${holdRatio}%</div>
+            </div>
+            <div>
+              <div style="font-size:11px;color:#999">持有收益</div>
+              <div style="font-size:14px;font-weight:600;color:${profit >= 0 ? '#e74c3c' : '#27ae60'}">${profit >= 0 ? '+' : ''}¥${fmt(profit)}</div>
+            </div>
+            <div>
+              <div style="font-size:11px;color:#999">持有收益率</div>
+              <div style="font-size:14px;font-weight:600;color:${profitPct >= 0 ? '#e74c3c' : '#27ae60'}">${profitPct >= 0 ? '+' : ''}${fmt(profitPct)}%</div>
+            </div>
+            <div>
+              <div style="font-size:11px;color:#999">持仓成本</div>
+              <div style="font-size:14px;font-weight:600;color:#333">${fmt(holdCost)}</div>
+            </div>
+            <div>
+              <div style="font-size:11px;color:#999">当日收益</div>
+              <div style="font-size:14px;font-weight:600;color:${dayProfit >= 0 ? '#e74c3c' : '#27ae60'}">${dayProfit >= 0 ? '+' : ''}¥${fmt(dayProfit)}</div>
+            </div>
+            <div>
+              <div style="font-size:11px;color:#999">昨日收益</div>
+              <div style="font-size:14px;font-weight:600;color:#333">¥${fmt(fc.yesterdayProfit || 0)}</div>
+            </div>
+            <div>
+              <div style="font-size:11px;color:#999">持有天数</div>
+              <div style="font-size:14px;font-weight:600;color:#333">${holdDays}天</div>
+            </div>
+          </div>
+        </div>
+      </div>`;
+    }
+
+        // Tab切换栏
+    html += `<div style="display:flex;gap:0;margin-bottom:16px;background:#f5f5f5;border-radius:12px;padding:4px">
+      <button class="detail-tab active" onclick="switchDetailTab(this,'nx')" style="flex:1;padding:10px 0;border:none;background:transparent;font-size:13px;color:#999;border-radius:10px;transition:all 0.2s">NX交易法</button>
+      <button class="detail-tab" onclick="switchDetailTab(this,'related')" style="flex:1;padding:10px 0;border:none;background:transparent;font-size:13px;color:#999;border-radius:10px;transition:all 0.2s">关联涨幅</button>
+      <button class="detail-tab" onclick="switchDetailTab(this,'trend')" style="flex:1;padding:10px 0;border:none;background:transparent;font-size:13px;color:#999;border-radius:10px;transition:all 0.2s">业绩走势</button>
+      <button class="detail-tab" onclick="switchDetailTab(this,'profit')" style="flex:1;padding:10px 0;border:none;background:transparent;font-size:13px;color:#999;border-radius:10px;transition:all 0.2s">我的收益</button>
+      <button class="detail-tab" onclick="switchDetailTab(this,'predict')" style="flex:1;padding:10px 0;border:none;background:transparent;font-size:13px;color:#999;border-radius:10px;transition:all 0.2s">趋势预测</button>
+      <button class="detail-tab" onclick="switchDetailTab(this,'holdings')" style="flex:1;padding:10px 0;border:none;background:transparent;font-size:13px;color:#999;border-radius:10px;transition:all 0.2s">重仓股票</button>
+    </div>`;
+
+    // Tab内容区域
+    html += `<div id="detailTabContent">`;
+    
+        // NX交易法 Tab
+    const nxShares = fc.shares || 0;
+    const nxNav = fc.nav || fc.navPrev || 0;
+    const nxCost = fc.totalCost || 0;
+    const nxPosValue = nxShares * nxNav;
+    // 自动计算N值，但优先使用手动覆盖值
+    const autoN = calcNXAutoN(netWorthTrend, fc.code);
+    if (!window._nxNValues) window._nxNValues = {};
+    const manualN = getNXManualN(fc.code);
+    const effectiveN = manualN !== null ? manualN : autoN;
+    window._nxNValues[fc.code] = effectiveN;
+    const nxAdjustRatio = 25 / effectiveN;
+    const isManualN = manualN !== null;
+
+    // N值策略描述
+    const nxStrategyMap = {
+      1: '货币/黄金基金',
+      2: '稳健指数',
+      3: '宽基指数',
+      4: '行业指数',
+      5: '高波动行业',
+      6: '较高波动',
+      7: '高波动',
+      8: '很高波动',
+      9: '极高波动',
+      10: '超高波动'
+    };
+    const nxStrategy = nxStrategyMap[effectiveN] || '自定义';
+
+    html += `<div id="tab-nx" class="tab-panel active">
+      <div style="background:#fff;border-radius:12px;padding:16px;margin-bottom:12px">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">
+          <div style="font-size:14px;font-weight:600">NX交易法计算</div>
+<div style="display:flex;flex-direction:column;gap:8px;background:#f0f7ff;padding:8px 12px;border-radius:8px">
+            <div style="display:flex;align-items:center;gap:8px">
+              <span style="font-size:12px;color:#666">N值:</span>
+              <select id="nx-select-n-${fc.code}" onchange="updateNXManualN('${fc.code}', this.value)" style="flex:1;border:1px solid #e0e0e0;border-radius:6px;padding:6px 8px;font-size:13px;outline:none;background:#fff;cursor:pointer">
+              <option value="1" ${effectiveN === 1 ? "selected" : ""}>1X (波动±5%, 调仓25.00%) - 货币/黄金基金</option>
+              <option value="2" ${effectiveN === 2 ? "selected" : ""}>2X (波动±10%, 调仓12.50%) - 稳健指数</option>
+              <option value="3" ${effectiveN === 3 ? "selected" : ""}>3X (波动±15%, 调仓8.33%) - 宽基指数</option>
+              <option value="4" ${effectiveN === 4 ? "selected" : ""}>4X (波动±20%, 调仓6.25%) - 行业指数</option>
+              <option value="5" ${effectiveN === 5 ? "selected" : ""}>5X (波动±25%, 调仓5.00%) - 高波动行业</option>
+              <option value="6" ${effectiveN === 6 ? "selected" : ""}>6X (波动±30%, 调仓4.17%) - 较高波动</option>
+              <option value="7" ${effectiveN === 7 ? "selected" : ""}>7X (波动±35%, 调仓3.57%) - 高波动</option>
+              <option value="8" ${effectiveN === 8 ? "selected" : ""}>8X (波动±40%, 调仓3.12%) - 很高波动</option>
+              <option value="9" ${effectiveN === 9 ? "selected" : ""}>9X (波动±45%, 调仓2.78%) - 极高波动</option>
+              <option value="10" ${effectiveN === 10 ? "selected" : ""}>10X (波动±50%, 调仓2.50%) - 超高波动</option>
+            </select>
+            </div>
+            <div style="display:flex;align-items:center;gap:8px;justify-content:center">
+              <span id="nx-adjust-ratio-${fc.code}" style="font-size:11px;color:#666">每变化±1%，调仓±${nxAdjustRatio.toFixed(2)}%</span>
+            </div>
+          </div>
+        </div>
+        <div id="nx-strategy-${fc.code}" style="background:#e8f5e9;border-radius:8px;padding:10px;margin-bottom:12px;text-align:center">
+          <span style="font-size:12px;color:#2e7d32">📊 策略类型：${nxStrategy}</span>
+        </div>
+        <!-- N 值已改为后台自动计算，不再显示开关 -->
+        <div style="background:#e3f2fd;border-radius:8px;padding:10px;margin-bottom:12px">
+          <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:8px">
+            <span style="font-size:12px;color:#1565c0">📈 实时估值</span>
+            <span id="nx-est-time-${fc.code}" style="font-size:11px;color:#999">--</span>
+          </div>
+          <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:8px">
+            <div style="text-align:center">
+              <div style="font-size:10px;color:#666">预估净值</div>
+              <div id="nx-est-nav-${fc.code}" style="font-size:14px;font-weight:600;color:#1565c0;margin-top:2px">${(fc.gsz || nxNav).toFixed(4)}</div>
+            </div>
+            <div style="text-align:center">
+              <div style="font-size:10px;color:#666">预估涨幅</div>
+              <div id="nx-est-pct-${fc.code}" style="font-size:14px;font-weight:600;color:${(fc.gszzl || 0) >= 0 ? '#e74c3c' : '#27ae60'};margin-top:2px">${(fc.gszzl || 0) >= 0 ? '+' : ''}${(fc.gszzl || 0).toFixed(2)}%</div>
+            </div>
+            <div style="text-align:center">
+              <div style="font-size:10px;color:#666">持仓市值</div>
+              <div id="nx-est-pos-${fc.code}" style="font-size:14px;font-weight:600;color:#333;margin-top:2px">¥${fmt(nxPosValue)}</div>
+            </div>
+            <div style="text-align:center">
+              <div style="font-size:10px;color:#666">备用金</div>
+              <div id="nx-est-reserve-${fc.code}" style="font-size:14px;font-weight:600;color:#333;margin-top:2px">¥${fmt(getNXManualReserve(fc.code))}</div>
+            </div>
+          </div>
+          <div style="display:flex;align-items:center;gap:8px;margin-top:10px">
+            <span style="font-size:12px;color:#666">备用金固定:</span>
+            <input id="nx-manual-reserve-${fc.code}" type="number" value="${getNXManualReserve(fc.code)}" placeholder="默认5000" style="flex:1;border:1px solid #e0e0e0;border-radius:6px;padding:6px 8px;font-size:13px;outline:none" oninput="updateNXManualReserve('${fc.code}', this.value)">
+            <button onclick="clearNXManualReserve('${fc.code}')" style="padding:6px 10px;border:1px solid #e0e0e0;border-radius:6px;background:#f5f5f5;font-size:12px;color:#666">恢复默认5000</button>
+          </div>
+        </div>
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin-bottom:12px">
+          <div style="background:#f8f9fa;border-radius:8px;padding:10px;text-align:center">
+            <div style="font-size:11px;color:#999">持仓份额</div>
+            <div style="font-size:15px;font-weight:600;color:#333;margin-top:4px">${nxShares.toFixed(2)}</div>
+          </div>
+          <div style="background:#f8f9fa;border-radius:8px;padding:10px;text-align:center">
+            <div style="font-size:11px;color:#999">当前净值</div>
+            <div style="font-size:15px;font-weight:600;color:#333;margin-top:4px">${nxNav.toFixed(4)}</div>
+          </div>
+          <div style="background:#f8f9fa;border-radius:8px;padding:10px;text-align:center">
+            <div style="font-size:11px;color:#999">持仓市值</div>
+            <div style="font-size:15px;font-weight:600;color:#333;margin-top:4px">¥${fmt(nxPosValue)}</div>
+          </div>
+        </div>
+                <div id="nx-result-${fc.code}"></div>
+      </div>
+    </div>`;
+    
+        // 默认显示关联涨幅
+    html += `<div id="tab-related" class="tab-panel" style="display:none">`;
+    // 阶段收益率
+    const rates = [
+      {label:'近1月',val:pz.syl_1y},{label:'近3月',val:pz.syl_3y},{label:'近6月',val:pz.syl_6y},
+      {label:'近1年',val:pz.syl_1n},{label:'今年来',val:pz.syl_1z},{label:'近1周',val:pz.syl_1zy}
+    ].filter(r => r.val != null);
+    if (rates.length > 0) {
+      html += `<div style="background:#fff;border-radius:12px;padding:16px;margin-bottom:12px">
+        <div style="font-size:14px;font-weight:600;margin-bottom:12px">阶段收益率</div>
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px">`;
+      rates.forEach(r => {
+        const cls = r.val >= 0 ? 'color:#e74c3c' : 'color:#27ae60';
+        const sign = r.val >= 0 ? '+' : '';
+        html += `<div style="text-align:center">
+          <div style="font-size:11px;color:#999;margin-bottom:4px">${r.label}</div>
+          <div style="font-size:16px;font-weight:600;${cls}">${sign}${Number(r.val).toFixed(2)}%</div>
+        </div>`;
+      });
+      html += `</div></div>`;
+    }
+    // 基金经理
+    if (data.manager && data.manager.length > 0) {
+      html += `<div style="background:#fff;border-radius:12px;padding:16px;margin-bottom:12px">
+        <div style="font-size:14px;font-weight:600;margin-bottom:12px">基金经理</div>
+        <div style="display:flex;flex-wrap:wrap;gap:8px">`;
+      data.manager.forEach(m => { 
+        html += `<span style="display:inline-block;padding:6px 12px;background:#f5f5f5;border-radius:8px;font-size:13px">${m.name}</span>`; 
+      });
+      html += `</div></div>`;
+    }
+    html += `</div>`;
+
+    // 业绩走势Tab
+    html += `<div id="tab-trend" class="tab-panel" style="display:none">`;
+    if (netWorthTrend && netWorthTrend.length > 0) {
+      const trendLen = netWorthTrend.length;
+      const latestVal = netWorthTrend[trendLen - 1]?.y || 0;
+      const getReturn = (days) => {
+        const idx = Math.max(0, trendLen - 1 - days);
+        const baseVal = netWorthTrend[idx]?.y || 0;
+        return baseVal > 0 ? ((latestVal - baseVal) / baseVal * 100) : 0;
+      };
+      const returns = {
+        '1m': getReturn(23), '3m': getReturn(66), '6m': getReturn(132),
+        '1y': getReturn(250), '3y': getReturn(750), 'all': getReturn(trendLen)
+      };
+      window._trendData = netWorthTrend;
+      window._trendReturns = returns;
+
+      html += `<div style="background:#fff;border-radius:12px;padding:16px">
+        <div style="display:flex;gap:0;margin-bottom:12px;background:#f5f5f5;border-radius:10px;padding:4px">
+          <button class="trend-tab active" data-period="1m" onclick="switchTrendPeriod(this,'1m')" style="flex:1;padding:8px 0;border:none;background:transparent;font-size:12px;color:#999;border-radius:8px">1月</button>
+          <button class="trend-tab" data-period="3m" onclick="switchTrendPeriod(this,'3m')" style="flex:1;padding:8px 0;border:none;background:transparent;font-size:12px;color:#999;border-radius:8px">3月</button>
+          <button class="trend-tab" data-period="6m" onclick="switchTrendPeriod(this,'6m')" style="flex:1;padding:8px 0;border:none;background:transparent;font-size:12px;color:#999;border-radius:8px">6月</button>
+          <button class="trend-tab" data-period="1y" onclick="switchTrendPeriod(this,'1y')" style="flex:1;padding:8px 0;border:none;background:transparent;font-size:12px;color:#999;border-radius:8px">1年</button>
+          <button class="trend-tab" data-period="3y" onclick="switchTrendPeriod(this,'3y')" style="flex:1;padding:8px 0;border:none;background:transparent;font-size:12px;color:#999;border-radius:8px">3年</button>
+          <button class="trend-tab" data-period="all" onclick="switchTrendPeriod(this,'all')" style="flex:1;padding:8px 0;border:none;background:transparent;font-size:12px;color:#999;border-radius:8px">成立来</button>
+        </div>
+        <div id="trendReturnDisplay" style="display:flex;justify-content:space-between;font-size:11px;color:var(--sub);margin-bottom:8px">
+          <span id="trendStartDate">+0.00%</span>
+          <span id="trendHoverDate" style="color:var(--red)">${netWorthTrend[netWorthTrend.length-1]?.x ? new Date(netWorthTrend[netWorthTrend.length-1].x).toLocaleDateString('zh-CN',{month:'2-digit',day:'2-digit'}).replace(/\//g,'-') : ''} +0.00%</span>
+          <span id="trendEndDate" style="color:var(--red)">+${returns['1m'].toFixed(2)}%</span>
+        </div>
+        <canvas id="trendChart" width="600" height="200" style="width:100%;height:200px"></canvas>
+      </div>`;
+    } else {
+      html += `<div style="background:#fff;border-radius:12px;padding:40px;text-align:center">
+        <div style="font-size:48px;margin-bottom:12px">📊</div>
+        <div style="font-size:14px;color:#999">暂无业绩数据</div>
+      </div>`;
+    }
+    html += `</div>`;
+
+    // 我的收益Tab
+    html += `<div id="tab-profit" class="tab-panel" style="display:none">
+      <div style="background:#fff;border-radius:12px;padding:16px">
+        <div style="display:grid;grid-template-columns:repeat(2,1fr);gap:16px">
+          <div style="text-align:center;padding:16px;background:#f8f9fa;border-radius:12px">
+            <div style="font-size:11px;color:#999;margin-bottom:4px">当前金额</div>
+            <div style="font-size:20px;font-weight:600;color:#333">¥${fmt(fc.currentValue)}</div>
+          </div>
+          <div style="text-align:center;padding:16px;background:#f8f9fa;border-radius:12px">
+            <div style="font-size:11px;color:#999;margin-bottom:4px">持仓成本</div>
+            <div style="font-size:20px;font-weight:600;color:#333">¥${fmt(fc.totalCost)}</div>
+          </div>
+          <div style="text-align:center;padding:16px;background:#f8f9fa;border-radius:12px">
+            <div style="font-size:11px;color:#999;margin-bottom:4px">持有收益</div>
+            <div style="font-size:20px;font-weight:600;${profit >= 0 ? 'color:#e74c3c' : 'color:#27ae60'}">${profit >= 0 ? '+' : ''}¥${fmt(profit)}</div>
+          </div>
+          <div style="text-align:center;padding:16px;background:#f8f9fa;border-radius:12px">
+            <div style="font-size:11px;color:#999;margin-bottom:4px">持有收益率</div>
+            <div style="font-size:20px;font-weight:600;${profitPct >= 0 ? 'color:#e74c3c' : 'color:#27ae60'}">${profitPct >= 0 ? '+' : ''}${fmt(profitPct)}%</div>
+          </div>
+        </div>
+        <div style="margin-top:16px;padding:16px;background:#f8f9fa;border-radius:12px">
+          <div style="display:flex;justify-content:space-between;margin-bottom:8px">
+            <span style="font-size:13px;color:#666">日收益</span>
+            <span style="font-size:13px;font-weight:600;${dayProfit >= 0 ? 'color:#e74c3c' : 'color:#27ae60'}">${dayProfit >= 0 ? '+' : ''}¥${fmt(dayProfit)}</span>
+          </div>
+          <div style="display:flex;justify-content:space-between">
+            <span style="font-size:13px;color:#666">日收益率</span>
+            <span style="font-size:13px;font-weight:600;${dayPct >= 0 ? 'color:#e74c3c' : 'color:#27ae60'}">${dayPct >= 0 ? '+' : ''}${fmt(dayPct)}%</span>
+          </div>
+        </div>
+      </div>
+    </div>`;
+
+    // 趋势预测Tab
+    html += `<div id="tab-predict" class="tab-panel" style="display:none">`;
+    const trend = data.trend;
+    if (trend) {
+      const trendColor = trend.trend === 'bullish' ? '#e74c3c' : trend.trend === 'bearish' ? '#27ae60' : '#f39c12';
+      const trendBg = trend.trend === 'bullish' ? 'rgba(231,76,60,0.08)' : trend.trend === 'bearish' ? 'rgba(39,174,96,0.08)' : 'rgba(243,156,18,0.08)';
+      const scoreColor = trend.score >= 65 ? '#e74c3c' : trend.score >= 45 ? '#f39c12' : '#27ae60';
+
+      html += `<div style="background:#fff;border-radius:12px;padding:16px">
+        <div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:16px;padding:16px;background:${trendBg};border-radius:12px">
+          <div style="display:flex;align-items:center;gap:12px">
+            <div style="width:44px;height:44px;display:flex;align-items:center;justify-content:center;border-radius:12px;background:${trendColor};color:#fff;font-size:20px;font-weight:700">${trend.trendText.charAt(0)}</div>
+            <span style="font-size:22px;font-weight:700;color:${trendColor}">${trend.trendText}</span>
+          </div>
+          <div style="text-align:right">
+            <div style="font-size:11px;color:#999">置信度</div>
+            <div style="font-size:22px;font-weight:700;color:${trendColor}">${trend.confidence}%</div>
+          </div>
+        </div>
+        <div style="display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-bottom:16px">
+          <div style="text-align:center;padding:16px;background:#f8f9fa;border-radius:12px">
+            <div style="font-size:11px;color:#999;margin-bottom:4px">支撑位</div>
+            <div style="font-size:20px;font-weight:700;color:#27ae60">${trend.support}</div>
+          </div>
+          <div style="text-align:center;padding:16px;background:#f8f9fa;border-radius:12px">
+            <div style="font-size:11px;color:#999;margin-bottom:4px">阻力位</div>
+            <div style="font-size:20px;font-weight:700;color:#e74c3c">${trend.resistance}</div>
+          </div>
+        </div>
+                ${trend.macdData ? `<div style="margin-bottom:16px;padding:12px;background:#f8f9fa;border-radius:12px">
+          <div style="font-size:13px;font-weight:600;margin-bottom:8px">📊 MACD 技术指标</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px;font-size:12px">
+            <div><span style="color:#999">DIF:</span> <span style="font-weight:600;color:${trend.macdData.dif > 0 ? '#e74c3c' : '#27ae60'}">${trend.macdData.dif.toFixed(4)}</span></div>
+            <div><span style="color:#999">DEA:</span> <span style="font-weight:600;color:${trend.macdData.dea > 0 ? '#e74c3c' : '#27ae60'}">${trend.macdData.dea.toFixed(4)}</span></div>
+            <div><span style="color:#999">MACD:</span> <span style="font-weight:600;color:${trend.macdData.hist > 0 ? '#e74c3c' : '#27ae60'}">${trend.macdData.hist.toFixed(4)}</span></div>
+          </div>
+          <div style="margin-top:6px;font-size:11px;color:#999">
+            ${trend.macdData.goldenCross ? '🔴 <b style="color:#e74c3c">MACD 金叉</b> — 买入信号' :
+              trend.macdData.deathCross ? '🟢 <b style="color:#27ae60">MACD 死叉</b> — 卖出信号' :
+              trend.macdData.bullZone ? '多头区域 (DIF/DEA > 0)' : trend.macdData.bearZone ? '空头区域 (DIF/DEA < 0)' : '零轴附近'}
+            ${trend.macdData.histRising ? ' · 柱状图放大' : ' · 柱状图缩小'}
+          </div>
+        </div>` : ''}
+        ${trend.maData ? `<div style="margin-bottom:16px;padding:12px;background:#f8f9fa;border-radius:12px">
+          <div style="font-size:13px;font-weight:600;margin-bottom:8px">📈 均线分析 (MA5 / MA10)</div>
+          <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:12px">
+            <div><span style="color:#999">MA5:</span> <span style="font-weight:600">${trend.maData.ma5.toFixed(4)}</span></div>
+            <div><span style="color:#999">MA10:</span> <span style="font-weight:600">${trend.maData.ma10.toFixed(4)}</span></div>
+          </div>
+          <div style="margin-top:6px;font-size:11px;color:#999">
+            ${trend.maData.goldenCross ? '🔴 <b style="color:#e74c3c">均线金叉</b> — MA5 上穿 MA10' :
+              trend.maData.deathCross ? '🟢 <b style="color:#27ae60">均线死叉</b> — MA5 下穿 MA10' :
+              trend.maData.pricePosition === 'above' ? '价格站上双均线，多头排列' :
+              trend.maData.pricePosition === 'below' ? '价格跌破双均线，空头排列' : '均线纠缠，方向待选择'}
+          </div>
+        </div>` : ''}
+        ${trend.signals.map(s => {
+          const tagBg = s.type === 'buy' ? '#e74c3c' : s.type === 'sell' ? '#27ae60' : '#888';
+          const tagText = s.type === 'buy' ? '买' : s.type === 'sell' ? '卖' : '中';
+          return `<div style="display:flex;align-items:flex-start;gap:12px;padding:12px 0;border-bottom:1px solid #f0f0f0">
+            <div style="width:32px;height:32px;min-width:32px;display:flex;align-items:center;justify-content:center;border-radius:50%;background:${tagBg};color:#fff;font-size:13px;font-weight:700">${tagText}</div>
+            <div>
+              <div style="font-size:14px;font-weight:600;margin-bottom:4px">${s.title}</div>
+              <div style="font-size:12px;color:#999;line-height:1.5">${s.desc}</div>
+            </div>
+          </div>`;
+        }).join('')}
+                <div style="text-align:center;padding:24px 16px;background:#f8f9fa;border-radius:12px;margin-top:16px">
+          <div style="display:flex;align-items:center;justify-content:center;gap:8px;margin-bottom:8px">
+            <span style="font-size:13px;color:#999">综合评分</span>
+            <span style="display:inline-block;padding:4px 12px;background:${scoreColor};color:#fff;border-radius:12px;font-size:12px;font-weight:600">${trend.grade}级</span>
+          </div>
+          <div style="font-size:48px;font-weight:700;color:${scoreColor};line-height:1.1">${trend.score}</div>
+          <div style="font-size:12px;color:#999;margin-top:8px">${trend.summary}</div>
+        </div>
+        ${trend.action ? `<div style="margin-top:16px;padding:16px;background:${trend.actionColor}10;border:1px solid ${trend.actionColor}30;border-radius:12px">
+          <div style="display:flex;align-items:center;gap:8px;margin-bottom:6px">
+            <span style="font-size:16px;font-weight:700;color:${trend.actionColor}">${trend.action}</span>
+          </div>
+          <div style="font-size:12px;color:#666;line-height:1.5">${trend.actionDesc}</div>
+        </div>` : ''}
+      </div>`;
+    } else {
+      html += `<div style="background:#fff;border-radius:12px;padding:40px;text-align:center">
+        <div style="font-size:48px;margin-bottom:12px">📈</div>
+        <div style="font-size:14px;color:#999">暂无预测数据</div>
+      </div>`;
+        }
+    html += `</div>`;
+
+        // 重仓股票Tab
+    html += `<div id="tab-holdings" class="tab-panel" style="display:none">`;
+    if (data.holdings && data.holdings.length > 0) {
+      html += `<div style="background:#fff;border-radius:12px;padding:16px">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px">
+          <div style="font-size:14px;font-weight:600">前10大重仓</div>
+          <div style="font-size:11px;color:#999">共${Math.min(data.holdings.length, 10)}只</div>
+        </div>
+        <div style="overflow-x:auto">
+          <table style="width:100%;border-collapse:collapse;font-size:13px">
+            <thead>
+              <tr style="border-bottom:2px solid #f0f0f0">
+                <th style="text-align:left;padding:8px 4px;color:#999;font-weight:500;font-size:12px">#</th>
+                                <th style="text-align:left;padding:8px 4px;color:#999;font-weight:500;font-size:12px">股票名称</th>
+                <th style="text-align:right;padding:8px 4px;color:#999;font-weight:500;font-size:12px">涨跌幅</th>
+                <th style="text-align:right;padding:8px 4px;color:#999;font-weight:500;font-size:12px">占比</th>
+              </tr>
+            </thead>
+                        <tbody>`;
+      data.holdings.slice(0, 10).forEach((h, i) => {
+        const change = h.change;
+        const changeText = change != null ? (change > 0 ? `+${change}%` : `${change}%`) : '-';
+        const changeColor = change > 0 ? '#e74c3c' : change < 0 ? '#27ae60' : '#999';
+        html += `<tr style="border-bottom:1px solid #f5f5f5">
+          <td style="padding:10px 4px;color:#999;font-size:12px">${i + 1}</td>
+          <td style="padding:10px 4px;font-weight:500">${h.name}</td>
+          <td style="padding:10px 4px;text-align:right;font-weight:600;color:${changeColor}">${changeText}</td>
+          <td style="padding:10px 4px;text-align:right;font-weight:600;color:#333">${h.percent}%</td>
+        </tr>`;
+      });
+      html += `</tbody></table></div></div>`;
+    } else {
+      html += `<div style="background:#fff;border-radius:12px;padding:40px;text-align:center">
+        <div style="font-size:48px;margin-bottom:12px">📊</div>
+        <div style="font-size:14px;color:#999">暂无持仓数据</div>
+      </div>`;
+    }
+    html += `</div>`;
+
+    html += `</div>`; // 关闭tab-content
+  }
+
+  // 资产配置（如果有）
+  const assetAlloc = pz.Data_assetAllocation;
+  if (assetAlloc) {
+    let allocItems = [];
+    if (Array.isArray(assetAlloc)) {
+      allocItems = assetAlloc.filter(item => item && item.percent);
+    } else if (typeof assetAlloc === 'object') {
+      if (assetAlloc.type && assetAlloc.percent && Array.isArray(assetAlloc.type)) {
+        assetAlloc.type.forEach((name, i) => {
+          if (assetAlloc.percent[i]) allocItems.push({ name, percent: assetAlloc.percent[i] });
+        });
+      } else {
+        for (const [key, val] of Object.entries(assetAlloc)) {
+          if (val && typeof val === 'string' && val.includes('%')) allocItems.push({ name: key, percent: val });
+        }
+      }
+    }
+    if (allocItems.length > 0) {
+      html += `<div style="background:#fff;border-radius:12px;padding:16px;margin-top:12px">
+        <div style="font-size:14px;font-weight:600;margin-bottom:12px">资产配置</div>
+        <div style="display:grid;grid-template-columns:repeat(3,1fr);gap:12px">`;
+      allocItems.forEach(item => {
+        html += `<div style="text-align:center">
+          <div style="font-size:11px;color:#999;margin-bottom:4px">${item.name}</div>
+          <div style="font-size:16px;font-weight:600;color:#333">${item.percent}</div>
+        </div>`;
+      });
+      html += `</div></div>`;
+        }
+  }
+
+  html += `<div style="text-align:center;font-size:11px;color:#999;padding:20px 0">数据来源：天天基金网</div>`;
+    body.innerHTML = html;
+
+  // 初始化NX交易法计算并启动实时刷新
+  setTimeout(() => { calcNXTrade(code); startNXAutoRefresh(code); }, 0);
+
+  // 绘制业绩走势图
+  if (netWorthTrend && netWorthTrend.length > 0) {
+    // 默认显示近1月（约22个交易日）
+    const defaultSliced = netWorthTrend.slice(-Math.min(23, netWorthTrend.length));
+    drawTrendChart('trendChart', defaultSliced);
+    // 存储全量数据供周期切换使用
+    window._trendData = netWorthTrend;
+  }
+}
+
+// 绘制业绩走势图（带十字光标）
+function drawTrendChart(canvasId, data) {
+  const canvas = document.getElementById(canvasId);
+  if (!canvas) return;
+  const ctx = canvas.getContext('2d');
+  const dpr = window.devicePixelRatio || 1;
+  const rect = canvas.getBoundingClientRect();
+  canvas.width = rect.width * dpr;
+  canvas.height = rect.height * dpr;
+  ctx.scale(dpr, dpr);
+  const w = rect.width, h = rect.height;
+
+  // 使用传入的数据（不再截取，因为switchTrendPeriod已经截取好了）
+  const recent = data;
+  if (recent.length < 2) return;
+
+  const values = recent.map(d => d.y);
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const range = max - min || 1;
+  const padding = { top: 20, right: 10, bottom: 30, left: 50 };
+  const chartW = w - padding.left - padding.right;
+  const chartH = h - padding.top - padding.bottom;
+
+  // 存储数据供交互使用
+  canvas._chartMeta = { recent, min, max, range, padding, chartW, chartH, w, h, dpr };
+
+  function draw(crosshairIdx) {
+    ctx.clearRect(0, 0, w, h);
+    // 背景
+    ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--card-bg').trim() || '#fff';
+    ctx.fillRect(0, 0, w, h);
+
+    // 网格线
+    ctx.strokeStyle = 'rgba(128,128,128,0.15)';
+    ctx.lineWidth = 0.5;
+    for (let i = 0; i <= 4; i++) {
+      const y = padding.top + (chartH / 4) * i;
+      ctx.beginPath();
+      ctx.moveTo(padding.left, y);
+      ctx.lineTo(w - padding.right, y);
+      ctx.stroke();
+      const rawVal = max - (range / 4) * i;
+      const baseVal = recent[0]?.y || 1;
+      const pctVal = baseVal > 0 ? ((rawVal - baseVal) / baseVal * 100) : 0;
+      ctx.fillStyle = '#999';
+      ctx.font = '10px sans-serif';
+      ctx.textAlign = 'right';
+      ctx.fillText((pctVal >= 0 ? '+' : '') + pctVal.toFixed(1) + '%', padding.left - 5, y + 3);
+    }
+
+    // X轴标签
+    ctx.fillStyle = '#999';
+    ctx.font = '10px sans-serif';
+    ctx.textAlign = 'center';
+    [0, Math.floor(recent.length / 2), recent.length - 1].forEach(i => {
+      const x = padding.left + (chartW / (recent.length - 1)) * i;
+      const date = recent[i].x ? new Date(recent[i].x) : null;
+      if (date) ctx.fillText(`${date.getMonth() + 1}/${date.getDate()}`, x, h - 8);
+    });
+
+    // 绘制曲线
+    const isUp = values[values.length - 1] >= values[0];
+    ctx.strokeStyle = isUp ? '#e74c3c' : '#27ae60';
+    ctx.lineWidth = 1.5;
+    ctx.beginPath();
+    recent.forEach((d, i) => {
+      const x = padding.left + (chartW / (recent.length - 1)) * i;
+      const y = padding.top + chartH - ((d.y - min) / range) * chartH;
+      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
+    });
+    ctx.stroke();
+
+    // 填充渐变
+    const gradient = ctx.createLinearGradient(0, padding.top, 0, padding.top + chartH);
+    if (isUp) {
+      gradient.addColorStop(0, 'rgba(231,76,60,0.2)');
+      gradient.addColorStop(1, 'rgba(231,76,60,0)');
+    } else {
+      gradient.addColorStop(0, 'rgba(39,174,96,0.2)');
+      gradient.addColorStop(1, 'rgba(39,174,96,0)');
+    }
+    ctx.lineTo(padding.left + chartW, padding.top + chartH);
+    ctx.lineTo(padding.left, padding.top + chartH);
+    ctx.closePath();
+    ctx.fillStyle = gradient;
+    ctx.fill();
+
+    // 标注高低点（基于收益率，而非净值）
+    const startVal = recent[0]?.y || 1;
+    let maxPct = -Infinity, minPct = Infinity;
+    let maxIdx = 0, minIdx = 0;
+    recent.forEach((d, i) => {
+      const val = parseFloat(d.y);
+      if (!isFinite(val) || val <= 0) return; // 跳过无效数据
+      const pct = startVal > 0 ? ((val - startVal) / startVal * 100) : 0;
+      if (isFinite(pct)) {
+        if (pct > maxPct) { maxPct = pct; maxIdx = i; }
+        if (pct < minPct) { minPct = pct; minIdx = i; }
+      }
+    });
+    // 如果没有找到有效数据，使用默认值
+    if (maxPct === -Infinity) maxPct = 0;
+    if (minPct === Infinity) minPct = 0;
+    const volatilityRange = maxPct - minPct; // 高点 - 低点 = 波动幅度
+
+    // 绘制高低点标注
+    function drawPointLabel(idx, pct, isHigh) {
+      const x = padding.left + (chartW / (recent.length - 1)) * idx;
+      const y = padding.top + chartH - ((recent[idx].y - min) / range) * chartH;
+      const color = isHigh ? '#e74c3c' : '#27ae60';
+      // 圆点
+      ctx.beginPath();
+      ctx.arc(x, y, 5, 0, Math.PI * 2);
+      ctx.fillStyle = color;
+      ctx.fill();
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 2;
+      ctx.stroke();
+      // 标签文字
+      const label = (pct >= 0 ? '+' : '') + pct.toFixed(2) + '%';
+      ctx.font = 'bold 11px sans-serif';
+      ctx.fillStyle = color;
+      ctx.textAlign = 'center';
+      const labelY = isHigh ? y - 12 : y + 22;
+      ctx.fillText(label, x, labelY);
+    }
+    drawPointLabel(maxIdx, maxPct, true);
+    drawPointLabel(minIdx, minPct, false);
+
+    // 绘制波动幅度标注（高点与低点之间）
+    const maxX = padding.left + (chartW / (recent.length - 1)) * maxIdx;
+    const minX = padding.left + (chartW / (recent.length - 1)) * minIdx;
+    const maxY = padding.top + chartH - ((recent[maxIdx].y - min) / range) * chartH;
+    const minY = padding.top + chartH - ((recent[minIdx].y - min) / range) * chartH;
+    // 画连接线
+    ctx.strokeStyle = 'rgba(128,128,128,0.5)';
+    ctx.lineWidth = 1;
+    ctx.setLineDash([3, 3]);
+    ctx.beginPath();
+    ctx.moveTo(maxX, maxY);
+    ctx.lineTo(minX, minY);
+    ctx.stroke();
+    ctx.setLineDash([]);
+
+    // 十字光标
+    if (crosshairIdx != null && crosshairIdx >= 0 && crosshairIdx < recent.length) {
+      const cx = padding.left + (chartW / (recent.length - 1)) * crosshairIdx;
+      const cy = padding.top + chartH - ((recent[crosshairIdx].y - min) / range) * chartH;
+
+      // 竖线
+      ctx.strokeStyle = 'rgba(128,128,128,0.5)';
+      ctx.lineWidth = 0.5;
+      ctx.setLineDash([4, 3]);
+      ctx.beginPath();
+      ctx.moveTo(cx, padding.top);
+      ctx.lineTo(cx, padding.top + chartH);
+      ctx.stroke();
+      // 横线
+      ctx.beginPath();
+      ctx.moveTo(padding.left, cy);
+      ctx.lineTo(padding.left + chartW, cy);
+      ctx.stroke();
+      ctx.setLineDash([]);
+
+      // 圆点
+      ctx.beginPath();
+      ctx.arc(cx, cy, 4, 0, Math.PI * 2);
+      ctx.fillStyle = isUp ? '#e74c3c' : '#27ae60';
+      ctx.fill();
+      ctx.strokeStyle = '#fff';
+      ctx.lineWidth = 1.5;
+      ctx.stroke();
+
+      // Tooltip
+      const d = recent[crosshairIdx];
+      const date = d.x ? new Date(d.x) : null;
+      const dateStr = date ? `${String(date.getMonth()+1).padStart(2,"0")}-${String(date.getDate()).padStart(2,"0")}` : '';
+      const startVal = recent[0]?.y || 0;
+      const retPct = startVal > 0 ? ((d.y - startVal) / startVal * 100) : 0;
+      const valStr = (retPct >= 0 ? '+' : '') + retPct.toFixed(2) + '%';
+      const tooltipText = `${dateStr}  ${valStr}`;
+      ctx.font = '11px sans-serif';
+      const tw = ctx.measureText(tooltipText).width + 14;
+      const th = 24;
+      let tx = cx - tw / 2;
+      let ty = cy - th - 10;
+      if (ty < padding.top - 5) ty = cy + 12;
+      if (tx < padding.left) tx = padding.left;
+      if (tx + tw > w - padding.right) tx = w - padding.right - tw;
+      // tooltip 背景
+      ctx.fillStyle = 'rgba(0,0,0,0.75)';
+      ctx.beginPath();
+      ctx.roundRect(tx, ty, tw, th, 4);
+      ctx.fill();
+      // tooltip 文字
+      ctx.fillStyle = '#fff';
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'middle';
+      ctx.fillText(tooltipText, tx + tw / 2, ty + th / 2);
+      ctx.textBaseline = 'alphabetic';
+    }
+  }
+
+  draw(null);
+
+  // 交互：触摸/鼠标十字光标
+  function getIndex(clientX) {
+    const r = canvas.getBoundingClientRect();
+    const x = clientX - r.left;
+    const idx = Math.round(((x - padding.left) / chartW) * (recent.length - 1));
+    return Math.max(0, Math.min(recent.length - 1, idx));
+  }
+
+    let active = false;
+  function onMove(clientX) {
+    active = true;
+    const idx = getIndex(clientX);
+    draw(idx);
+    // 更新上方日期显示
+    const hoverDateEl = document.getElementById('trendHoverDate');
+    if (hoverDateEl && recent[idx]) {
+      const d = recent[idx];
+      const date = d.x ? new Date(d.x) : null;
+      const dateStr = date ? `${String(date.getMonth()+1).padStart(2,"0")}-${String(date.getDate()).padStart(2,"0")}` : '';
+      const start_val = recent[0]?.y || 0;
+      const period_return = start_val > 0 ? ((d.y - start_val) / start_val * 100) : 0;
+      hoverDateEl.textContent = `${dateStr} ${period_return >= 0 ? '+' : ''}${period_return.toFixed(2)}%`;
+      hoverDateEl.style.color = period_return >= 0 ? 'var(--red)' : 'var(--green)';
+    }
+  }
+  function onEnd() {
+    active = false;
+    draw(null);
+    // 恢复为最新日期显示
+    const hoverDateEl = document.getElementById('trendHoverDate');
+    if (hoverDateEl && recent.length > 0) {
+      const latest = recent[recent.length - 1];
+      const date = latest.x ? new Date(latest.x) : null;
+      const dateStr = date ? `${String(date.getMonth()+1).padStart(2,"0")}-${String(date.getDate()).padStart(2,"0")}` : '';
+      const start_val = recent[0]?.y || 0;
+      const period_return = start_val > 0 ? ((latest.y - start_val) / start_val * 100) : 0;
+      hoverDateEl.textContent = `${dateStr} ${period_return >= 0 ? '+' : ''}${period_return.toFixed(2)}%`;
+      hoverDateEl.style.color = period_return >= 0 ? 'var(--red)' : 'var(--green)';
+    }
+  }
+
+  canvas.addEventListener('mousemove', e => { onMove(e.clientX); });
+  canvas.addEventListener('mouseleave', onEnd);
+  canvas.addEventListener('touchstart', e => { e.preventDefault(); onMove(e.touches[0].clientX); }, { passive: false });
+  canvas.addEventListener('touchmove', e => { e.preventDefault(); onMove(e.touches[0].clientX); }, { passive: false });
+  canvas.addEventListener('touchend', onEnd);
+  canvas.addEventListener('touchcancel', onEnd);
+}
+</script>
+<!-- 浮动添加按钮 -->
+<button class="fab" onclick="showAddSheet()" title="添加基金">+</button>
+</body>
+</html>
