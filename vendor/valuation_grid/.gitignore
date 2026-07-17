@@ -1,0 +1,29 @@
+# Python bytecode
+__pycache__/
+*.pyc
+*.pyo
+
+# Virtual environments
+.venv/
+venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Crash logs
+hs_err_pid*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+_commit.bat
+market_summary_log.txt
+
+# Log files
+logs/
+
+# Runtime position locks, backups and interrupted atomic writes
+data/
+cache/

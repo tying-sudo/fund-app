@@ -8,6 +8,7 @@
     "dev:api": "node dev-server.mjs",
     "dev:all": "concurrently \"npm run dev:api\" \"npm run dev\"",
     "build": "vite build",
+    "test:holding": "node --experimental-strip-types scripts/verify-holding-settlement.mjs",
     "preview": "vite preview",
     "update-funds": "node scripts/fetch-fund-list.mjs",
     "cap:init": "npx cap init",

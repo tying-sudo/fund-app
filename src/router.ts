@@ -40,6 +40,12 @@ const router = createRouter({
       meta: { title: '分析' }
     },
     {
+      path: '/valuation-grid',
+      name: 'valuationGrid',
+      component: () => import('@/views/ValuationGrid.vue'),
+      meta: { title: '估值网格' }
+    },
+    {
       path: '/search',
       name: 'search',
       component: () => import('@/views/Search.vue'),

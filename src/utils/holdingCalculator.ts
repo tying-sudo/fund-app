@@ -3,7 +3,7 @@
 // [OPT] 使用缓存和惰性计算提升性能
 
 import type { HoldingRecord, FundEstimate, FundShareClass } from '@/types/fund'
-import { calculateDailyServiceFee } from '@/api/fund'
+import { getBeijingDateString, getBeijingDayAndMinutes, getCalendarDayDifference } from '@/utils/tradingDate'
 
 /** 计算结果 */
 export interface CalculationResult {
@@ -19,10 +19,6 @@ export interface CalculationResult {
   todayProfit: number
   /** 有效份额（可能被重新计算） */
   effectiveShares: number
-  /** 累计服务费 (C类) */
-  totalServiceFee: number
-  /** 今日服务费 (C类) */
-  todayServiceFee: number
 }
 
 /** 计算上下文 */
@@ -65,10 +61,7 @@ export function round(value: number, decimals: number): number {
  * [WHY] 统一日期格式，避免时区问题
  */
 export function getTodayStr(baseDate?: Date): string {
-  const now = baseDate || new Date()
-  const utc = now.getTime() + now.getTimezoneOffset() * 60000
-  const bjTime = new Date(utc + 8 * 3600000)
-  return bjTime.toISOString().slice(0, 10)
+  return getBeijingDateString(baseDate)
 }
 
 /**
@@ -76,15 +69,11 @@ export function getTodayStr(baseDate?: Date): string {
  * [WHAT] 周一至周五 9:30-15:00
  */
 export function isTradingHours(now?: Date): boolean {
-  const date = now || new Date()
-  const day = date.getDay()
-  const hours = date.getHours()
-  const minutes = date.getMinutes()
-  const currentTime = hours * 60 + minutes
+  const { day, minutes } = getBeijingDayAndMinutes(now)
   
   return day >= 1 && day <= 5 && 
-         currentTime >= 9 * 60 + 30 && 
-         currentTime < 15 * 60
+         minutes >= 9 * 60 + 30 && 
+         minutes < 15 * 60
 }
 
 /**
@@ -118,26 +107,28 @@ export function isValidRealChangeDate(
   if (realChangeDate === today) {
     return { valid: true, isToday: true, reason: 'TODAY' }
   }
+
+  if (realChangeDate > today) {
+    return { valid: false, isToday: false, reason: 'FUTURE_DATE' }
+  }
   
-  // 非交易时段（早盘/盘后/周末），昨天的真实数据也视为有效，避免跨日 0.2 级误差
+  // 收市、盘前、周末和长假期间，保留最近公布的官方净值。
+  // 交易所休市并不一定只跨一个自然日，因此不能仅比较“昨天”。
   const trading = isTradingHours(date)
   if (!trading) {
-    const yesterday = new Date(date)
-    yesterday.setDate(yesterday.getDate() - 1)
-    const yesterdayStr = yesterday.toISOString().slice(0, 10)
-    if (realChangeDate === yesterdayStr) {
-      return { valid: true, isToday: false, reason: 'NON_TRADING_YESTERDAY' }
+    const staleDays = getCalendarDayDifference(realChangeDate, today)
+    if (staleDays <= 10) {
+      return { valid: true, isToday: false, reason: 'LATEST_CLOSED_NAV' }
     }
   }
   
   // QDII基金特殊处理：盘后21点后，昨天数据也视为有效
   const isQdii = /QDII|全球|新兴|港/.test(fundName)
-  const hours = date.getHours()
+  const { minutes } = getBeijingDayAndMinutes(date)
+  const hours = Math.floor(minutes / 60)
   if (isQdii && hours >= 21) {
-    const yesterday = new Date(date)
-    yesterday.setDate(yesterday.getDate() - 1)
-    const yesterdayStr = yesterday.toISOString().slice(0, 10)
-    if (realChangeDate === yesterdayStr) {
+    const staleDays = getCalendarDayDifference(realChangeDate, today)
+    if (staleDays <= 10) {
       return { valid: true, isToday: false, reason: 'QDII_LATE_EVENING' }
     }
   }
@@ -240,31 +231,13 @@ export function calculateHoldingProfit(context: CalcContext): CalculationResult 
       profitRate: 0,
       todayProfit: 0,
       effectiveShares,
-      totalServiceFee: 0,
-      todayServiceFee: 0
     }
   }
   
   // ===== 6. 计算市值和基础收益 =====
   const marketValue = round(effectiveShares * currentValue, PRECISION.AMOUNT)
   
-  // ===== 7. 计算费用 (C类销售服务费) =====
-  // [FIX] C类服务费已体现在每日净值中，不再从收益中额外扣除
-  //       仅计算累计服务费用于展示
-  let totalServiceFee = 0
-  let todayServiceFee = 0
-
-
-  if (holding.shareClass === 'C' && holding.serviceFeeRate) {
-    const days = holding.holdingDays || 0
-    if (days > 0 && effectiveShares > 0) {
-      todayServiceFee = calculateDailyServiceFee(effectiveShares, currentValue, holding.serviceFeeRate)
-      totalServiceFee = round(todayServiceFee * days, PRECISION.AMOUNT)
-    }
-  }
-
-  
-  // A类买入手续费已在录入时扣除
+  // C类销售服务费已反映在基金净值中，不再单独计算或展示。
   
   // ===== 8. 计算最终收益 =====
   const profit = round(marketValue - cost, PRECISION.AMOUNT)
@@ -278,9 +251,7 @@ export function calculateHoldingProfit(context: CalcContext): CalculationResult 
     profit,
     profitRate,
     todayProfit: round(todayProfit, PRECISION.AMOUNT),
-    effectiveShares: round(effectiveShares, 2),
-    totalServiceFee,
-    todayServiceFee
+    effectiveShares: round(effectiveShares, 4)
   }
 }
 
