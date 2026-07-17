@@ -1,0 +1,3584 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>实时估值 · 低频网格工具</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, "SF Pro Text", "Helvetica Neue", sans-serif;
+            background: #f0f2f5;
+            color: #1a1a2e;
+            min-height: 100vh;
+            font-size: 13px;
+        }
+        .container { max-width: 960px; margin: 0 auto; padding: 12px; }
+        h1 {
+            text-align: center;
+            margin-bottom: 12px;
+            color: #1a1a2e;
+            font-size: 18px;
+            font-weight: 600;
+        }
+
+        /* 顶部操作栏 */
+        .toolbar {
+            display: flex;
+            gap: 8px;
+            margin-bottom: 12px;
+            align-items: center;
+        }
+        .toolbar button {
+            padding: 6px 14px;
+            border: none;
+            border-radius: 6px;
+            cursor: pointer;
+            font-size: 12px;
+            font-weight: 500;
+            transition: all .15s;
+        }
+        .btn-primary { background: #4f46e5; color: #fff; }
+        .btn-primary:hover { background: #4338ca; }
+        .btn-primary:disabled { background: #a5b4fc; cursor: not-allowed; }
+        .btn-success { background: #10b981; color: #fff; }
+        .btn-success:hover { background: #059669; }
+        .btn-warning { background: #f59e0b; color: #fff; }
+        .btn-warning:hover { background: #d97706; }
+        .btn-danger { background: #ef4444; color: #fff; }
+        .btn-danger:hover { background: #dc2626; }
+
+        .refresh-status {
+            margin-left: auto;
+            font-size: 11px;
+            color: #6b7280;
+            display: flex;
+            align-items: center;
+            gap: 6px;
+        }
+        .refresh-status .dot {
+            width: 6px;
+            height: 6px;
+            border-radius: 50%;
+            background: #10b981;
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.4; }
+        }
+
+        /* 状态提示 */
+        .status {
+            padding: 8px 12px;
+            border-radius: 6px;
+            margin-bottom: 10px;
+            font-size: 12px;
+            display: none;
+        }
+        .status.show { display: block; }
+        .status.success { background: #d1fae5; color: #065f46; }
+        .status.error { background: #fee2e2; color: #991b1b; }
+        .status.info { background: #dbeafe; color: #1e40af; }
+
+        /* Tab 切换 */
+        .tab-bar {
+            display: flex;
+            gap: 0;
+            margin-bottom: 12px;
+            border-bottom: 2px solid #e5e7eb;
+        }
+        .tab-btn {
+            padding: 8px 20px;
+            border: none;
+            background: none;
+            cursor: pointer;
+            font-size: 13px;
+            font-weight: 500;
+            color: #6b7280;
+            border-bottom: 2px solid transparent;
+            margin-bottom: -2px;
+            transition: all .15s;
+        }
+        .tab-btn.active {
+            color: #4f46e5;
+            border-bottom-color: #4f46e5;
+        }
+        .tab-btn:hover { color: #4338ca; }
+        .tab-panel { display: none; }
+        .tab-panel.active { display: block; }
+
+        /* 板块 */
+        .sector {
+            background: #fff;
+            border-radius: 8px;
+            margin-bottom: 10px;
+            box-shadow: 0 1px 3px rgba(0,0,0,.08);
+            overflow: hidden;
+        }
+        .sector-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 14px;
+            background: #f8fafc;
+            border-bottom: 1px solid #e5e7eb;
+        }
+        .sector-name {
+            font-weight: 600;
+            font-size: 14px;
+            color: #1e293b;
+        }
+        .btn-export {
+            background: none;
+            border: 1px solid #d1d5db;
+            border-radius: 4px;
+            padding: 4px 8px;
+            cursor: pointer;
+            font-size: 12px;
+            color: #6b7280;
+            transition: all .15s;
+        }
+        .btn-export:hover {
+            background: #f3f4f6;
+            border-color: #9ca3af;
+        }
+
+        /* 紧凑表格 */
+        .fund-table {
+            width: 100%;
+            border-collapse: collapse;
+        }
+        .fund-table th {
+            background: #f1f5f9;
+            padding: 6px 10px;
+            text-align: left;
+            font-weight: 500;
+            font-size: 11px;
+            color: #64748b;
+            border-bottom: 1px solid #e2e8f0;
+        }
+        .fund-table td {
+            padding: 6px 10px;
+            border-bottom: 1px solid #f1f5f9;
+            vertical-align: middle;
+        }
+        .fund-table tr:last-child td { border-bottom: none; }
+        .fund-table tr:hover { background: #f8fafc; }
+
+        .td-code {
+            font-family: "SF Mono", Monaco, monospace;
+            font-weight: 600;
+            color: #4f46e5;
+            font-size: 12px;
+            width: 70px;
+            cursor: pointer;
+        }
+        .td-code:hover { text-decoration: underline; }
+        .td-name {
+            color: #374151;
+            font-size: 12px;
+            max-width: 200px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+        }
+        .td-change {
+            font-weight: 700;
+            font-size: 14px;
+            text-align: right;
+            width: 90px;
+            white-space: nowrap;
+        }
+        .td-change.up { color: #dc2626; }
+        .td-change.down { color: #16a34a; }
+        .td-change.flat { color: #6b7280; }
+
+        .td-confidence {
+            font-size: 11px;
+            color: #9ca3af;
+            text-align: right;
+            width: 60px;
+        }
+        .td-action {
+            width: 60px;
+            text-align: center;
+        }
+        .td-action button {
+            background: none;
+            border: none;
+            color: #d1d5db;
+            cursor: pointer;
+            font-size: 14px;
+            padding: 2px 6px;
+            border-radius: 4px;
+        }
+        .td-action button:hover {
+            color: #ef4444;
+            background: #fef2f2;
+        }
+
+        /* 添加表单 */
+        .add-row {
+            display: flex;
+            gap: 8px;
+            padding: 8px 10px;
+            background: #fafafa;
+            border-top: 1px solid #f1f5f9;
+        }
+        .add-row input {
+            padding: 6px 10px;
+            border: 1px solid #e5e7eb;
+            border-radius: 4px;
+            font-size: 12px;
+            outline: none;
+            transition: border-color .15s;
+        }
+        .add-row input:focus { border-color: #4f46e5; }
+        .add-row input[name="code"] { width: 80px; }
+        .add-row input[name="alias"] { flex: 1; min-width: 0; }
+        .add-row button {
+            padding: 6px 12px;
+            font-size: 12px;
+            white-space: nowrap;
+        }
+
+        /* 弹窗 */
+        .modal {
+            display: none;
+            position: fixed;
+            top: 0; left: 0; right: 0; bottom: 0;
+            background: rgba(0,0,0,.4);
+            justify-content: center;
+            align-items: center;
+            z-index: 100;
+        }
+        .modal.show { display: flex; }
+        .modal-content {
+            background: #fff;
+            padding: 20px;
+            border-radius: 10px;
+            width: 90%;
+            max-width: 360px;
+        }
+        .modal-content.wide {
+            max-width: 520px;
+        }
+        .modal-content h3 { margin-bottom: 12px; font-size: 15px; }
+        .modal-content input {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            font-size: 13px;
+            margin-bottom: 12px;
+        }
+        .modal-actions { display: flex; gap: 8px; justify-content: flex-end; }
+        .modal-actions button { padding: 8px 16px; font-size: 13px; border-radius: 6px; }
+        .btn-secondary { background: #e5e7eb; color: #374151; border: none; cursor: pointer; }
+        .btn-secondary:hover { background: #d1d5db; }
+
+        /* 空状态 */
+        .empty { text-align: center; padding: 40px 20px; color: #9ca3af; }
+        .empty-icon { font-size: 36px; margin-bottom: 10px; }
+
+        /* 加载 */
+        .loading {
+            display: inline-block;
+            width: 12px; height: 12px;
+            border: 2px solid #e5e7eb;
+            border-top-color: #4f46e5;
+            border-radius: 50%;
+            animation: spin .6s linear infinite;
+            margin-right: 6px;
+        }
+        @keyframes spin { to { transform: rotate(360deg); } }
+
+        /* 更新时间 */
+        .update-time {
+            text-align: center;
+            color: #9ca3af;
+            font-size: 11px;
+            margin-top: 12px;
+        }
+
+        /* ========== 净值历史弹窗 ========== */
+        .nav-history-table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 12px;
+            margin-top: 8px;
+        }
+        .nav-history-table th {
+            background: #f1f5f9;
+            padding: 5px 8px;
+            text-align: left;
+            font-weight: 500;
+            color: #64748b;
+            font-size: 11px;
+        }
+        .nav-history-table td {
+            padding: 4px 8px;
+            border-bottom: 1px solid #f1f5f9;
+        }
+        .nav-history-table .up { color: #dc2626; font-weight: 600; }
+        .nav-history-table .down { color: #16a34a; font-weight: 600; }
+        .nav-history-table .flat { color: #6b7280; }
+        .nav-history-scroll {
+            max-height: 400px;
+            overflow-y: auto;
+        }
+        /* 迷你柱状图 */
+        .mini-bar {
+            display: inline-block;
+            height: 10px;
+            min-width: 1px;
+            border-radius: 1px;
+            vertical-align: middle;
+            margin-left: 4px;
+        }
+
+        /* ========== 策略面板 ========== */
+        .strategy-panel { margin-top: 4px; }
+
+        /* ========== v5.17: 行情模式（紧凑内联） ========== */
+        .regime-inline { display: inline-flex; align-items: center; gap: 4px; margin: 0 8px; }
+        .regime-inline .ri-btn {
+            padding: 2px 8px; border: 1.5px solid #e2e8f0; border-radius: 4px;
+            background: #fff; cursor: pointer; font-size: 11px; transition: .15s;
+        }
+        .regime-inline .ri-btn:hover { border-color: #94a3b8; }
+        .regime-inline .ri-btn.active-neutral { border-color: #6366f1; background: #eef2ff; color: #4f46e5; font-weight: 600; }
+        .regime-inline .ri-btn.active-bear { border-color: #10b981; background: #ecfdf5; color: #059669; font-weight: 600; }
+        .regime-auto-badge {
+            font-size: 10px; padding: 1px 6px; border-radius: 3px;
+            background: #e0e7ff; color: #4338ca; font-weight: 500; cursor: pointer;
+        }
+        .regime-auto-badge.manual { background: #fef3c7; color: #92400e; }
+        .fitness-badge {
+            display: inline-block; font-size: 10px; padding: 1px 5px;
+            border-radius: 3px; font-weight: 600; margin-left: 4px;
+        }
+        .fitness-badge.grade-A { background: #d1fae5; color: #059669; }
+        .fitness-badge.grade-B { background: #dbeafe; color: #2563eb; }
+        .fitness-badge.grade-C { background: #fef3c7; color: #d97706; }
+        .fitness-badge.grade-D { background: #fed7aa; color: #ea580c; }
+        .fitness-badge.grade-E { background: #fecaca; color: #dc2626; }
+
+        .signal-card {
+            background: #fff;
+            border-radius: 8px;
+            margin-bottom: 10px;
+            box-shadow: 0 1px 3px rgba(0,0,0,.08);
+            overflow: hidden;
+        }
+        .signal-card-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 14px;
+            background: #f8fafc;
+            border-bottom: 1px solid #e5e7eb;
+        }
+        .signal-card-header .fund-info {
+            font-weight: 600;
+            font-size: 13px;
+            color: #1e293b;
+        }
+        .signal-card-header .fund-info .code {
+            font-family: "SF Mono", Monaco, monospace;
+            color: #4f46e5;
+            cursor: pointer;
+        }
+        .signal-card-header .fund-info .code:hover { text-decoration: underline; }
+
+        .signal-badge {
+            display: inline-block;
+            padding: 3px 10px;
+            border-radius: 12px;
+            font-size: 11px;
+            font-weight: 600;
+        }
+        .signal-badge.sell { background: #fee2e2; color: #dc2626; }
+        .signal-badge.buy { background: #d1fae5; color: #059669; }
+        .signal-badge.hold { background: #f3f4f6; color: #6b7280; }
+        .signal-badge.alert { background: #fef3c7; color: #d97706; }
+
+        .signal-card-body {
+            padding: 10px 14px 6px;
+        }
+        .signal-reason {
+            font-size: 12px;
+            color: #374151;
+            margin-bottom: 4px;
+            line-height: 1.5;
+        }
+        .signal-fee {
+            font-size: 11px;
+            color: #6b7280;
+            margin-bottom: 4px;
+        }
+        .signal-alert {
+            background: #fef3c7;
+            border-radius: 4px;
+            padding: 4px 10px;
+            font-size: 11px;
+            color: #92400e;
+            margin-bottom: 4px;
+        }
+
+        .pos-summary {
+            display: flex;
+            flex-wrap: wrap;
+            font-size: 11px;
+            color: #6b7280;
+            padding: 6px 14px;
+            background: #fafbfc;
+            border-top: 1px solid #f1f5f9;
+            justify-content: space-between;
+        }
+        .pos-summary .item { display: flex; gap: 4px; }
+        .pos-summary .label { color: #9ca3af; }
+        .pos-summary .value { font-weight: 600; color: #374151; }
+
+        .pos-batches {
+            padding: 0 14px 6px;
+            overflow-x: auto;
+        }
+        .pos-batches table {
+            width: 100%;
+            border-collapse: collapse;
+            font-size: 11px;
+            table-layout: fixed;
+        }
+        .pos-batches th {
+            text-align: left;
+            padding: 4px 6px;
+            color: #9ca3af;
+            font-weight: 500;
+            font-size: 10px;
+        }
+        .pos-batches td {
+            padding: 4px 6px;
+            border-top: 1px solid #f5f5f5;
+            color: #374151;
+        }
+        .pos-actions {
+            padding: 6px 14px;
+            border-top: 1px solid #f1f5f9;
+            display: flex;
+            gap: 8px;
+            flex-wrap: wrap;
+        }
+        .pos-actions button {
+            padding: 5px 12px;
+            border: 1px solid #e5e7eb;
+            border-radius: 5px;
+            background: #fff;
+            cursor: pointer;
+            font-size: 11px;
+            transition: all .15s;
+        }
+        .pos-actions button:hover { background: #f3f4f6; }
+        .pos-actions .buy-btn { border-color: #10b981; color: #059669; }
+        .pos-actions .buy-btn:hover { background: #ecfdf5; }
+        .pos-actions .sell-btn { border-color: #ef4444; color: #dc2626; }
+        .pos-actions .sell-btn:hover { background: #fef2f2; }
+
+        /* 行情分析区域 */
+        .market-analysis {
+            padding: 4px 14px 2px;
+            border-top: 1px solid #f1f5f9;
+        }
+        .market-analysis .trend-bar {
+            display: flex;
+            gap: 1px;
+            align-items: stretch;
+            margin-bottom: 2px;
+            position: relative;
+        }
+        .market-analysis .trend-bar .day-bar {
+            flex: 1;
+            min-width: 0;
+            display: flex;
+            flex-direction: column;
+            align-items: center;
+        }
+        .market-analysis .trend-bar .day-bar .bar-upper {
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-end;
+            align-items: center;
+            width: 100%;
+        }
+        .market-analysis .trend-bar .day-bar .bar-lower {
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-start;
+            align-items: center;
+            width: 100%;
+        }
+        .market-analysis .trend-bar .day-bar .bar-fill {
+            width: 80%;
+            border-radius: 1px;
+            min-height: 0;
+        }
+        .market-analysis .trend-bar .day-bar .bar-label {
+            font-size: 7px;
+            color: #9ca3af;
+            white-space: nowrap;
+            line-height: 1.1;
+            margin-top: 1px;
+        }
+        .market-analysis .trend-bar .day-bar .bar-value {
+            font-size: 8px;
+            font-weight: 600;
+            white-space: nowrap;
+            line-height: 1.1;
+        }
+        .market-analysis .zero-line {
+            width: 100%;
+            height: 1px;
+            background: #e5e7eb;
+            margin: 0;
+        }
+        .market-stats {
+            display: flex;
+            gap: 6px;
+            flex-wrap: wrap;
+            font-size: 10px;
+            color: #6b7280;
+            padding: 4px 0 4px;
+            justify-content: space-between;
+        }
+        .market-stats .stat-item {
+            display: flex;
+            gap: 3px;
+        }
+        .market-stats .stat-label { color: #9ca3af; }
+        .market-stats .stat-value { font-weight: 600; }
+        .market-stats .stat-value.up { color: #dc2626; }
+        .market-stats .stat-value.down { color: #059669; }
+        .market-stats .stat-value.flat { color: #6b7280; }
+
+        /* 策略说明提示 */
+        .strategy-info-btn {
+            background: none;
+            border: 1px solid #e5e7eb;
+            color: #9ca3af;
+            font-size: 10px;
+            cursor: pointer;
+            padding: 1px 6px;
+            border-radius: 3px;
+            margin-left: 4px;
+        }
+        .strategy-info-btn:hover { background: #f3f4f6; color: #374151; }
+        .strategy-info-box {
+            background: #f8fafc;
+            border: 1px solid #e5e7eb;
+            border-radius: 4px;
+            padding: 6px 10px;
+            margin: 4px 0 6px;
+            font-size: 10px;
+            color: #6b7280;
+            line-height: 1.6;
+            display: none;
+        }
+        .strategy-info-box.show { display: block; }
+
+        /* 买入/卖出弹窗 form */
+        .trade-form { display: flex; flex-direction: column; gap: 10px; }
+        .trade-form label { font-size: 12px; color: #374151; font-weight: 500; }
+        .trade-form input, .trade-form select {
+            width: 100%;
+            padding: 8px 10px;
+            border: 1px solid #d1d5db;
+            border-radius: 6px;
+            font-size: 13px;
+            margin-top: 2px;
+        }
+        .trade-form .hint { font-size: 11px; color: #9ca3af; margin-top: 2px; }
+
+        /* 策略分组 */
+        .strategy-group {
+            background: #fff;
+            border-radius: 8px;
+            margin-bottom: 10px;
+            box-shadow: 0 1px 3px rgba(0,0,0,.08);
+            overflow: hidden;
+        }
+        .strategy-group-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            padding: 10px 14px;
+            background: #f8fafc;
+            border-bottom: 1px solid #e5e7eb;
+        }
+        .strategy-group-header .group-name {
+            font-weight: 600;
+            font-size: 14px;
+            color: #1e293b;
+            cursor: pointer;
+        }
+        .strategy-group-header .group-name:hover { color: #4f46e5; }
+        .strategy-group-header .group-actions {
+            display: flex;
+            gap: 4px;
+        }
+        .strategy-group-header .group-actions button {
+            background: none;
+            border: 1px solid #d1d5db;
+            border-radius: 4px;
+            padding: 3px 7px;
+            cursor: pointer;
+            font-size: 11px;
+            color: #6b7280;
+            transition: all .15s;
+        }
+        .strategy-group-header .group-actions button:hover {
+            background: #f3f4f6;
+            border-color: #9ca3af;
+        }
+        .strategy-group-body { padding: 0; }
+        .ungrouped-label {
+            font-size: 12px;
+            color: #9ca3af;
+            padding: 8px 14px 4px;
+        }
+
+        /* 无持仓基金快速添加 */
+        .add-position-bar {
+            background: #fff;
+            border-radius: 8px;
+            padding: 12px 14px;
+            margin-bottom: 10px;
+            box-shadow: 0 1px 3px rgba(0,0,0,.08);
+            display: flex;
+            gap: 8px;
+            align-items: center;
+        }
+        .add-position-bar input {
+            padding: 6px 10px;
+            border: 1px solid #e5e7eb;
+            border-radius: 4px;
+            font-size: 12px;
+            outline: none;
+            width: 90px;
+        }
+        .add-position-bar input:focus { border-color: #4f46e5; }
+        .add-position-bar span { font-size: 12px; color: #6b7280; }
+    </style>
+</head>
+<body>
+    <div class="container">
+
+        <div class="toolbar">
+            <div class="refresh-status">
+                <span class="dot"></span>
+                <span id="refreshTimer">自动刷新中</span>
+            </div>
+        </div>
+
+        <div class="status" id="status"></div>
+
+        <!-- Tab 切换 -->
+        <div class="tab-bar">
+            <button class="tab-btn active" onclick="switchTab('valuation')">实时估值</button>
+            <button class="tab-btn" onclick="switchTab('strategy')">低频网格</button>
+        </div>
+
+        <!-- 估值看板 -->
+        <div class="tab-panel active" id="tab-valuation">
+            <div style="display:flex;gap:8px;margin-bottom:10px;">
+                <button class="btn-primary" onclick="refreshAll()" id="refreshBtn">🔄 刷新</button>
+                <button class="btn-success" onclick="showAddSectorModal()">➕ 新建板块</button>
+                <button class="btn-warning" onclick="exportAllSectorImages()">📷 批量导出</button>
+            </div>
+            <div id="sectors"></div>
+        </div>
+
+        <!-- 策略面板 -->
+        <div class="tab-panel" id="tab-strategy">
+            <div class="strategy-panel" id="strategyPanel">
+                <div class="empty">
+                    <div class="empty-icon">📡</div>
+                    <p>点击"刷新信号"获取策略建议</p>
+                </div>
+            </div>
+        </div>
+
+        <div class="update-time" id="updateTime"></div>
+    </div>
+
+    <!-- 新建板块弹窗 -->
+    <div class="modal" id="addSectorModal">
+        <div class="modal-content">
+            <h3>新建板块</h3>
+            <input type="text" id="newSectorName" placeholder="输入板块名称，如：有色金属">
+            <div class="modal-actions">
+                <button class="btn-secondary" onclick="closeModal('addSectorModal')">取消</button>
+                <button class="btn-primary" onclick="addSector()">确定</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ETF映射弹窗 -->
+    <div class="modal" id="etfLinkModal">
+        <div class="modal-content">
+            <h3>设置ETF联接穿透</h3>
+            <p style="font-size:12px;color:#666;margin-bottom:12px;">
+                对于ETF联接基金，可指定目标ETF以获取准确持仓
+            </p>
+            <input type="text" id="etfLinkCode" placeholder="联接基金代码（如016708）" maxlength="6" readonly>
+            <input type="text" id="etfTargetCode" placeholder="目标ETF代码（如516650）" maxlength="6">
+            <div class="modal-actions">
+                <button class="btn-secondary" onclick="closeModal('etfLinkModal')">取消</button>
+                <button class="btn-secondary" onclick="clearEtfLink()" style="color:#ef4444;">清除映射</button>
+                <button class="btn-primary" onclick="saveEtfLink()">保存</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 净值历史弹窗 -->
+    <div class="modal" id="moveFundModal">
+        <div class="modal-content">
+            <h3 id="moveFundTitle">移动基金到板块</h3>
+            <div id="moveFundList" style="max-height:300px;overflow-y:auto;"></div>
+            <div class="modal-actions">
+                <button class="btn-secondary" onclick="closeModal('moveFundModal')">关闭</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 净值历史弹窗（原） -->
+    <div class="modal" id="navHistoryModal">
+        <div class="modal-content wide">
+            <h3 id="navHistoryTitle">净值历史</h3>
+            <div class="nav-history-scroll" id="navHistoryBody">
+                <p style="text-align:center;color:#9ca3af;padding:20px;">加载中...</p>
+            </div>
+            <div class="modal-actions" style="margin-top:12px;">
+                <button class="btn-secondary" onclick="closeModal('navHistoryModal')">关闭</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 买入弹窗 -->
+    <div class="modal" id="buyModal">
+        <div class="modal-content">
+            <h3 id="buyModalTitle">录入买入</h3>
+            <div class="trade-form">
+                <div>
+                    <label>买入日期</label>
+                    <input type="date" id="buyDate">
+                    <div class="hint">下单日期（影响持有天数和费率计算）</div>
+                </div>
+                <div>
+                    <label>买入金额（元）</label>
+                    <input type="number" id="buyAmount" placeholder="支付宝显示的买入金额（填0=空仓观察）" step="100">
+                    <div class="hint" style="color:#6366f1;">💡 金额填0：加入空仓观察，策略引擎将提供建仓时机建议</div>
+                </div>
+                <div>
+                    <label>确认净值（选填）</label>
+                    <input type="number" id="buyNav" placeholder="份额确认后补录，可先留空" step="0.0001">
+                    <div class="hint" id="buyNavHint">净值通常T+1确认，可先留空后续补录</div>
+                </div>
+                <div>
+                    <label>备注（可选）</label>
+                    <input type="text" id="buyNote" placeholder="方便自己回忆，如：大跌抄底、补仓、定投">
+                </div>
+                <div style="display:flex;align-items:center;gap:8px;">
+                    <input type="checkbox" id="buySupplement" style="width:auto;margin:0;">
+                    <label for="buySupplement" style="font-weight:400;color:#6b7280;font-size:12px;">补仓买入（计入补仓次数，备注以"补仓"开头也会自动识别）</label>
+                </div>
+            </div>
+            <input type="hidden" id="buyFundCode">
+            <input type="hidden" id="buyOwner">
+            <div class="modal-actions" style="margin-top:12px;">
+                <button class="btn-secondary" onclick="closeModal('buyModal')">取消</button>
+                <button class="btn-success" onclick="submitBuy()">确认录入</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 卖出弹窗 -->
+    <div class="modal" id="sellModal">
+        <div class="modal-content">
+            <h3 id="sellModalTitle">录入卖出</h3>
+            <div class="trade-form">
+                <div>
+                    <label>卖出日期</label>
+                    <input type="date" id="sellDate">
+                    <div class="hint">下单日期（影响持有天数和费率计算）</div>
+                </div>
+                <div id="sellBatchSelectWrap">
+                    <label>卖出批次</label>
+                    <select id="sellBatchSelect" onchange="onSellBatchChange()">
+                        <option value="">请选择...</option>
+                    </select>
+                    <div class="hint" id="sellBatchHint"></div>
+                </div>
+                <div id="sellFifoInfo" style="display:none;">
+                    <div style="background:#eff6ff;border:1px solid #bfdbfe;border-radius:6px;padding:8px 10px;font-size:11px;color:#1e40af;">
+                        <b>FIFO 模式</b>：支付宝按先进先出自动扣减份额，系统将自动按 FIFO 顺序拆分到各批次。
+                        <div id="sellFifoSteps" style="margin-top:4px;"></div>
+                    </div>
+                </div>
+                <div>
+                    <label>卖出份额</label>
+                    <input type="number" id="sellShares" placeholder="支付宝→交易记录中的「卖出份额」" step="0.01">
+                    <div class="hint" id="sellSharesHint"></div>
+                </div>
+                <div>
+                    <label>确认净值（选填）</label>
+                    <input type="number" id="sellNav" placeholder="金额确认后补录，可先留空" step="0.0001">
+                    <div class="hint">卖出金额确认后，在交易记录中查看确认净值</div>
+                </div>
+            </div>
+            <input type="hidden" id="sellFundCode">
+            <input type="hidden" id="sellMode" value="batch">
+            <div class="modal-actions" style="margin-top:12px;">
+                <button class="btn-secondary" onclick="closeModal('sellModal')">取消</button>
+                <button class="btn-danger" onclick="submitSell()">确认卖出</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 分组管理弹窗 -->
+    <div class="modal" id="groupModal">
+        <div class="modal-content">
+            <h3 id="groupModalTitle">新建分组</h3>
+            <input type="text" id="groupNameInput" placeholder="输入分组名称，如：有色金属">
+            <input type="hidden" id="groupEditId" value="">
+            <div class="modal-actions">
+                <button class="btn-secondary" onclick="closeModal('groupModal')">取消</button>
+                <button class="btn-primary" onclick="saveGroup()">确定</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 分配基金到分组弹窗 -->
+    <div class="modal" id="assignGroupModal">
+        <div class="modal-content">
+            <h3 id="assignGroupTitle">分配到分组</h3>
+            <div id="assignGroupList" style="max-height:300px;overflow-y:auto;"></div>
+            <div class="modal-actions" style="margin-top:12px;">
+                <button class="btn-secondary" onclick="closeModal('assignGroupModal')">关闭</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 新增模块弹窗（同基金多人持仓） -->
+    <div class="modal" id="addInstanceModal">
+        <div class="modal-content">
+            <h3>新增持仓模块</h3>
+            <p style="font-size:11px;color:#6b7280;margin-bottom:12px;">
+                同一基金可为不同人各自建立独立的持仓和策略跟踪，<br>
+                例如为"老公"和"老婆"分别跟踪 017193。
+            </p>
+            <div class="trade-form">
+                <div>
+                    <label>基金代码</label>
+                    <input type="text" id="instanceFundCode" placeholder="6位基金代码" maxlength="6">
+                </div>
+                <div>
+                    <label>持仓人/标签</label>
+                    <input type="text" id="instanceOwner" placeholder="如：老公、老婆、账户A" maxlength="10">
+                    <div class="hint">用于区分同基金不同人的持仓</div>
+                </div>
+            </div>
+            <div class="modal-actions" style="margin-top:12px;">
+                <button class="btn-secondary" onclick="closeModal('addInstanceModal')">取消</button>
+                <button class="btn-warning" onclick="submitAddInstance()">创建并录入买入</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- 灵敏度调整弹窗 -->
+    <div class="modal" id="volSensModal">
+        <div class="modal-content">
+            <h3 id="volSensTitle">调整波动率灵敏度</h3>
+            <p style="font-size:11px;color:#6b7280;margin-bottom:8px;">
+                灵敏度影响买卖阈值的宽窄：<b>&gt;1.0</b> 阈值更宽（更不容易触发），<b>&lt;1.0</b> 阈值更窄（更灵敏）。
+            </p>
+            <div id="volSensInfo" style="font-size:11px;color:#6b7280;margin-bottom:8px;padding:6px 8px;background:#f8fafc;border-radius:4px;"></div>
+            <div class="trade-form">
+                <div>
+                    <label>灵敏度值 (0.5 ~ 1.5)</label>
+                    <input type="range" id="volSensSlider" min="0.5" max="1.5" step="0.05" value="1.0"
+                           oninput="document.getElementById('volSensDisplay').textContent=this.value"
+                           style="width:100%;margin-top:4px;">
+                    <div style="display:flex;justify-content:space-between;font-size:10px;color:#9ca3af;">
+                        <span>0.5 灵敏</span>
+                        <span id="volSensDisplay" style="font-weight:600;color:#4f46e5;font-size:13px;">1.00</span>
+                        <span>1.5 迟钝</span>
+                    </div>
+                </div>
+            </div>
+            <input type="hidden" id="volSensFundCode">
+            <div class="modal-actions" style="margin-top:12px;">
+                <button class="btn-secondary" onclick="closeModal('volSensModal')">取消</button>
+                <button class="btn-secondary" onclick="clearVolSensitivity()" style="color:#f59e0b;">恢复自动</button>
+                <button class="btn-secondary" onclick="recalibrateVolSensitivity()" style="color:#4f46e5;">重新校准</button>
+                <button class="btn-primary" onclick="saveVolSensitivity()">手动设置</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const API_BASE = '';
+        let state = { version: 1, sectors: [] };
+        let valuations = {};
+        let autoRefreshTimer = null;
+        let isRefreshing = false;
+        let lastRefreshTime = null;
+        let currentTab = 'valuation';
+        let strategyLoadPromise = null;
+        let lastUserInteractionAt = 0;
+
+        const RETRYABLE_API_STATUS = new Set([502, 503, 504]);
+        const API_RETRY_DELAYS = [400, 1000];
+        const USER_INTERACTION_GRACE_MS = 6000;
+
+        function wait(ms) {
+            return new Promise(resolve => setTimeout(resolve, ms));
+        }
+
+        function escapeHtml(value) {
+            return String(value)
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#039;');
+        }
+
+        function markUserInteraction() {
+            lastUserInteractionAt = Date.now();
+        }
+
+        function getRefreshPauseReason() {
+            if (document.hidden) return '页面在后台';
+            if (document.querySelector('.modal.show')) return '正在填写或确认';
+
+            const active = document.activeElement;
+            if (active && (active.matches('input, textarea, select') || active.isContentEditable)) {
+                return '正在输入';
+            }
+
+            const activePanel = document.querySelector('.tab-panel.active');
+            if (activePanel) {
+                const hasPendingInput = [...activePanel.querySelectorAll(
+                    'input:not([type="hidden"]):not([type="button"]):not([type="submit"]), textarea'
+                )].some(input => String(input.value || '').trim() !== '');
+                if (hasPendingInput) return '有未提交输入';
+            }
+
+            if (Date.now() - lastUserInteractionAt < USER_INTERACTION_GRACE_MS) {
+                return '正在操作';
+            }
+            return '';
+        }
+
+        function capturePanelView(panel) {
+            const state = { scrollY: window.scrollY, fundKey: '', top: 0 };
+            if (!panel) return state;
+            const visibleCard = [...panel.querySelectorAll('[data-fund-key]')]
+                .find(card => card.getBoundingClientRect().bottom > 0);
+            if (visibleCard) {
+                state.fundKey = visibleCard.dataset.fundKey || '';
+                state.top = visibleCard.getBoundingClientRect().top;
+            }
+            return state;
+        }
+
+        function restorePanelView(panel, viewState) {
+            requestAnimationFrame(() => {
+                if (viewState.fundKey && panel) {
+                    const card = [...panel.querySelectorAll('[data-fund-key]')]
+                        .find(item => item.dataset.fundKey === viewState.fundKey);
+                    if (card) {
+                        window.scrollBy(0, card.getBoundingClientRect().top - viewState.top);
+                        return;
+                    }
+                }
+                window.scrollTo(0, viewState.scrollY);
+            });
+        }
+
+        async function fetchJson(url, options = {}, label = '请求') {
+            let lastError;
+            const {
+                retrySafe = false,
+                timeoutMs = 0,
+                maxRetries = API_RETRY_DELAYS.length,
+                ...fetchOptions
+            } = options;
+            const method = String(fetchOptions.method || 'GET').toUpperCase();
+            const canRetry = retrySafe || method === 'GET' || method === 'HEAD';
+            const retryCount = Math.max(0, Math.min(maxRetries, API_RETRY_DELAYS.length));
+
+            for (let attempt = 0; attempt <= retryCount; attempt++) {
+                const controller = timeoutMs > 0 ? new AbortController() : null;
+                let timedOut = false;
+                const timeoutId = controller ? setTimeout(() => {
+                    timedOut = true;
+                    controller.abort();
+                }, timeoutMs) : null;
+                try {
+                    const requestOptions = controller
+                        ? { ...fetchOptions, signal: controller.signal }
+                        : fetchOptions;
+                    const res = await fetch(url, requestOptions);
+                    const text = await res.text();
+
+                    if (!res.ok) {
+                        let detail = '';
+                        try {
+                            const errorData = text ? JSON.parse(text) : null;
+                            detail = errorData?.detail || errorData?.message || '';
+                        } catch {
+                            detail = text.trim();
+                        }
+
+                        const error = new Error(
+                            `${label}失败（HTTP ${res.status}${detail ? `: ${detail.slice(0, 120)}` : ''}）`
+                        );
+                        error.retryable = RETRYABLE_API_STATUS.has(res.status);
+                        throw error;
+                    }
+
+                    if (!text.trim()) {
+                        throw new Error(`${label}返回为空`);
+                    }
+
+                    try {
+                        return JSON.parse(text);
+                    } catch {
+                        throw new Error(`${label}返回了非 JSON 数据`);
+                    }
+                } catch (e) {
+                    if (timedOut) {
+                        e = new Error(`${label}超时（${Math.round(timeoutMs / 1000)}秒），已停止等待`);
+                        e.retryable = false;
+                    }
+                    lastError = e;
+                    const retryable = canRetry && e.retryable !== false &&
+                        (e.retryable || e.name === 'TypeError');
+                    if (!retryable || attempt >= retryCount) {
+                        throw e;
+                    }
+                    await wait(API_RETRY_DELAYS[attempt]);
+                } finally {
+                    if (timeoutId) clearTimeout(timeoutId);
+                }
+            }
+
+            throw lastError;
+        }
+
+        // ============ 状态提示 ============
+        function showStatus(msg, type = 'info') {
+            const el = document.getElementById('status');
+            el.textContent = msg;
+            el.className = `status show ${type}`;
+            setTimeout(() => el.classList.remove('show'), 2500);
+        }
+
+        // ============ Tab 切换 ============
+        function switchTab(tab) {
+            currentTab = tab;
+            document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
+            document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
+            document.querySelector(`.tab-btn[onclick="switchTab('${tab}')"]`).classList.add('active');
+            document.getElementById(`tab-${tab}`).classList.add('active');
+
+            if (tab === 'strategy') {
+                loadRegimeStatus();
+                loadStrategyPanel();
+            }
+        }
+
+        // ============ 弹窗控制 ============
+        function showAddSectorModal() {
+            document.getElementById('newSectorName').value = '';
+            document.getElementById('addSectorModal').classList.add('show');
+            document.getElementById('newSectorName').focus();
+        }
+
+        function closeModal(id) {
+            const modal = document.getElementById(id);
+            if (modal.contains(document.activeElement)) {
+                document.activeElement.blur();
+            }
+            modal.classList.remove('show');
+            lastUserInteractionAt = 0;
+        }
+
+        // ============ API 调用 ============
+        async function loadState() {
+            try {
+                state = await fetchJson(`${API_BASE}/v1/state`, {}, '加载状态');
+                render();
+            } catch (e) {
+                showStatus('加载失败: ' + e.message, 'error');
+            }
+        }
+
+        async function saveState() {
+            try {
+                await fetchJson(`${API_BASE}/v1/state`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(state)
+                }, '保存状态');
+            } catch (e) {
+                showStatus('保存失败: ' + e.message, 'error');
+            }
+        }
+
+        async function getFundName(code) {
+            try {
+                const data = await fetchJson(`${API_BASE}/v1/fund/${code}/name`, {}, '获取基金名称');
+                return data.name || '';
+            } catch {
+                return '';
+            }
+        }
+
+        async function refreshAll() {
+            if (isRefreshing) return;
+            if (state.sectors.length === 0) return;
+
+            const allCodes = [];
+            state.sectors.forEach(s => s.funds.forEach(f => { if (f.code) allCodes.push(f.code); }));
+            if (allCodes.length === 0) return;
+
+            isRefreshing = true;
+            const btn = document.getElementById('refreshBtn');
+            btn.innerHTML = '<span class="loading"></span>刷新中';
+            btn.disabled = true;
+
+            try {
+                const requests = [
+                    fetchJson(`${API_BASE}/v1/valuation/batch`, {
+                        method: 'POST',
+                        timeoutMs: 50000,
+                        maxRetries: 0,
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ fund_codes: allCodes })
+                    }, '刷新估值')
+                ];
+                // 只有低频网格页可见时才刷新信号，避免估值页刷新时叠加重请求。
+                if (currentTab === 'strategy') {
+                    requests.push(loadStrategyPanel().catch(() => null));
+                }
+
+                const [data] = await Promise.all(requests);
+                valuations = {};
+                (data.items || []).forEach(item => {
+                    if (item?.fund_code) valuations[item.fund_code] = item;
+                });
+
+                const pauseReason = getRefreshPauseReason();
+                if (pauseReason) {
+                    showStatus(`数据已获取，${pauseReason}，页面暂不重绘`, 'info');
+                    return;
+                }
+                const viewState = capturePanelView(document.getElementById('sectors'));
+                render();
+                restorePanelView(document.getElementById('sectors'), viewState);
+                lastRefreshTime = new Date();
+                document.getElementById('updateTime').textContent =
+                    `更新于 ${lastRefreshTime.toLocaleTimeString()}`;
+            } catch (e) {
+                showStatus('刷新失败: ' + e.message, 'error');
+            } finally {
+                isRefreshing = false;
+                btn.innerHTML = '🔄 刷新';
+                btn.disabled = false;
+            }
+        }
+
+        // ============ 板块操作 ============
+        function addSector() {
+            const name = document.getElementById('newSectorName').value.trim();
+            if (!name) return;
+
+            state.sectors.push({ name, funds: [] });
+            saveState();
+            render();
+            closeModal('addSectorModal');
+        }
+
+        // ============ 基金操作 ============
+        async function addFund(sectorIndex) {
+            const form = document.querySelector(`#sector-${sectorIndex} .add-row`);
+            const codeInput = form.querySelector('input[name="code"]');
+            const aliasInput = form.querySelector('input[name="alias"]');
+            const code = codeInput.value.trim();
+            let alias = aliasInput.value.trim();
+
+            if (!code || !/^\d{6}$/.test(code)) {
+                showStatus('请输入6位基金代码', 'error');
+                return;
+            }
+
+            // 检查重复
+            const exists = state.sectors[sectorIndex].funds.some(f => f.code === code);
+            if (exists) {
+                showStatus('该基金已存在', 'error');
+                return;
+            }
+
+            // 自动获取基金名称
+            if (!alias) {
+                const btn = form.querySelector('button');
+                btn.innerHTML = '<span class="loading"></span>';
+                btn.disabled = true;
+                alias = await getFundName(code);
+                btn.innerHTML = '添加';
+                btn.disabled = false;
+            }
+
+            state.sectors[sectorIndex].funds.push({ code, alias });
+            saveState();
+            render();
+
+            codeInput.value = '';
+            aliasInput.value = '';
+
+            // 添加后立即刷新估值
+            refreshAll();
+        }
+
+        function deleteFund(sectorIndex, fundIndex) {
+            state.sectors[sectorIndex].funds.splice(fundIndex, 1);
+            saveState();
+            render();
+        }
+
+        function showMoveFundModal(sectorIndex, fundIndex) {
+            const fund = state.sectors[sectorIndex].funds[fundIndex];
+            if (!fund) return;
+            const displayName = valuations[fund.code]?.fund_name || fund.alias || fund.code;
+            document.getElementById('moveFundTitle').textContent = `移动 ${fund.code} ${displayName}`;
+
+            let html = '';
+            state.sectors.forEach((sector, si) => {
+                const isCurrent = si === sectorIndex;
+                html += `<div style="padding:8px 10px;border-bottom:1px solid #f1f5f9;cursor:${isCurrent ? 'default' : 'pointer'};border-radius:4px;${isCurrent ? 'background:#eff6ff;' : ''}" ${isCurrent ? '' : `onclick="moveFund(${sectorIndex},${fundIndex},${si})"`}>
+                    <span style="font-size:12px;color:#374151;">📁 ${sector.name}</span>
+                    <span style="font-size:11px;color:#9ca3af;margin-left:8px;">${sector.funds.length}只基金</span>
+                    ${isCurrent ? '<span style="float:right;color:#4f46e5;font-size:11px;">✓ 当前</span>' : ''}
+                </div>`;
+            });
+            document.getElementById('moveFundList').innerHTML = html;
+            document.getElementById('moveFundModal').classList.add('show');
+        }
+
+        function moveFund(fromSector, fundIndex, toSector) {
+            if (fromSector === toSector) return;
+            const fund = state.sectors[fromSector].funds[fundIndex];
+            if (!fund) return;
+            // 检查目标板块是否已有同代码基金
+            if (state.sectors[toSector].funds.some(f => f.code === fund.code)) {
+                showStatus('目标板块已存在该基金', 'error');
+                return;
+            }
+            state.sectors[fromSector].funds.splice(fundIndex, 1);
+            state.sectors[toSector].funds.push(fund);
+            saveState();
+            closeModal('moveFundModal');
+            render();
+            showStatus(`已移动到「${state.sectors[toSector].name}」`, 'success');
+        }
+
+        async function deleteSector(sectorIndex) {
+            const sector = state.sectors[sectorIndex];
+            if (!confirm(`确定删除板块「${sector.name}」及其所有基金？`)) return;
+            state.sectors.splice(sectorIndex, 1);
+            saveState();
+            render();
+        }
+
+        // ============ 净值历史弹窗 ============
+        async function showNavHistory(fundCode) {
+            const modal = document.getElementById('navHistoryModal');
+            const title = document.getElementById('navHistoryTitle');
+            const body = document.getElementById('navHistoryBody');
+
+            const val = valuations[fundCode];
+            const name = val?.fund_name || fundCode;
+            title.textContent = `${name}（${fundCode}）近期涨跌`;
+            body.innerHTML = '<p style="text-align:center;color:#9ca3af;padding:20px;"><span class="loading"></span>加载中...</p>';
+            modal.classList.add('show');
+
+            try {
+                const data = await fetchJson(`${API_BASE}/v1/fund/${fundCode}/nav-history?days=20`, {}, '加载净值历史');
+                const history = data.history || [];
+
+                if (history.length === 0) {
+                    body.innerHTML = '<p style="text-align:center;color:#9ca3af;padding:20px;">暂无数据</p>';
+                    return;
+                }
+
+                // 找最大绝对值用于柱状图比例
+                const maxAbs = Math.max(...history.map(h => Math.abs(h.change || 0)), 0.01);
+
+                let html = `<table class="nav-history-table">
+                    <thead><tr>
+                        <th>日期</th>
+                        <th>净值</th>
+                        <th style="text-align:right">涨跌幅</th>
+                        <th style="width:80px"></th>
+                    </tr></thead><tbody>`;
+
+                history.forEach(h => {
+                    const change = h.change;
+                    const cls = change > 0 ? 'up' : change < 0 ? 'down' : 'flat';
+                    const changeStr = change != null ? ((change >= 0 ? '+' : '') + change.toFixed(2) + '%') : '--';
+                    const navStr = h.nav != null ? h.nav.toFixed(4) : '--';
+
+                    // 迷你柱状图
+                    const barWidth = change != null ? Math.round(Math.abs(change) / maxAbs * 60) : 0;
+                    const barColor = change > 0 ? '#fca5a5' : change < 0 ? '#86efac' : '#e5e7eb';
+                    const barHtml = barWidth > 0 ? `<span class="mini-bar" style="width:${barWidth}px;background:${barColor}"></span>` : '';
+
+                    html += `<tr>
+                        <td>${h.date || '--'}</td>
+                        <td>${navStr}</td>
+                        <td style="text-align:right" class="${cls}">${changeStr}</td>
+                        <td>${barHtml}</td>
+                    </tr>`;
+                });
+
+                html += '</tbody></table>';
+
+                // 累计统计（复利计算）
+                const validChanges = history.filter(h => h.change != null).map(h => h.change);
+                if (validChanges.length >= 2) {
+                    const compoundReturn = (arr) => {
+                        let product = 1;
+                        for (const c of arr) product *= (1 + c / 100);
+                        return (product - 1) * 100;
+                    };
+                    const sum5 = compoundReturn(validChanges.slice(0, 5));
+                    const sum10 = compoundReturn(validChanges.slice(0, 10));
+                    const upDays = validChanges.filter(c => c > 0).length;
+                    const downDays = validChanges.filter(c => c < 0).length;
+                    html += `<div style="padding:8px 0;font-size:11px;color:#6b7280;display:flex;gap:16px;flex-wrap:wrap;">
+                        <span>近5日累计: <b style="color:${sum5>=0?'#dc2626':'#16a34a'}">${sum5>=0?'+':''}${sum5.toFixed(2)}%</b></span>
+                        <span>近10日累计: <b style="color:${sum10>=0?'#dc2626':'#16a34a'}">${sum10>=0?'+':''}${sum10.toFixed(2)}%</b></span>
+                        <span>涨${upDays}天 跌${downDays}天</span>
+                    </div>`;
+                }
+
+                body.innerHTML = html;
+            } catch (e) {
+                body.innerHTML = `<p style="text-align:center;color:#ef4444;padding:20px;">加载失败: ${e.message}</p>`;
+            }
+        }
+
+        // ============ 自动刷新（交易时段感知） ============
+        function isTradeTime() {
+            const now = new Date();
+            const day = now.getDay();
+            if (day === 0 || day === 6) return false;
+            const hhmm = now.getHours() * 100 + now.getMinutes();
+            // 9:15~11:35 和 12:55~15:05（留缓冲）
+            return (hhmm >= 915 && hhmm <= 1135) || (hhmm >= 1255 && hhmm <= 1505);
+        }
+
+        function startAutoRefresh() {
+            if (autoRefreshTimer) return;
+            _scheduleNextRefresh();
+            updateRefreshTimer();
+        }
+
+        function _scheduleNextRefresh(delayOverride = null) {
+            if (autoRefreshTimer) clearTimeout(autoRefreshTimer);
+            const interval = delayOverride ?? (isTradeTime() ? 30000 : 300000); // 交易时段30s，非交易5min
+            autoRefreshTimer = setTimeout(async () => {
+                autoRefreshTimer = null;
+                const pauseReason = getRefreshPauseReason();
+                if (!pauseReason && state.sectors.some(s => s.funds.length > 0)) {
+                    if (currentTab === 'strategy') {
+                        await Promise.all([loadRegimeStatus(), loadStrategyPanel()]);
+                    } else {
+                        await refreshAll();
+                    }
+                }
+                _scheduleNextRefresh(pauseReason ? 5000 : null);
+            }, interval);
+        }
+
+        function updateRefreshTimer() {
+            const el = document.getElementById('refreshTimer');
+            const dot = document.querySelector('.refresh-status .dot');
+            const trading = isTradeTime();
+            const pauseReason = getRefreshPauseReason();
+
+            if (pauseReason) {
+                if (dot) dot.style.background = '#f59e0b';
+                el.textContent = `⏸ ${pauseReason} · 自动刷新已暂停`;
+                setTimeout(updateRefreshTimer, 1000);
+                return;
+            }
+
+            if (trading) {
+                if (dot) dot.style.background = '#10b981';
+                if (lastRefreshTime) {
+                    const ago = Math.floor((Date.now() - lastRefreshTime) / 1000);
+                    el.textContent = `${ago}s前更新 · 30s刷新`;
+                } else {
+                    el.textContent = '🟢 30s自动刷新中';
+                }
+            } else {
+                if (dot) dot.style.background = '#9ca3af';
+                if (lastRefreshTime) {
+                    const ago = Math.floor((Date.now() - lastRefreshTime) / 1000);
+                    const agoText = ago < 60 ? `${ago}s` : `${Math.floor(ago/60)}m`;
+                    el.textContent = `⏸ 非交易时段 · ${agoText}前更新`;
+                } else {
+                    el.textContent = '⏸ 非交易时段';
+                }
+            }
+            setTimeout(updateRefreshTimer, 1000);
+        }
+
+        // ============ 渲染界面（估值看板） ============
+        function render() {
+            const container = document.getElementById('sectors');
+
+            if (state.sectors.length === 0) {
+                container.innerHTML = `
+                    <div class="empty">
+                        <div class="empty-icon">📁</div>
+                        <p>点击"新建板块"开始</p>
+                    </div>
+                `;
+                return;
+            }
+
+            container.innerHTML = state.sectors.map((sector, si) => {
+                // 按涨跌幅排序（由高到低）
+                const sortedFunds = [...sector.funds].sort((a, b) => {
+                    const valA = valuations[a.code];
+                    const valB = valuations[b.code];
+                    const changeA = valA?.estimation_change ?? -999;
+                    const changeB = valB?.estimation_change ?? -999;
+                    return changeB - changeA;
+                });
+
+                return `
+                <div class="sector" id="sector-${si}">
+                    <div class="sector-header">
+                        <span class="sector-name">${sector.name}</span>
+                        <div style="display:flex;gap:4px;">
+                            <button class="btn-export" onclick="exportSectorImage(${si})" title="导出图片">📷</button>
+                            <button class="btn-export" onclick="deleteSector(${si})" title="删除板块" style="color:#ef4444;">🗑</button>
+                        </div>
+                    </div>
+                    ${sector.funds.length === 0 ?
+                        '<div style="padding:20px;text-align:center;color:#9ca3af;font-size:12px;">暂无基金</div>' :
+                        `<table class="fund-table">
+                            <thead>
+                                <tr>
+                                    <th>代码</th>
+                                    <th>名称</th>
+                                    <th style="text-align:right">涨跌幅</th>
+                                    <th style="text-align:right">近5日</th>
+                                    <th style="text-align:right">近20日</th>
+                                    <th style="text-align:right">置信度</th>
+                                    <th></th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                ${sortedFunds.map((fund) => {
+                                    const fi = sector.funds.findIndex(f => f.code === fund.code);
+                                    return renderFundRow(fund, si, fi);
+                                }).join('')}
+                            </tbody>
+                        </table>`
+                    }
+                    <div class="add-row">
+                        <input type="text" name="code" placeholder="代码" maxlength="6">
+                        <input type="text" name="alias" placeholder="名称（自动获取）">
+                        <button class="btn-primary" onclick="addFund(${si})">添加</button>
+                    </div>
+                </div>
+            `}).join('');
+        }
+
+        function renderFundRow(fund, sectorIndex, fundIndex) {
+            const val = valuations[fund.code];
+            let changeText = '--';
+            let changeClass = 'flat';
+            let confidence = '--';
+            let weekText = '--';
+            let weekClass = 'flat';
+            let monthText = '--';
+            let monthClass = 'flat';
+            let displayName = fund.alias || '';
+            let needsEtfLink = false;
+            let isNav = false;
+
+            if (val) {
+                if (val.estimation_change !== null && val.estimation_change !== undefined) {
+                    const change = val.estimation_change;
+                    changeText = (change >= 0 ? '+' : '') + change.toFixed(2) + '%';
+                    changeClass = change > 0 ? 'up' : change < 0 ? 'down' : 'flat';
+                    if (val._source === 'nav') isNav = true;
+                }
+                if (val.week_change !== null && val.week_change !== undefined) {
+                    const wc = val.week_change;
+                    weekText = (wc >= 0 ? '+' : '') + wc.toFixed(2) + '%';
+                    weekClass = wc > 0 ? 'up' : wc < 0 ? 'down' : 'flat';
+                }
+                if (val.month_change !== null && val.month_change !== undefined) {
+                    const mc = val.month_change;
+                    monthText = (mc >= 0 ? '+' : '') + mc.toFixed(2) + '%';
+                    monthClass = mc > 0 ? 'up' : mc < 0 ? 'down' : 'flat';
+                }
+                confidence = ((val.calibrated_confidence ?? val.confidence) * 100).toFixed(0) + '%';
+                if (!displayName && val.fund_name) {
+                    displayName = val.fund_name;
+                }
+                if ((val.calibrated_confidence ?? val.confidence) < 0.15) {
+                    needsEtfLink = true;
+                }
+            }
+
+            // ✓ 标记作为小号内联元素，和数字在同一行
+            // _nav_date 存在且非今天时，显示净值日期（如"2/13净值"）
+            let navMark = '';
+            if (isNav) {
+                const navDate = val?._nav_date;
+                const todayStr = new Date().toISOString().slice(0, 10);
+                if (navDate && navDate !== todayStr) {
+                    const md = navDate.slice(5).replace(/^0/, '').replace(/-0?/, '/');
+                    navMark = `<span style="font-size:9px;margin-left:2px;color:#f59e0b;font-weight:400;" title="${navDate}净值">${md}</span>`;
+                } else {
+                    navMark = '<span style="font-size:10px;margin-left:2px;color:#10b981;font-weight:400;">✓</span>';
+                }
+            }
+
+            const etfBtn = needsEtfLink ?
+                `<button onclick="showEtfLinkModal('${fund.code}')" title="设置ETF穿透" style="color:#f59e0b;">⚙</button>` : '';
+
+            return `
+                <tr>
+                    <td class="td-code" onclick="showNavHistory('${fund.code}')" title="点击查看近期涨跌">${fund.code}</td>
+                    <td class="td-name" title="${displayName}">${displayName}</td>
+                    <td class="td-change ${changeClass}" style="white-space:nowrap;">${changeText}${navMark}</td>
+                    <td class="td-change ${weekClass}">${weekText}</td>
+                    <td class="td-change ${monthClass}">${monthText}</td>
+                    <td class="td-confidence">${confidence}</td>
+                    <td class="td-action" style="white-space:nowrap;">
+                        ${etfBtn}
+                        <button onclick="addToStrategy('${fund.code}')" title="加入低频网格" style="color:#10b981;">📌</button>
+                        <button onclick="showMoveFundModal(${sectorIndex}, ${fundIndex})" title="移动到其他板块" style="color:#6366f1;">↗</button>
+                        <button onclick="deleteFund(${sectorIndex}, ${fundIndex})" title="删除">×</button>
+                    </td>
+                </tr>
+            `;
+        }
+
+        // ============ ETF映射设置 ============
+        function showEtfLinkModal(linkCode) {
+            document.getElementById('etfLinkCode').value = linkCode;
+            document.getElementById('etfTargetCode').value = '';
+            document.getElementById('etfLinkModal').classList.add('show');
+            document.getElementById('etfTargetCode').focus();
+        }
+
+        async function saveEtfLink() {
+            const linkCode = document.getElementById('etfLinkCode').value.trim();
+            const etfCode = document.getElementById('etfTargetCode').value.trim();
+
+            if (!etfCode || !/^\d{6}$/.test(etfCode)) {
+                showStatus('请输入6位ETF代码', 'error');
+                return;
+            }
+
+            try {
+                await fetchJson(`${API_BASE}/v1/etf-link`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ link_code: linkCode, etf_code: etfCode })
+                }, '设置 ETF 映射');
+
+                showStatus(`已设置 ${linkCode} -> ${etfCode}`, 'success');
+                closeModal('etfLinkModal');
+
+                // 刷新估值
+                await refreshAll();
+            } catch (e) {
+                showStatus('设置失败: ' + e.message, 'error');
+            }
+        }
+
+        async function clearEtfLink() {
+            const linkCode = document.getElementById('etfLinkCode').value.trim();
+
+            try {
+                await fetchJson(`${API_BASE}/v1/etf-link/${linkCode}`, { method: 'DELETE' }, '清除 ETF 映射');
+                showStatus(`已清除 ${linkCode} 的映射`, 'success');
+                closeModal('etfLinkModal');
+                await refreshAll();
+            } catch (e) {
+                showStatus('清除失败', 'error');
+            }
+        }
+
+        // ============ 加入策略持仓 ============
+        async function addToStrategy(fundCode) {
+            // 先检查是否已在持仓中（包括空仓观察）
+            try {
+                const posData = await fetchJson(`${API_BASE}/v1/positions`, {}, '加载持仓');
+                const funds = posData.funds || {};
+                if (funds[fundCode]) {
+                    showStatus(`${fundCode} 已在低频网格中`, 'info');
+                    switchTab('strategy');
+                    return;
+                }
+            } catch {}
+            // 打开买入弹窗（支持空仓观察录入）
+            showBuyModal(fundCode);
+        }
+
+        // ============ 从策略面板移除基金 ============
+        async function removeFromStrategy(fundCode) {
+            const displayCode = fundCode.includes('__') ? fundCode.replace('__', ' [') + ']' : fundCode;
+            if (!confirm(`确定将 ${displayCode} 从低频网格移除？（会删除所有持仓记录）`)) return;
+            try {
+                await fetchJson(`${API_BASE}/v1/position/${encodeURIComponent(fundCode)}`, { method: 'DELETE' }, '移除持仓');
+                showStatus(`已移除 ${displayCode}`, 'success');
+                loadStrategyPanel();
+            } catch (e) {
+                showStatus('移除失败: ' + e.message, 'error');
+            }
+        }
+
+        // ============ 策略面板 ============
+        // ============================================================
+        // v5.13: 行情模式管理
+        // ============================================================
+        let _currentRegime = 'neutral';
+        let _regimeAuto = true;
+        let _regimeManual = false;
+
+
+        async function loadRegimeStatus() {
+            try {
+                const data = await fetchJson(`${API_BASE}/v1/market-regime`, {}, '加载行情模式');
+                _currentRegime = data.regime || 'neutral';
+                if (_currentRegime === 'bull') _currentRegime = 'neutral';  // v5.17: bull已禁用
+                _regimeAuto = data.auto !== false;
+                _regimeManual = !!data.manual;
+                updateRegimeUI();
+            } catch(e) { console.warn('loadRegimeStatus error:', e); }
+        }
+
+        async function setRegimeManual(regime) {
+            try {
+                await fetchJson(`${API_BASE}/v1/market-regime`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify({ regime, auto: true, manual_override: true }),
+                }, '设置行情模式');
+                _currentRegime = regime;
+                _regimeManual = true;
+                updateRegimeUI();
+                loadStrategyPanel();
+            } catch(e) { showStatus('设置行情模式失败', 'error'); }
+        }
+
+        async function toggleRegimeAuto() {
+            try {
+                if (_regimeManual) {
+                    // 恢复自动
+                    await fetchJson(`${API_BASE}/v1/market-regime`, {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({ regime: 'neutral', auto: true, manual_override: false }),
+                    }, '恢复自动行情模式');
+                    _regimeManual = false;
+                }
+                await loadRegimeStatus();
+                loadStrategyPanel();
+            } catch(e) { showStatus('切换自动识别失败', 'error'); }
+        }
+
+        function updateRegimeUI() {
+            // v5.17: 内联regime按钮在loadStrategyPanel中渲染，此处更新已存在的按钮
+            document.querySelectorAll('.ri-btn').forEach(btn => {
+                const text = btn.textContent;
+                const isBear = text.includes('熊');
+                const regime = isBear ? 'bear' : 'neutral';
+                btn.className = 'ri-btn';
+                if (regime === _currentRegime) btn.classList.add(`active-${_currentRegime}`);
+            });
+            const srcLabel = document.getElementById('regimeSourceLabel');
+            if (srcLabel) {
+                srcLabel.textContent = _regimeManual ? '手动' : '自动';
+                srcLabel.className = 'regime-auto-badge' + (_regimeManual ? ' manual' : '');
+            }
+        }
+
+        async function loadStrategyPanel() {
+            if (strategyLoadPromise) {
+                return strategyLoadPromise;
+            }
+
+            strategyLoadPromise = loadStrategyPanelInternal();
+            try {
+                return await strategyLoadPromise;
+            } finally {
+                strategyLoadPromise = null;
+            }
+        }
+
+        async function loadStrategyPanelInternal() {
+            const panel = document.getElementById('strategyPanel');
+            const hadContent = Boolean(panel.querySelector('.signal-card, .strategy-group'));
+            const viewState = capturePanelView(panel);
+            if (!hadContent) {
+                panel.innerHTML = '<div style="text-align:center;padding:20px;color:#9ca3af;"><span class="loading"></span>加载信号中...</div>';
+            }
+
+            try {
+                // 并行获取信号 + 持仓
+                const [sigData, posData] = await Promise.all([
+                    fetchJson(`${API_BASE}/v1/strategy/signals`, {}, '加载网格信号'),
+                    fetchJson(`${API_BASE}/v1/positions`, {}, '加载持仓'),
+                ]);
+                const signals = sigData.signals || [];
+                const funds = posData.funds || {};
+
+                const pauseReason = getRefreshPauseReason();
+                if (hadContent && pauseReason) {
+                    showStatus(`信号已获取，${pauseReason}，页面暂不重绘`, 'info');
+                    return;
+                }
+
+                if (signals.length === 0 && Object.keys(funds).length === 0) {
+                    panel.innerHTML = `
+                        <div class="empty">
+                            <div class="empty-icon">📡</div>
+                            <p>暂无持仓和信号数据</p>
+                            <p style="font-size:11px;color:#9ca3af;margin-top:8px;">在实时估值中观察基金，然后在此录入持仓</p>
+                        </div>
+                        <div class="add-position-bar">
+                            <span>快速添加持仓基金：</span>
+                            <input type="text" id="quickAddCode" placeholder="6位代码" maxlength="6">
+                            <button class="btn-success" onclick="quickAddPosition()" style="padding:6px 12px;font-size:12px;border:none;border-radius:4px;cursor:pointer;">录入买入</button>
+                        </div>
+                    `;
+                    return;
+                }
+
+                const pb = sigData.portfolio_budget;
+                const cashReserveRatio = pb ? pb.cash_reserve_ratio : 0.30;
+
+                let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                    <div style="display:flex;align-items:center;">
+                        <span style="font-size:12px;color:#6b7280;">信号生成于 ${sigData.generated_at || '--'}</span>
+                        <div class="regime-inline" id="regimeInline">
+                            <button class="ri-btn ${_currentRegime === 'neutral' ? 'active-neutral' : ''}" onclick="setRegimeManual('neutral')">⚖️ 震荡</button>
+                            <button class="ri-btn ${_currentRegime === 'bear' ? 'active-bear' : ''}" onclick="setRegimeManual('bear')">🐻 熊市</button>
+                            <span id="regimeSourceLabel" class="regime-auto-badge ${_regimeManual ? 'manual' : ''}" onclick="toggleRegimeAuto()" title="点击切换自动/手动">${_regimeManual ? '手动' : '自动'}</span>
+                        </div>
+                    </div>
+                    <div style="display:flex;gap:6px;">
+                        <button class="btn-warning" onclick="showAddInstanceModal()" style="padding:4px 12px;font-size:11px;">新增模块</button>
+                        <button class="btn-success" onclick="showGroupModal()" style="padding:4px 12px;font-size:11px;">➕ 新建分组</button>
+                        <button class="btn-primary" onclick="loadStrategyPanel()" style="padding:4px 12px;font-size:11px;">刷新信号</button>
+                    </div>
+                </div>`;
+
+                // sigMap moved here so calcGroupBudget and renderSignalCard can access it
+                const sigMap = {};
+                for (const sig of signals) sigMap[sig.fund_code] = sig;
+
+                // 按分组计算预算的辅助函数（预算用成本口径）
+                function calcGroupBudget(fundCodes) {
+                    let maxInvest = 0, invested = 0;
+                    for (const code of fundCodes) {
+                        const f = funds[code];
+                        if (!f) continue;
+                        maxInvest += (f.max_position || 5000);
+                        // 优先使用市值（与持仓汇总展示口径一致），回退到成本求和
+                        const mv = sigMap[code]?.market_analysis?.market_value;
+                        if (mv != null && mv > 0) {
+                            invested += mv;
+                        } else {
+                            const holding = (f.batches || []).filter(b => b.status === 'holding');
+                            invested += holding.reduce((s, b) => s + (b.amount || 0), 0);
+                        }
+                    }
+                    maxInvest *= (1 - cashReserveRatio);
+                    return { maxInvest, invested, available: Math.max(0, maxInvest - invested) };
+                }
+                function renderGroupBudgetBar(budget) {
+                    if (budget.maxInvest <= 0) return '';
+                    const pct = (budget.invested / budget.maxInvest * 100).toFixed(0);
+                    const clr = pct > 85 ? '#ef4444' : pct > 60 ? '#f59e0b' : '#10b981';
+                    return `<div style="display:flex;align-items:center;gap:8px;padding:5px 14px;font-size:10px;color:#9ca3af;border-bottom:1px solid #f1f5f9;">
+                        <span>预算</span>
+                        <div style="flex:1;height:4px;background:#f1f5f9;border-radius:2px;overflow:hidden;">
+                            <div style="width:${Math.min(pct,100)}%;height:100%;background:${clr};border-radius:2px;"></div>
+                        </div>
+                        <span>¥${budget.invested.toFixed(0)} / ¥${budget.maxInvest.toFixed(0)}</span>
+                        <span>可用 <b style="color:${budget.available > 0 ? '#059669' : '#dc2626'};">¥${budget.available.toFixed(0)}</b></span>
+                    </div>`;
+                }
+
+                // === 按分组组织信号卡片 ===
+                // v5.4 优化: 自动根据角色标签同步分组
+                const allFundCodes = signals.map(s => s.fund_code);
+                const groupData = autoSyncGroupsFromOwnerTags(allFundCodes);
+                const groupedCodes = new Set();
+                for (const grp of groupData.groups) {
+                    for (const c of grp.fund_codes) groupedCodes.add(c);
+                }
+
+                // 渲染一个分组
+                function renderGroupSection(groupId, groupName, fundCodes, showHeader) {
+                    // 过滤出有信号的基金
+                    const codesWithSig = fundCodes.filter(c => sigMap[c]);
+                    if (codesWithSig.length === 0 && showHeader) return '';
+
+                    let sectionHtml = '';
+                    if (showHeader) {
+                        const gBudget = calcGroupBudget(codesWithSig);
+                        sectionHtml += `<div class="strategy-group" data-group-id="${groupId}">
+                            <div class="strategy-group-header">
+                                <span class="group-name" onclick="showGroupModal('${groupId}')" title="点击重命名">${groupName}</span>
+                                <div class="group-actions">
+                                    <button onclick="exportStrategyGroupImage('${groupId}')" title="导出图片">📷</button>
+                                    <button onclick="showGroupModal('${groupId}')" title="重命名">✏️</button>
+                                    <button onclick="deleteGroup('${groupId}')" title="删除分组" style="color:#ef4444;">🗑</button>
+                                </div>
+                            </div>
+                            ${renderGroupBudgetBar(gBudget)}
+                            <div class="strategy-group-body">`;
+                    }
+
+                    for (const code of codesWithSig) {
+                        sectionHtml += renderSignalCard(code, sigMap[code], funds[code]);
+                    }
+
+                    if (showHeader) {
+                        sectionHtml += `</div></div>`;
+                    }
+                    return sectionHtml;
+                }
+
+                // 渲染各分组（自选优先置顶）
+                const sortedGroups = [...groupData.groups].sort((a, b) => {
+                    if (a.name === '自选') return -1;
+                    if (b.name === '自选') return 1;
+                    return 0;
+                });
+                for (const grp of sortedGroups) {
+                    html += renderGroupSection(grp.id, grp.name, grp.fund_codes, true);
+                }
+
+                // 未分组的基金
+                const ungroupedCodes = signals.map(s => s.fund_code).filter(c => !groupedCodes.has(c));
+                if (ungroupedCodes.length > 0) {
+                    if (groupData.groups.length > 0) {
+                        html += `<div class="ungrouped-label">未分组</div>`;
+                    }
+                    for (const code of ungroupedCodes) {
+                        html += renderSignalCard(code, sigMap[code], funds[code]);
+                    }
+                }
+
+                // 渲染单个信号卡片的函数（在上面被 renderGroupSection 调用）
+                function renderSignalCard(code, sig, fundPos) {
+                    const holdingBatches = (fundPos?.batches?.filter(b => b.status === 'holding') || [])
+                        .sort((a, b) => a.buy_date.localeCompare(b.buy_date));
+                    const hasPos = holdingBatches.length > 0;
+
+                    let badgeCls = 'hold';
+                    if (sig.action === 'sell') badgeCls = 'sell';
+                    else if (sig.action === 'buy') badgeCls = 'buy';
+                    if (sig.alert) badgeCls = 'alert';
+                    if (sig.signal_name && sig.signal_name.includes('低置信')) badgeCls = 'alert';
+
+                    // 解析复合键：code 可能是 "017193__老公"
+                    let realCode = code, ownerTag = '';
+                    if (code.includes('__')) {
+                        const parts = code.split('__');
+                        realCode = parts[0];
+                        ownerTag = parts[1] || '';
+                    }
+
+                    const fundName = fundPos?.fund_name || valuations[realCode]?.fund_name || '';
+                    const ownerBadge = ownerTag ? `<span style="margin-left:6px;background:#e0e7ff;color:#4338ca;font-size:10px;font-weight:600;padding:1px 6px;border-radius:3px;">${ownerTag}</span>` : '';
+                    // 使用 encodeURIComponent 确保复合键在 URL 中安全
+                    const safeCode = encodeURIComponent(code);
+
+                    // v5.13: 适配评分徽章
+                    let fitBadge = '';
+                    const _ma = sig.market_analysis || {};
+                    const fitScore = _ma.fitness_score;
+                    const fitGrade = _ma.fitness_grade;
+                    if (fitScore != null && fitGrade) {
+                        const fitCls = fitScore >= 70 ? 'grade-A' : fitScore >= 55 ? 'grade-B' : fitScore >= 40 ? 'grade-C' : fitScore >= 25 ? 'grade-D' : 'grade-E';
+                        fitBadge = `<span class="fitness-badge ${fitCls}" title="适配评分 ${Math.round(fitScore)}分 (${fitGrade})">${Math.round(fitScore)}</span>`;
+                    }
+
+                    // v5.17: 行情模式标签（熊市时显示）
+                    let regimeBadge = '';
+                    if (_ma.market_regime === 'bear') {
+                        const rSrc = _ma.regime_source === 'manual' ? '手动' : '自动';
+                        regimeBadge = `<span style="font-size:10px;margin-left:2px;" title="${rSrc}识别">🐻</span>`;
+                    }
+
+                    let html = `<div class="signal-card" data-fund-key="${escapeHtml(code)}">
+                        <div class="signal-card-header">
+                            <div class="fund-info">
+                                <span class="code" onclick="showNavHistory('${realCode}')">${realCode}</span>
+                                ${ownerBadge}${fitBadge}${regimeBadge}
+                                ${fundName ? `<span style="margin-left:6px;font-weight:400;color:#6b7280;font-size:12px;">${fundName}</span>` : ''}
+                            </div>
+                            <div style="display:flex;align-items:center;gap:6px;">
+                                <span class="signal-badge ${badgeCls}">${sig.signal_name}</span>
+                                <button onclick="showSetOwnerModal('${code}')" title="设置标签/持仓人" style="background:none;border:none;color:#a5b4fc;cursor:pointer;font-size:12px;padding:2px;">👤</button>
+                                <button onclick="showAssignGroupModal('${code}')" title="分配到分组" style="background:none;border:none;color:#9ca3af;cursor:pointer;font-size:12px;padding:2px;">📁</button>
+                                <button onclick="removeFromStrategy('${code}')" title="从低频网格移除" style="background:none;border:none;color:#d1d5db;cursor:pointer;font-size:13px;padding:2px;">×</button>
+                            </div>
+                        </div>
+                        <div class="signal-card-body" style="padding:6px 14px 4px;">`;
+
+                    const signalsToShow = sig.all_signals && sig.all_signals.length > 0 ? sig.all_signals : [sig];
+                    const fifo = sig.fifo_sell_plan;
+                    if (fifo && fifo.steps && fifo.steps.length > 0) {
+                        html += `<div style="background:#fef2f2;border:1px solid #fecaca;border-radius:6px;padding:8px 10px;margin-bottom:4px;">
+                            <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:4px;">
+                                <span style="font-weight:600;color:#dc2626;font-size:12px;">${fifo.instruction}</span>
+                                <span style="font-size:10px;color:#9ca3af;">涉及 ${fifo.batch_count} 个批次</span>
+                            </div>`;
+                        if (fifo.has_passthrough) {
+                            html += `<div style="background:#fef3c7;border-radius:4px;padding:3px 6px;margin-bottom:4px;font-size:10px;color:#92400e;">
+                                ⚠️ 支付宝按先进先出扣减，中间批次会被"穿过"一并卖出
+                            </div>`;
+                        }
+                        html += `<div style="font-size:10px;color:#6b7280;">`;
+                        for (const step of fifo.steps) {
+                            const ptTag = step.is_passthrough ? '<span style="color:#d97706;font-weight:600;">[穿过]</span> ' : '';
+                            const profitColor = (step.estimated_net_profit||0) >= 0 ? '#dc2626' : '#16a34a';
+                            html += `<div style="display:flex;justify-content:space-between;padding:2px 0;border-bottom:1px dashed #f3f4f6;">
+                                <span>${ptTag}${step.batch_id} · ${step.buy_date} · 持有${step.hold_days}天 · ${step.reason}</span>
+                                <span style="white-space:nowrap;">${step.sell_shares}份 · 费率${step.fee_rate}% · <b style="color:${profitColor}">¥${step.estimated_net_profit?.toFixed(2) || '--'}</b></span>
+                            </div>`;
+                        }
+                        html += `<div style="display:flex;justify-content:space-between;padding:3px 0;font-weight:600;color:#374151;">
+                            <span>合计</span>
+                            <span>手续费 ¥${fifo.total_estimated_fee?.toFixed(2) || '--'} · 净收益 <b style="color:${(fifo.total_estimated_profit||0) >= 0 ? '#dc2626' : '#16a34a'}">¥${fifo.total_estimated_profit?.toFixed(2) || '--'}</b></span>
+                        </div>`;
+                        html += `</div></div>`;
+                        for (const s of signalsToShow) {
+                            if (s.action === 'buy' && s._is_rebuy && s._pending_rebuy_id) {
+                                // v5.X: 延迟回补触发
+                                html += `<div style="background:#eef2ff;border:2px solid #6366f1;border-radius:6px;padding:8px 10px;margin-bottom:4px;">
+                                    <div style="display:flex;justify-content:space-between;align-items:center;">
+                                        <span style="font-size:12px;color:#4338ca;font-weight:700;">🔥 延迟回补已触发</span>
+                                        <span style="font-size:10px;color:#6366f1;">挂单 ${s._pending_rebuy_id}</span>
+                                    </div>
+                                    <div style="font-size:11px;color:#374151;margin-top:3px;">${s.reason || ''}</div>
+                                    <div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px;">
+                                        <div style="font-size:12px;color:#4f46e5;font-weight:700;">建议买入: ¥${s.amount.toFixed(2)}</div>
+                                        <button onclick="showBuyModalForRebuy('${code}', ${s.amount}, '${s._pending_rebuy_id}', '${(s.signal_name || '').replace(/'/g, '')}')"
+                                                style="padding:3px 12px;background:#4f46e5;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600;">
+                                            一键执行回补
+                                        </button>
+                                    </div>
+                                </div>`;
+                            } else if (s.action === 'buy' && s.amount) {
+                                html += `<div style="background:#ecfdf5;border:1px solid #a7f3d0;border-radius:6px;padding:6px 10px;margin-bottom:4px;">
+                                    <div style="font-size:11px;color:#374151;">
+                                        <span style="font-weight:600;color:#059669;">${s.signal_name}</span>
+                                        <span style="margin-left:6px;">${s.reason || ''}</span>
+                                    </div>
+                                    <div style="font-size:11px;color:#059669;font-weight:600;margin-top:2px;">建议买入: ¥${s.amount.toFixed(2)}${s._portfolio_discount != null && s._portfolio_discount < 1.0 ? `<span style="font-weight:400;color:#6b7280;margin-left:6px;">(组合${s._portfolio_buy_count}只同时买入, 折扣${Math.round(s._portfolio_discount*100)}%${s._portfolio_buy_peers ? ' · ' + s._portfolio_buy_peers.filter(c => c !== realCode).join('/') : ''})</span>` : ''}</div>
+                                </div>`;
+                            } else if (s.alert && s.action !== 'sell') {
+                                html += `<div style="background:#fef3c7;border:1px solid #fde68a;border-radius:6px;padding:6px 10px;margin-bottom:4px;">
+                                    <div style="font-size:11px;color:#92400e;">
+                                        <span style="font-weight:600;">⚠️ ${s.signal_name}</span>
+                                        <span style="margin-left:4px;">${s.reason || ''}</span>
+                                    </div>
+                                </div>`;
+                            }
+                        }
+                        // v5.12: 延迟回补建议（止盈后不立即买入，净值回落到触发价时回补）
+                        if (sig.rebuy_recommendation) {
+                            const rb = sig.rebuy_recommendation;
+                            const triggerInfo = rb.trigger_nav ? `净值≤${rb.trigger_nav}时触发` : `回补${Math.round((rb.ratio||0)*100)}%`;
+                            const windowInfo = rb.window_days ? `${rb.window_days}天内有效` : '';
+                            html += `<div style="background:#eef2ff;border:1px solid #c7d2fe;border-radius:6px;padding:6px 10px;margin-bottom:4px;">
+                                <div style="display:flex;justify-content:space-between;align-items:baseline;">
+                                    <div style="font-size:11px;color:#4338ca;">
+                                        <span style="font-weight:600;">🔄 延迟回补</span>
+                                        <span style="margin-left:6px;">趋势${rb.trend || ''}，${triggerInfo}${windowInfo ? '，'+windowInfo : ''}</span>
+                                    </div>
+                                    <div style="font-size:11px;color:#4f46e5;font-weight:600;">回补金额: ¥${rb.amount?.toFixed(2) || '--'}</div>
+                                </div>
+                            </div>`;
+                        }
+                    } else {
+                        for (const s of signalsToShow) {
+                            if (s.action === 'sell' && s.target_batch_id && s.fee_info) {
+                                const fi = s.fee_info;
+                                html += `<div style="background:#fef2f2;border:1px solid #fecaca;border-radius:6px;padding:6px 10px;margin-bottom:4px;">
+                                <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:2px;">
+                                    <div style="font-size:11px;color:#374151;">
+                                        <span style="font-weight:600;color:#dc2626;">${s.signal_name}</span>
+                                        <span style="margin-left:6px;">${s.reason || ''}</span>
+                                    </div>
+                                    <span style="font-size:10px;color:#9ca3af;white-space:nowrap;margin-left:8px;">批次 ${s.target_batch_id}</span>
+                                </div>
+                                <div style="display:flex;justify-content:space-between;align-items:baseline;">
+                                    <div style="font-size:10px;color:#6b7280;">费率 <b>${fi.sell_fee_rate}%</b>&ensp;手续费 <b>¥${fi.estimated_fee?.toFixed(2) || '--'}</b>&ensp;净收益 <b style="color:${(fi.estimated_net_profit||0) >= 0 ? '#dc2626' : '#16a34a'}">¥${fi.estimated_net_profit?.toFixed(2) || '--'}</b></div>
+                                    <div style="font-size:12px;font-weight:600;color:#dc2626;white-space:nowrap;">建议卖出: ${s.sell_shares}份 ${s.sell_pct ? `(该批次${s.sell_pct}%)` : ''}</div>
+                                </div>
+                            </div>`;
+                                // v5.12: 延迟回补建议
+                                if (s.rebuy_recommendation || sig.rebuy_recommendation) {
+                                    const rb = s.rebuy_recommendation || sig.rebuy_recommendation;
+                                    const triggerInfo = rb.trigger_nav ? `净值≤${rb.trigger_nav}时触发` : `回补${Math.round((rb.ratio||0)*100)}%`;
+                                    const windowInfo = rb.window_days ? `${rb.window_days}天内有效` : '';
+                                    html += `<div style="background:#eef2ff;border:1px solid #c7d2fe;border-radius:6px;padding:6px 10px;margin-bottom:4px;">
+                                        <div style="display:flex;justify-content:space-between;align-items:baseline;">
+                                            <div style="font-size:11px;color:#4338ca;">
+                                                <span style="font-weight:600;">🔄 延迟回补</span>
+                                                <span style="margin-left:6px;">趋势${rb.trend || ''}，${triggerInfo}${windowInfo ? '，'+windowInfo : ''}</span>
+                                            </div>
+                                            <div style="font-size:11px;color:#4f46e5;font-weight:600;">回补金额: ¥${rb.amount?.toFixed(2) || '--'}</div>
+                                        </div>
+                                    </div>`;
+                                }
+                            } else if (s.action === 'buy' && s._is_rebuy && s._pending_rebuy_id) {
+                                // v5.X: 延迟回补触发——醒目渲染 + 一键回补按钮
+                                html += `<div style="background:#eef2ff;border:2px solid #6366f1;border-radius:6px;padding:8px 10px;margin-bottom:4px;">
+                                    <div style="display:flex;justify-content:space-between;align-items:center;">
+                                        <span style="font-size:12px;color:#4338ca;font-weight:700;">🔥 延迟回补已触发</span>
+                                        <span style="font-size:10px;color:#6366f1;">挂单 ${s._pending_rebuy_id}</span>
+                                    </div>
+                                    <div style="font-size:11px;color:#374151;margin-top:3px;">${s.reason || ''}</div>
+                                    <div style="display:flex;justify-content:space-between;align-items:center;margin-top:4px;">
+                                        <div style="font-size:12px;color:#4f46e5;font-weight:700;">建议买入: ¥${s.amount.toFixed(2)}</div>
+                                        <button onclick="showBuyModalForRebuy('${code}', ${s.amount}, '${s._pending_rebuy_id}', '${(s.signal_name || '').replace(/'/g, '')}')"
+                                                style="padding:3px 12px;background:#4f46e5;color:#fff;border:none;border-radius:4px;cursor:pointer;font-size:11px;font-weight:600;">
+                                            一键执行回补
+                                        </button>
+                                    </div>
+                                </div>`;
+                            } else if (s.action === 'buy' && s.amount) {
+                                html += `<div style="background:#ecfdf5;border:1px solid #a7f3d0;border-radius:6px;padding:6px 10px;margin-bottom:4px;">
+                                <div style="font-size:11px;color:#374151;">
+                                    <span style="font-weight:600;color:#059669;">${s.signal_name}</span>
+                                    <span style="margin-left:6px;">${s.reason || ''}</span>
+                                </div>
+                                <div style="font-size:11px;color:#059669;font-weight:600;margin-top:2px;">建议买入: ¥${s.amount.toFixed(2)}${s._portfolio_discount != null && s._portfolio_discount < 1.0 ? `<span style="font-weight:400;color:#6b7280;margin-left:6px;">(组合${s._portfolio_buy_count}只同时买入, 折扣${Math.round(s._portfolio_discount*100)}%${s._portfolio_buy_peers ? ' · ' + s._portfolio_buy_peers.filter(c => c !== realCode).join('/') : ''})</span>` : ''}</div>
+                            </div>`;
+                            } else if (s.alert) {
+                                html += `<div style="background:#fef3c7;border:1px solid #fde68a;border-radius:6px;padding:6px 10px;margin-bottom:4px;">
+                                <div style="font-size:11px;color:#92400e;">
+                                    <span style="font-weight:600;">⚠️ ${s.signal_name}</span>
+                                    <span style="margin-left:4px;">${s.reason || ''}</span>
+                                </div>
+                            </div>`;
+                            } else if (s !== sig) {
+                                html += `<div style="font-size:11px;color:#6b7280;padding:2px 0;">${s.signal_name}: ${s.reason || ''}</div>`;
+                            }
+                        }
+                    }
+                    if (signalsToShow.length === 1 && sig.action === 'hold' && !sig.alert) {
+                        html += `<div class="signal-reason" style="margin-bottom:4px;">${sig.reason || ''}</div>`;
+                    }
+                    if (sig.alert && sig.alert_msg && !(sig.all_signals && sig.all_signals.some(s => s.alert))) {
+                        html += `<div class="signal-alert" style="margin-bottom:4px;">${sig.alert_msg}</div>`;
+                    }
+                    html += '</div>';
+
+                    // 行情分析区域
+                    const ma = sig.market_analysis;
+                    if (ma && ma.day_changes) {
+                        html += `<div class="market-analysis">`;
+                        const days = [...ma.day_changes].reverse();
+                        const maxAbs = Math.max(...days.map(d => Math.abs(d.change || 0)), 0.5);
+                        const upH = 30, downH = 30;
+                        html += `<div class="trend-bar">`;
+                        for (let di = 0; di < days.length; di++) {
+                            const d = days[di];
+                            const val = d.change ?? 0;
+                            const barH = Math.max(Math.abs(val) / maxAbs * 26, 1);
+                            const color = val > 0 ? '#ef4444' : val < 0 ? '#10b981' : '#d1d5db';
+                            const valColor = val > 0 ? '#dc2626' : val < 0 ? '#059669' : '#9ca3af';
+                            const dateLabel = d.date ? d.date.slice(5).replace('-', '/') : '';
+                            const srcTag = d.source === 'estimation' ? '<sup style="font-size:5px;color:#a78bfa;margin-left:1px;">估</sup>' : '';
+                            const valStr = (val > 0 ? '+' : '') + val.toFixed(2) + '%';
+                            html += `<div class="day-bar">
+                                <div class="bar-upper" style="height:${upH}px;">
+                                    ${val > 0 ? `<span class="bar-value" style="color:${valColor}">${valStr}${srcTag}</span><div class="bar-fill" style="background:${color};height:${barH}px;"></div>` : ''}
+                                </div>
+                                <div class="bar-lower" style="height:${downH}px;border-top:1px solid #e5e7eb;">
+                                    ${val <= 0 ? `<div class="bar-fill" style="background:${color};height:${barH}px;"></div><span class="bar-value" style="color:${valColor}">${valStr}${srcTag}</span>` : ''}
+                                </div>
+                                <span class="bar-label">${dateLabel}</span>
+                            </div>`;
+                        }
+                        html += `</div>`;
+                        html += `<div class="market-stats">`;
+                        const _s = (v, label) => {
+                            if (v === null || v === undefined) return '';
+                            const cls = v > 0 ? 'up' : v < 0 ? 'down' : 'flat';
+                            return `<div class="stat-item"><span class="stat-label">${label}:</span><span class="stat-value ${cls}">${v > 0 ? '+' : ''}${v}%</span></div>`;
+                        };
+                        html += _s(ma.short_3d, '3日');
+                        html += _s(ma.short_5d, '5日');
+                        html += _s(ma.mid_10d, '10日');
+                        html += _s(ma.long_20d, '20日');
+                        if (ma.trend) {
+                            const trendColor = {'连跌':'#dc2626','偏弱':'#f59e0b','连涨':'#059669','偏强':'#059669','震荡':'#6b7280','中期走弱':'#dc2626','中期走强':'#059669'}[ma.trend] || '#6b7280';
+                            html += `<div class="stat-item"><span class="stat-label">趋势:</span><span class="stat-value" style="color:${trendColor}">${ma.trend}</span></div>`;
+                        }
+                        if (ma.current_nav) {
+                            html += `<div class="stat-item"><span class="stat-label">估算净值:</span><span class="stat-value flat">${ma.current_nav}</span></div>`;
+                        }
+                        if (ma.total_profit_pct !== null && ma.total_profit_pct !== undefined) {
+                            const clsP = ma.total_profit_pct > 0 ? 'up' : ma.total_profit_pct < 0 ? 'down' : 'flat';
+                            html += `<div class="stat-item"><span class="stat-label">总浮盈:</span><span class="stat-value ${clsP}">${ma.total_profit_pct > 0 ? '+' : ''}${ma.total_profit_pct}%</span></div>`;
+                        }
+                        if (ma.confidence != null) {
+                            const confColor = ma.confidence >= 0.6 ? '#059669' : ma.confidence >= 0.4 ? '#d97706' : '#dc2626';
+                            html += `<div class="stat-item"><span class="stat-label">置信度:</span><span class="stat-value" style="color:${confColor}">${(ma.confidence * 100).toFixed(0)}%</span></div>`;
+                        }
+                        if (ma.covered_weight != null) {
+                            html += `<div class="stat-item"><span class="stat-label">覆盖:</span><span class="stat-value flat">${ma.covered_weight}%${ma.residual_weight ? `<span style="color:#d97706;font-size:9px;margin-left:1px;">+残差${ma.residual_weight}%</span>` : ''}</span></div>`;
+                        }
+                        const sp = ma.strategy_params || {};
+                        if (sp.risk_multiplier != null && sp.risk_multiplier !== 1.0) {
+                            const rmColor = sp.risk_multiplier > 1.2 ? '#d97706' : sp.risk_multiplier < 0.9 ? '#059669' : '#6b7280';
+                            html += `<div class="stat-item"><span class="stat-label">风险系数:</span><span class="stat-value" style="color:${rmColor}">${sp.risk_multiplier}×</span></div>`;
+                        }
+                        if (sp.vol_sensitivity != null) {
+                            const vs = sp.vol_sensitivity;
+                            const vsColor = Math.abs(vs - 1.0) > 0.05 ? (vs > 1.0 ? '#d97706' : '#059669') : '#6b7280';
+                            const vsSource = sp.vol_sensitivity_source === 'manual' ? '手动' : sp.vol_sensitivity_source === 'auto' ? '自动' : '默认';
+                            html += `<div class="stat-item"><span class="stat-label">灵敏度:</span><span class="stat-value" style="color:${vsColor};cursor:pointer;border-bottom:1px dashed ${vsColor};" onclick="showVolSensitivityModal('${code}')" title="点击调整灵敏度（当前来源:${vsSource}）">${vs.toFixed(2)}×<sup style="font-size:7px;color:#9ca3af;margin-left:1px;">${vsSource}</sup></span></div>`;
+                        }
+                        html += `<button class="strategy-info-btn" onclick="toggleStrategyInfo('${code}')" title="策略触发条件">?</button>`;
+                        html += `</div>`;
+                        html += `<div class="strategy-info-box" id="strategy-info-${code}">
+                            <div style="display:flex;flex-direction:column;gap:4px;">
+                                <div style="display:flex;align-items:baseline;gap:6px;">
+                                    <span style="display:inline-block;background:#d1fae5;color:#059669;font-size:9px;font-weight:600;padding:1px 5px;border-radius:3px;flex-shrink:0;">买入</span>
+                                    <span>大跌 ≤${sp.dip_buy_threshold||'--'}% · 连跌低吸 ≤${sp.consecutive_dip_trigger||'--'}%且前日跌 · 补仓最多${sp.supplement_max_count||3}次(浮亏≤${sp.supplement_loss_min||'--'}%且当日≤${sp.supplement_trigger||'--'}%，间隔≥2交易日+再跌≥1.2%) · 趋势建仓(5日≤-3%或10日≤-5%) · <b style="color:#4f46e5;">延迟回补(净值回落1.5-2%后触发，强趋势60%/中性35%，15天窗口)</b> · <b style="color:#4f46e5;">趋势自适应仓位(强趋势买入×1.4/弱趋势×0.8)</b></span>
+                                </div>
+                                <div style="display:flex;align-items:baseline;gap:6px;">
+                                    <span style="display:inline-block;background:#fee2e2;color:#dc2626;font-size:9px;font-weight:600;padding:1px 5px;border-radius:3px;flex-shrink:0;">卖出</span>
+                                    <span>冲高止盈(P2) ≥${sp.take_profit_trigger||'--'}% · 慢涨止盈(P2) 评分≥54(窄化窗口) · 回撤止盈(P2.2) 峰值回撤≥${sp.trail_dd||'1.8'}% · <b style="color:#4f46e5;">扭亏评分化(nz_bonus=min(12,浮盈×2)，走统一评分门槛)</b> · 趋弱(P3) 按盈利分级减仓(薄利70%/中利50%/厚利30%) · 止损(P1) ≤${sp.stop_loss_base||'--'}%−费率 · 短期深亏≤-6%安全网减30% · 回补仓位L2保护期10天</span>
+                                </div>
+                                <div style="display:flex;align-items:baseline;gap:6px;">
+                                    <span style="display:inline-block;background:#fef3c7;color:#92400e;font-size:9px;font-weight:600;padding:1px 5px;border-radius:3px;flex-shrink:0;">风控</span>
+                                    <span>灾难阀 ≤${sp.disaster_loss_threshold||'-9'}%(极端亏损卖50%/暴跌卖30%) · 补仓禁入(10日≤-10%+连跌≥5 或 回撤≥15%+波动≥2.5%) · 补仓节奏阀(间隔≥2交易日,急跌可缩至2日) · FIFO穿透亏损>50元自动暂缓 · 总仓位风控(灾难保底/时间豁免/趋势确认三层) · 趋势确认减仓(连跌≥6天+10日≤-10%双确认，浅亏≤-6%不减) · L3分级减仓(新仓&lt;25天+非暴跌减70%) · <b style="color:#4f46e5;">趋势自适应仓位(强趋势上限×1.6/弱趋势×0.7)</b> · 动态阈值 ${sp.risk_multiplier != null ? sp.risk_multiplier+'×' : '1.0×'} · 灵敏度 ${sp.vol_sensitivity != null ? sp.vol_sensitivity.toFixed(2)+'×' : '1.0×'}(${sp.vol_sensitivity_source === 'manual' ? '手动' : sp.vol_sensitivity_source === 'auto' ? '自动' : '默认'})</span>
+                                </div>
+                            </div>
+                        </div>`;
+                        if (ma.decision_note) {
+                            html += `<div style="margin:2px 0 2px;padding:4px 10px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:4px;font-size:10px;color:#1e40af;line-height:1.5;">
+                                ${ma.decision_note}
+                            </div>`;
+                        }
+                        html += `</div>`;
+                    }
+
+                    // 持仓汇总
+                    if (hasPos) {
+                        const totalCost = holdingBatches.reduce((s, b) => s + b.amount, 0);
+                        const totalShares = holdingBatches.reduce((s, b) => s + b.shares, 0);
+                        const totalOriginal = holdingBatches.reduce((s, b) => s + (b.original_amount || b.amount), 0);
+                        const maxPos = fundPos.max_position || 5000;
+                        const suppCount = fundPos.supplement_count || 0;
+                        const hasSold = totalOriginal - totalCost > 0.01;
+                        const feeSchedule = fundPos.fee_schedule || null;
+                        const feeDisplay = feeSchedule && feeSchedule.length > 0
+                            ? feeSchedule.map(s => s.days ? `<${s.days}天${s.rate}%` : `${s.rate}%`).join(' / ')
+                            : '默认';
+                        window._feeCache = window._feeCache || {};
+                        window._feeCache[code] = feeSchedule;
+                        // v5.2: 使用 market_value（份额×净值）展示持仓金额，与支付宝一致
+                        const marketValue = ma && ma.market_value != null ? ma.market_value : null;
+                        const displayAmount = marketValue != null ? marketValue : totalCost;
+                        const unrealizedPnl = ma && ma.unrealized_pnl != null ? ma.unrealized_pnl : null;
+                        const unrealizedPnlPct = ma && ma.unrealized_pnl_pct != null ? ma.unrealized_pnl_pct : null;
+                        const cumulativePnl = ma && ma.cumulative_pnl != null ? ma.cumulative_pnl : null;
+                        const realizedPnl = ma && ma.realized_pnl != null ? ma.realized_pnl : 0;
+
+                        // 盈亏显示
+                        let pnlHtml = '';
+                        if (unrealizedPnl != null) {
+                            const pnlColor = unrealizedPnl >= 0 ? '#dc2626' : '#16a34a';
+                            const pnlSign = unrealizedPnl >= 0 ? '+' : '';
+                            pnlHtml = `<div class="item"><span class="label">浮动盈亏:</span><span class="value" style="color:${pnlColor};font-weight:700;">${pnlSign}¥${unrealizedPnl.toFixed(2)}${unrealizedPnlPct != null ? `(${pnlSign}${unrealizedPnlPct}%)` : ''}</span></div>`;
+                        }
+                        let cumPnlHtml = '';
+                        if (cumulativePnl != null && realizedPnl !== 0) {
+                            const cumColor = cumulativePnl >= 0 ? '#dc2626' : '#16a34a';
+                            const cumSign = cumulativePnl >= 0 ? '+' : '';
+                            cumPnlHtml = `<div class="item"><span class="label">累计盈亏:</span><span class="value" style="color:${cumColor};">${cumSign}¥${cumulativePnl.toFixed(2)}</span></div>`;
+                        }
+                        // 成本标注：仅在 market_value 可用时显示成本对比
+                        const costNote = marketValue != null ? `<span style="color:#9ca3af;font-size:9px;margin-left:2px;">(成本¥${totalCost.toFixed(0)}${hasSold ? `/投入¥${totalOriginal.toFixed(0)}` : ''})</span>` : (hasSold ? `<span style="color:#9ca3af;font-size:9px;margin-left:2px;">(投入¥${totalOriginal.toFixed(0)})</span>` : '');
+                        html += `<div class="pos-summary">
+                            <div class="item"><span class="label">持仓金额:</span><span class="value">¥${displayAmount.toFixed(2)}${costNote}</span></div>
+                            ${pnlHtml}
+                            ${cumPnlHtml}
+                            <div class="item"><span class="label">份额:</span><span class="value">${totalShares.toFixed(2)}</span></div>
+                            <div class="item"><span class="label">批次:</span><span class="value">${holdingBatches.length}笔</span></div>
+                            ${suppCount > 0 ? `<div class="item"><span class="label">补仓:</span><span class="value" style="color:#d97706;">${suppCount}/${sigMap[code]?.market_analysis?.strategy_params?.supplement_max_count || 3}次</span></div>` : ''}
+                            <div class="item"><span class="label">上限:</span><span class="value" style="cursor:pointer;border-bottom:1px dashed #9ca3af;" onclick="editMaxPosition('${code}',${maxPos})" title="点击修改上限">¥${maxPos}</span></div>
+                            <div class="item"><span class="label">费率:</span><span class="value" style="cursor:pointer;border-bottom:1px dashed #9ca3af;" onclick="editFeeSchedule('${code}')" title="点击修改费率">${feeDisplay}</span></div>
+                        </div>`;
+                    } else if (fundPos) {
+                        // 空仓待建仓状态
+                        const maxPos = fundPos.max_position || 5000;
+                        const watchNote = fundPos.watch_note || '空仓待建仓';
+                        html += `<div class="pos-summary" style="background:#eef2ff;border:1px solid #c7d2fe;">
+                            <div class="item"><span class="label" style="color:#4338ca;">📡 状态:</span><span class="value" style="color:#4338ca;font-weight:600;">${watchNote}</span></div>
+                            <div class="item"><span class="label">上限:</span><span class="value" style="cursor:pointer;border-bottom:1px dashed #9ca3af;" onclick="editMaxPosition('${code}',${maxPos})" title="点击修改上限">¥${maxPos}</span></div>
+                            <div class="item"><span class="label" style="color:#6b7280;">提示:</span><span class="value" style="color:#6b7280;">策略引擎正在监控建仓时机，实际买入后请录入批次</span></div>
+                        </div>`;
+                    }
+
+                    // 批次表格
+                    const sellRecords = (fundPos?.sell_records || [])
+                        .sort((a, b) => (b.sell_date || '').localeCompare(a.sell_date || ''));
+                    if (hasPos || sellRecords.length > 0) {
+                        html += `<div class="pos-batches"><table>
+                            <colgroup>
+                                <col style="width:17%"><col style="width:15%"><col style="width:15%"><col style="width:13%"><col style="width:12%"><col style="width:10%"><col style="width:18%">
+                            </colgroup>
+                            <thead><tr>
+                                <th>批次</th><th>日期</th><th>金额</th><th>净值</th><th>份额</th><th>备注</th><th style="text-align:right;">操作</th>
+                            </tr></thead><tbody>`;
+                        for (const b of holdingBatches) {
+                            let amountDisplay = `¥${b.amount.toFixed(2)}`;
+                            if (b.original_amount && Math.abs(b.original_amount - b.amount) > 0.01) {
+                                amountDisplay = `¥${b.amount.toFixed(2)} <span style="color:#9ca3af;font-size:9px;text-decoration:line-through;">¥${b.original_amount.toFixed(2)}</span>`;
+                            }
+                            html += `<tr>
+                                <td style="font-family:monospace;font-size:10px;">${b.id}</td>
+                                <td>${b.buy_date}</td>
+                                <td>${amountDisplay}</td>
+                                <td>${b.nav ? b.nav.toFixed(4) : `<button onclick="promptBuyNav('${code}','${b.id}')" style="background:none;border:1px solid #f59e0b;color:#f59e0b;font-size:9px;padding:1px 6px;border-radius:3px;cursor:pointer;">补录</button>`}</td>
+                                <td>${b.shares ? b.shares.toFixed(2) : '--'}</td>
+                                <td style="color:#9ca3af;">${b.note || ''}</td>
+                                <td style="text-align:right;">
+                                    <button onclick="showSellModal('${code}','${b.id}',${b.nav})" title="卖出" style="color:#ef4444;background:none;border:none;cursor:pointer;font-size:12px;">卖</button>
+                                    <button onclick="deleteBatch('${code}','${b.id}')" title="删除" style="color:#d1d5db;background:none;border:none;cursor:pointer;font-size:12px;">×</button>
+                                </td>
+                            </tr>`;
+                        }
+                        if (sellRecords.length > 0) {
+                            html += `<tr><td colspan="7" style="padding:6px 6px 2px;border-top:1px dashed #e5e7eb;"></td></tr>`;
+                            html += `<tr style="background:#f8fafc;">
+                                <th style="text-align:left;padding:4px 6px;color:#9ca3af;font-weight:500;font-size:10px;">来源批次</th>
+                                <th style="text-align:left;padding:4px 6px;color:#9ca3af;font-weight:500;font-size:10px;">卖出日</th>
+                                <th style="text-align:left;padding:4px 6px;color:#9ca3af;font-weight:500;font-size:10px;">买入净值</th>
+                                <th style="text-align:left;padding:4px 6px;color:#9ca3af;font-weight:500;font-size:10px;">卖出净值</th>
+                                <th style="text-align:left;padding:4px 6px;color:#9ca3af;font-weight:500;font-size:10px;">份额</th>
+                                <th style="text-align:left;padding:4px 6px;color:#9ca3af;font-weight:500;font-size:10px;">持有天数</th>
+                                <th style="text-align:right;padding:4px 6px;color:#9ca3af;font-weight:500;font-size:10px;">盈亏</th>
+                            </tr>`;
+                            for (const sr of sellRecords) {
+                                let navCell = '';
+                                let profitCell = '';
+                                if (sr.sell_nav) {
+                                    navCell = sr.sell_nav.toFixed(4);
+                                    const pColor = (sr.profit_pct || 0) >= 0 ? '#dc2626' : '#16a34a';
+                                    profitCell = `<span style="color:${pColor};font-weight:600;font-size:10px;">${sr.profit_pct >= 0 ? '+' : ''}${sr.profit_pct}%</span>`;
+                                } else {
+                                    navCell = `<button onclick="promptSellNav('${code}','${sr.id}')" style="background:none;border:1px solid #f59e0b;color:#f59e0b;font-size:9px;padding:1px 6px;border-radius:3px;cursor:pointer;">补录</button>`;
+                                    profitCell = `<span style="color:#f59e0b;font-size:9px;">待确认</span>`;
+                                }
+                                html += `<tr style="color:#9ca3af;">
+                                    <td style="font-family:monospace;font-size:9px;">${sr.batch_id}</td>
+                                    <td>${sr.sell_date}</td>
+                                    <td>${sr.buy_nav ? sr.buy_nav.toFixed(4) : '--'}</td>
+                                    <td>${navCell}</td>
+                                    <td>${sr.sell_shares.toFixed(2)}</td>
+                                    <td>${sr.hold_days}天</td>
+                                    <td style="text-align:right;">${profitCell} <button onclick="deleteSellRecord('${code}','${sr.id}')" title="删除卖出记录" style="color:#d1d5db;background:none;border:none;cursor:pointer;font-size:11px;margin-left:2px;">×</button></td>
+                                </tr>`;
+                            }
+                        }
+                        html += '</tbody></table></div>';
+                    }
+                    html += `<div class="pos-actions">
+                        <button class="buy-btn" onclick="showBuyModal('${code}')">录入买入</button>`;
+                    // 有持仓时始终显示"录入卖出"按钮（不依赖策略信号）
+                    if (hasPos) {
+                        html += `<button class="sell-btn" onclick="showSellFifoModal('${code}', 0)">录入卖出</button>`;
+                    }
+                    const fifoP = sig.fifo_sell_plan;
+                    if (fifoP && fifoP.steps && fifoP.steps.length > 0) {
+                        html += `<button class="sell-btn" onclick="showSellFifoModal('${code}', ${fifoP.total_shares})" style="font-weight:700;">执行卖出(${fifoP.total_shares}份)</button>`;
+                    } else {
+                        const sellSignals = (sig.all_signals || [sig]).filter(s => s.action === 'sell' && s.target_batch_id);
+                        for (const ss of sellSignals) {
+                            html += `<button class="sell-btn" onclick="showSellFifoModal('${code}', ${ss.sell_shares || 0})" style="font-weight:700;">执行${ss.signal_name}(${ss.sell_shares}份)</button>`;
+                        }
+                    }
+                    html += `</div>`;
+                    html += '</div>';
+                    return html;
+                }
+                panel.innerHTML = html;
+                restorePanelView(panel, viewState);
+                lastRefreshTime = new Date();
+                document.getElementById('updateTime').textContent =
+                    `更新于 ${lastRefreshTime.toLocaleTimeString()}`;
+            } catch (e) {
+                if (hadContent) {
+                    showStatus('信号刷新失败: ' + e.message, 'error');
+                } else {
+                    panel.innerHTML = `<div style="text-align:center;padding:20px;color:#ef4444;">加载失败: ${escapeHtml(e.message)}<br><button class="btn-primary" onclick="loadStrategyPanel()" style="margin-top:8px;padding:4px 12px;font-size:11px;">重试</button></div>`;
+                }
+            }
+
+        }
+
+        // ============ 买入/卖出操作 ============
+        function showQuickBuyModal() {
+            const code = prompt('请输入6位基金代码：');
+            if (code && /^\d{6}$/.test(code.trim())) {
+                showBuyModal(code.trim());
+            }
+        }
+
+        function quickAddPosition() {
+            const input = document.getElementById('quickAddCode');
+            const code = input.value.trim();
+            if (/^\d{6}$/.test(code)) {
+                showBuyModal(code);
+                input.value = '';
+            } else {
+                showStatus('请输入6位基金代码', 'error');
+            }
+        }
+
+        function showAddInstanceModal() {
+            document.getElementById('instanceFundCode').value = '';
+            document.getElementById('instanceOwner').value = '';
+            document.getElementById('addInstanceModal').classList.add('show');
+            document.getElementById('instanceFundCode').focus();
+        }
+
+        function submitAddInstance() {
+            const code = document.getElementById('instanceFundCode').value.trim();
+            const owner = document.getElementById('instanceOwner').value.trim();
+
+            if (!/^\d{6}$/.test(code)) {
+                showStatus('请输入6位基金代码', 'error');
+                return;
+            }
+            if (!owner) {
+                showStatus('请输入持仓人/标签', 'error');
+                return;
+            }
+            if (owner.includes('__') || /['"<>&\/\\]/.test(owner)) {
+                showStatus('标签不能包含 __ 或特殊符号', 'error');
+                return;
+            }
+
+            closeModal('addInstanceModal');
+            // 打开买入弹窗，传入 owner
+            showBuyModal(code, owner);
+        }
+
+        function showSetOwnerModal(fundKey) {
+            const realCode = fundKey.includes('__') ? fundKey.split('__')[0] : fundKey;
+            const currentOwner = fundKey.includes('__') ? fundKey.split('__')[1] : '';
+            const name = valuations[realCode]?.fund_name || realCode;
+
+            const newOwner = prompt(
+                `为 ${realCode} ${name} 设置持仓人标签\n（留空则去除标签，当前: ${currentOwner || '无'}）`,
+                currentOwner
+            );
+            if (newOwner === null) return; // 用户取消
+            const trimmed = newOwner.trim();
+            if (trimmed.includes('__') || /['"<>&\/\\]/.test(trimmed)) {
+                showStatus('标签不能包含 __ 或特殊符号', 'error');
+                return;
+            }
+            submitSetOwner(fundKey, trimmed);
+        }
+
+        async function submitSetOwner(oldKey, newOwner) {
+            try {
+                const data = await fetchJson(`${API_BASE}/v1/position/${encodeURIComponent(oldKey)}/rename`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ new_owner: newOwner })
+                }, '设置持仓标签');
+                // 同步更新前端 localStorage 中的分组映射
+                const groupData = loadStrategyGroups();
+                const oldGroupId = groupData.fund_group_map[oldKey];
+                if (oldGroupId && data.new_key !== oldKey) {
+                    // 迁移分组映射
+                    for (const grp of groupData.groups) {
+                        grp.fund_codes = grp.fund_codes.map(c => c === oldKey ? data.new_key : c);
+                    }
+                    groupData.fund_group_map[data.new_key] = oldGroupId;
+                    delete groupData.fund_group_map[oldKey];
+                    saveStrategyGroups(groupData);
+                }
+                showStatus(`标签已更新: ${data.new_key}`, 'success');
+                loadStrategyPanel();
+            } catch (e) {
+                showStatus('设置标签失败: ' + e.message, 'error');
+            }
+        }
+
+        function showBuyModal(fundCode, owner) {
+            // fundCode 可能是复合键 "017193__老公"，也可能是纯代码 "017193"
+            let realCode = fundCode;
+            let ownerTag = owner || '';
+            if (fundCode.includes('__')) {
+                const parts = fundCode.split('__');
+                realCode = parts[0];
+                ownerTag = parts[1] || '';
+            }
+            document.getElementById('buyFundCode').value = realCode;
+            document.getElementById('buyOwner').value = ownerTag;
+            document.getElementById('buyAmount').value = '';
+            document.getElementById('buyNav').value = '';
+            document.getElementById('buyNote').value = '';
+            document.getElementById('buySupplement').checked = false;
+            // 默认日期为今天
+            document.getElementById('buyDate').value = new Date().toISOString().slice(0, 10);
+            // v5.X: 默认清理回补标记（showBuyModalForRebuy 会随后重新设置）
+            const _modal = document.getElementById('buyModal');
+            delete _modal.dataset.isRebuy;
+            delete _modal.dataset.pendingRebuyId;
+
+            const val = valuations[realCode];
+            const name = val?.fund_name || realCode;
+            const ownerLabel = ownerTag ? ` [${ownerTag}]` : '';
+            document.getElementById('buyModalTitle').textContent = `录入买入 · ${name}${ownerLabel}`;
+
+            if (val?.recent_changes?.length > 0) {
+                const latest = val.recent_changes[0];
+                document.getElementById('buyNavHint').textContent =
+                    `最近确认净值参考: ${latest.date}，在支付宝交易记录中查看实际值`;
+            } else {
+                document.getElementById('buyNavHint').textContent = '在支付宝→持仓→交易记录中查看「确认净值」';
+            }
+
+            document.getElementById('buyModal').classList.add('show');
+            document.getElementById('buyAmount').focus();
+        }
+
+        async function submitBuy() {
+            const code = document.getElementById('buyFundCode').value;
+            const owner = document.getElementById('buyOwner').value;
+            const buyDate = document.getElementById('buyDate').value;
+            const amount = parseFloat(document.getElementById('buyAmount').value) || 0;
+            // nav handled below in validation
+            const note = document.getElementById('buyNote').value.trim();
+
+            if (!buyDate) { showStatus('请选择买入日期', 'error'); return; }
+
+            // 空仓观察模式：金额=0时走watch接口
+            if (amount === 0) {
+                try {
+                    const fundKey = owner ? `${code}__${owner}` : code;
+                    const data = await fetchJson(`${API_BASE}/v1/position/${encodeURIComponent(code)}/watch`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify({ max_position: 5000, note: note || '空仓待建仓', owner: owner })
+                    }, '添加观察');
+                    const ownerLabel = owner ? ` [${owner}]` : '';
+                    if (data.status === 'already_exists') {
+                        showStatus(`${code}${ownerLabel} 已在低频网格中`, 'info');
+                    } else {
+                        showStatus(`${code}${ownerLabel} 已加入空仓观察，等待建仓信号`, 'success');
+                    }
+                    closeModal('buyModal');
+                    switchTab('strategy');
+                    loadStrategyPanel();
+                } catch (e) {
+                    showStatus('添加观察失败: ' + e.message, 'error');
+                }
+                return;
+            }
+
+            // 正常买入模式：金额>0时
+            if (amount < 0) { showStatus('请输入有效金额', 'error'); return; }
+            // nav 允许为空（T+1确认后补录），但如果填了必须>0
+            const navRaw = document.getElementById('buyNav').value.trim();
+            const navVal = navRaw ? parseFloat(navRaw) : null;
+            if (navRaw && (!navVal || navVal <= 0)) { showStatus('净值必须大于0，或留空后续补录', 'error'); return; }
+
+            try {
+                const isSupplement = document.getElementById('buySupplement').checked;
+                // v5.X: 透传延迟回补标记（由 showBuyModalForRebuy 设置）
+                const _modal = document.getElementById('buyModal');
+                const isRebuy = _modal.dataset.isRebuy === 'true';
+                const pendingRebuyId = _modal.dataset.pendingRebuyId || null;
+                const data = await fetchJson(`${API_BASE}/v1/position/${encodeURIComponent(code)}/buy`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        amount, nav: navVal, note, buy_date: buyDate,
+                        is_supplement: isSupplement, owner: owner,
+                        is_rebuy: isRebuy,
+                        pending_rebuy_id: pendingRebuyId,
+                    })
+                }, '买入');
+                const ownerLabel = owner ? ` [${owner}]` : '';
+                const rebuyTag = isRebuy ? ' [回补]' : '';
+                showStatus(`买入成功: ${code}${ownerLabel}${rebuyTag} · ${data.batch?.id}`, 'success');
+                // 提交后清理回补标记，避免下次普通买入误带
+                delete _modal.dataset.isRebuy;
+                delete _modal.dataset.pendingRebuyId;
+                closeModal('buyModal');
+                loadStrategyPanel();  // 刷新策略面板
+            } catch (e) {
+                showStatus('买入失败: ' + e.message, 'error');
+            }
+        }
+
+        // v5.X: 一键执行延迟回补（预填弹窗 + 设置回补标记）
+        function showBuyModalForRebuy(fundCode, amount, pendingRebuyId, sourceLabel) {
+            showBuyModal(fundCode);
+            // 预填回补金额
+            const amtInput = document.getElementById('buyAmount');
+            if (amtInput) amtInput.value = (amount || 0).toFixed(2);
+            const noteInput = document.getElementById('buyNote');
+            if (noteInput) noteInput.value = `延迟回补触发${sourceLabel ? '(' + sourceLabel + ')' : ''}`;
+            // 把回补标记挂在弹窗 dataset，供 submitBuy 取用
+            const modal = document.getElementById('buyModal');
+            modal.dataset.pendingRebuyId = pendingRebuyId || '';
+            modal.dataset.isRebuy = 'true';
+            // 标题加视觉标记
+            const realCode = fundCode.includes('__') ? fundCode.split('__')[0] : fundCode;
+            const fundName = valuations[realCode]?.fund_name || realCode;
+            const titleEl = document.getElementById('buyModalTitle');
+            if (titleEl) titleEl.textContent = `🔥 延迟回补 · ${fundName}`;
+        }
+
+        // ============ 策略说明折叠 ============
+        function toggleStrategyInfo(fundCode) {
+            const el = document.getElementById(`strategy-info-${fundCode}`);
+            if (el) el.classList.toggle('show');
+        }
+
+        // ============ 卖出操作 ============
+        let _sellBatchesCache = [];  // 缓存当前基金的批次列表
+
+        function showSellFifoModal(fundCode, suggestedShares) {
+            document.getElementById('sellFundCode').value = fundCode;
+            document.getElementById('sellMode').value = 'fifo';
+            document.getElementById('sellShares').value = suggestedShares ? suggestedShares.toFixed(2) : '';
+            document.getElementById('sellNav').value = '';
+            document.getElementById('sellDate').value = new Date().toISOString().slice(0, 10);
+
+            const realCode = fundCode.includes('__') ? fundCode.split('__')[0] : fundCode;
+            const ownerTag = fundCode.includes('__') ? fundCode.split('__')[1] : '';
+            const name = valuations[realCode]?.fund_name || realCode;
+            const ownerLabel = ownerTag ? ` [${ownerTag}]` : '';
+            document.getElementById('sellModalTitle').textContent = `录入卖出 · ${name}${ownerLabel}`;
+
+            // 隐藏批次选择，显示 FIFO 说明
+            document.getElementById('sellBatchSelectWrap').style.display = 'none';
+            document.getElementById('sellFifoInfo').style.display = 'block';
+
+            // 加载批次信息用于 FIFO 预览
+            fetchJson(`${API_BASE}/v1/position/${encodeURIComponent(fundCode)}`, {}, '加载卖出批次')
+                .then(data => {
+                    const batches = (data.batches || []).filter(b => b.status === 'holding');
+                    batches.sort((a, b) => a.buy_date.localeCompare(b.buy_date));
+                    _sellBatchesCache = batches;
+
+                    const totalShares = batches.reduce((s, b) => s + b.shares, 0);
+                    document.getElementById('sellSharesHint').textContent =
+                        `总持有 ${totalShares.toFixed(2)} 份（${batches.length}个批次），全部卖出填 ${totalShares.toFixed(2)}`;
+
+                    // 预览 FIFO 拆解
+                    let stepsHtml = '';
+                    let remaining = suggestedShares || 0;
+                    for (const b of batches) {
+                        if (remaining <= 0.005) break;
+                        const sellAmt = Math.min(remaining, b.shares);
+                        const holdDays = Math.floor((new Date() - new Date(b.buy_date)) / 86400000);
+                        stepsHtml += `<div style="padding:1px 0;">${b.id} · ${b.buy_date} · 持有${holdDays}天 → 卖出 ${sellAmt.toFixed(2)}份${Math.abs(sellAmt - b.shares) < 0.01 ? '(全部)' : `(剩${(b.shares-sellAmt).toFixed(2)})`}</div>`;
+                        remaining -= sellAmt;
+                    }
+                    document.getElementById('sellFifoSteps').innerHTML = stepsHtml;
+                })
+                .catch(() => {
+                    document.getElementById('sellSharesHint').textContent = '加载批次信息失败';
+                });
+
+            document.getElementById('sellModal').classList.add('show');
+        }
+
+        function showSellModal(fundCode, preselectedBatchId, buyNav) {
+            document.getElementById('sellFundCode').value = fundCode;
+            document.getElementById('sellMode').value = 'batch';
+            document.getElementById('sellShares').value = '';
+            document.getElementById('sellNav').value = '';
+            document.getElementById('sellDate').value = new Date().toISOString().slice(0, 10);
+
+            // 显示批次选择，隐藏 FIFO 说明
+            document.getElementById('sellBatchSelectWrap').style.display = 'block';
+            document.getElementById('sellFifoInfo').style.display = 'none';
+
+            const realCode2 = fundCode.includes('__') ? fundCode.split('__')[0] : fundCode;
+            const ownerTag2 = fundCode.includes('__') ? fundCode.split('__')[1] : '';
+            const name = valuations[realCode2]?.fund_name || realCode2;
+            const ownerLabel2 = ownerTag2 ? ` [${ownerTag2}]` : '';
+            document.getElementById('sellModalTitle').textContent = `录入卖出 · ${name}${ownerLabel2}`;
+
+            // 加载该基金的 holding 批次到下拉框
+            const select = document.getElementById('sellBatchSelect');
+            select.innerHTML = '<option value="">加载中...</option>';
+            _sellBatchesCache = [];
+
+            fetchJson(`${API_BASE}/v1/position/${encodeURIComponent(fundCode)}`, {}, '加载卖出批次')
+                .then(data => {
+                    const batches = (data.batches || []).filter(b => b.status === 'holding');
+                    _sellBatchesCache = batches;
+                    let opts = '';
+                    if (batches.length === 0) {
+                        opts = '<option value="">无可卖出批次</option>';
+                    } else {
+                        opts = '<option value="">请选择批次...</option>';
+                        for (const b of batches) {
+                            const sel = b.id === preselectedBatchId ? ' selected' : '';
+                            opts += `<option value="${b.id}"${sel}>${b.id} · ${b.buy_date} · ${b.shares ? b.shares.toFixed(2) + '份' : '份额待定'} · 净值${b.nav ? b.nav.toFixed(4) : '待补录'}${b.note ? ' · ' + b.note : ''}</option>`;
+                        }
+                    }
+                    select.innerHTML = opts;
+                    onSellBatchChange();
+                })
+                .catch(() => {
+                    select.innerHTML = '<option value="">加载失败</option>';
+                });
+
+            document.getElementById('sellModal').classList.add('show');
+        }
+
+        function onSellBatchChange() {
+            const batchId = document.getElementById('sellBatchSelect').value;
+            const hint = document.getElementById('sellBatchHint');
+            const sharesHint = document.getElementById('sellSharesHint');
+            if (!batchId) {
+                hint.textContent = '';
+                sharesHint.textContent = '';
+                return;
+            }
+            const batch = _sellBatchesCache.find(b => b.id === batchId);
+            if (batch) {
+                const buyDate = new Date(batch.buy_date);
+                const today = new Date();
+                const holdDays = Math.floor((today - buyDate) / 86400000);
+                hint.textContent = `买入 ¥${batch.amount.toFixed(2)}，净值 ${batch.nav ? batch.nav.toFixed(4) : '待补录'}，持有${holdDays}天`;
+                sharesHint.textContent = `该批次持有 ${batch.shares.toFixed(2)} 份，全部卖出填 ${batch.shares.toFixed(2)}`;
+                // 预填全部份额
+                document.getElementById('sellShares').value = batch.shares.toFixed(2);
+            }
+        }
+
+        async function submitSell() {
+            const code = document.getElementById('sellFundCode').value;
+            const mode = document.getElementById('sellMode').value;
+            const sellShares = parseFloat(document.getElementById('sellShares').value);
+            const sellNav = parseFloat(document.getElementById('sellNav').value) || null;
+            const sellDate = document.getElementById('sellDate').value || null;
+
+            if (!sellShares || sellShares <= 0) { showStatus('请输入有效卖出份额', 'error'); return; }
+
+            try {
+                let data, statusMsg;
+
+                if (mode === 'fifo') {
+                    // FIFO 模式：调用新接口，自动按先进先出拆分
+                    const body = { total_sell_shares: sellShares };
+                    if (sellNav) body.sell_nav = sellNav;
+                    if (sellDate) body.sell_date = sellDate;
+
+                    data = await fetchJson(`${API_BASE}/v1/position/${encodeURIComponent(code)}/sell-fifo`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body)
+                    }, 'FIFO 卖出');
+                    statusMsg = `FIFO卖出成功: ${data.total_sell_shares}份（涉及${data.batch_count}个批次）`;
+                    if (data.nav_pending) {
+                        statusMsg += ' · 净值待确认';
+                    } else if (data.total_profit !== null) {
+                        const profitStr = data.total_profit >= 0 ? `+¥${data.total_profit.toFixed(2)}` : `-¥${Math.abs(data.total_profit).toFixed(2)}`;
+                        statusMsg += ` · ${profitStr}`;
+                    }
+                } else {
+                    // 单批次模式（兜底 / 手动选批次）
+                    const batchId = document.getElementById('sellBatchSelect').value;
+                    if (!batchId) { showStatus('请选择卖出批次', 'error'); return; }
+
+                    const body = { batch_id: batchId, sell_shares: sellShares };
+                    if (sellNav) body.sell_nav = sellNav;
+                    if (sellDate) body.sell_date = sellDate;
+
+                    data = await fetchJson(`${API_BASE}/v1/position/${encodeURIComponent(code)}/sell`, {
+                        method: 'POST',
+                        headers: { 'Content-Type': 'application/json' },
+                        body: JSON.stringify(body)
+                    }, '卖出');
+                    statusMsg = `卖出成功: ${data.sell_shares}份（持有${data.hold_days}天，费率${data.sell_fee_rate}%）`;
+                    if (data.nav_pending) {
+                        statusMsg += ' · 净值待确认';
+                    } else {
+                        const profitStr = data.profit >= 0 ? `+¥${data.profit.toFixed(2)}` : `-¥${Math.abs(data.profit).toFixed(2)}`;
+                        statusMsg += ` · ${profitStr}`;
+                    }
+                }
+
+                showStatus(statusMsg, 'success');
+                closeModal('sellModal');
+                loadStrategyPanel();
+            } catch (e) {
+                showStatus('卖出失败: ' + e.message, 'error');
+            }
+        }
+
+        async function deleteBatch(fundCode, batchId) {
+            if (!confirm(`确定删除批次 ${batchId}？此操作不可恢复。`)) return;
+            try {
+                await fetchJson(`${API_BASE}/v1/position/${encodeURIComponent(fundCode)}/batch/${batchId}`, { method: 'DELETE' }, '删除批次');
+                showStatus(`已删除 ${batchId}`, 'success');
+                loadStrategyPanel();
+            } catch (e) {
+                showStatus('删除失败: ' + e.message, 'error');
+            }
+        }
+
+        async function deleteSellRecord(fundCode, sellRecordId) {
+            if (!confirm(`确定删除卖出记录 ${sellRecordId}？此操作不可恢复。`)) return;
+            try {
+                await fetchJson(`${API_BASE}/v1/position/${encodeURIComponent(fundCode)}/sell-record/${sellRecordId}`, { method: 'DELETE' }, '删除卖出记录');
+                showStatus(`已删除卖出记录 ${sellRecordId}`, 'success');
+                loadStrategyPanel();
+            } catch (e) {
+                showStatus('删除失败: ' + e.message, 'error');
+            }
+        }
+
+        async function promptBuyNav(fundCode, batchId) {
+            const navStr = prompt('请输入买入确认净值（在支付宝→交易记录→买入详情中查看「确认净值」）:');
+            if (!navStr) return;
+            const nav = parseFloat(navStr);
+            if (!nav || nav <= 0) { showStatus('请输入有效净值', 'error'); return; }
+            try {
+                const data = await fetchJson(`${API_BASE}/v1/position/${encodeURIComponent(fundCode)}/buy-nav`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ batch_id: batchId, nav: nav })
+                }, '补录买入净值');
+                showStatus(`买入净值已补录: ${data.batch.nav.toFixed(4)} · 份额 ${data.batch.shares.toFixed(2)}`, 'success');
+                loadStrategyPanel();
+            } catch (e) {
+                showStatus('补录失败: ' + e.message, 'error');
+            }
+        }
+
+        async function promptSellNav(fundCode, sellRecordId) {
+            const navStr = prompt('请输入卖出确认净值（在支付宝→交易记录→卖出详情中查看）:');
+            if (!navStr) return;
+            const nav = parseFloat(navStr);
+            if (!nav || nav <= 0) { showStatus('请输入有效净值', 'error'); return; }
+            try {
+                const data = await fetchJson(`${API_BASE}/v1/position/${encodeURIComponent(fundCode)}/sell-nav`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sell_record_id: sellRecordId, sell_nav: nav })
+                }, '补录卖出净值');
+                const r = data.record;
+                const profitStr = r.profit >= 0 ? `+¥${r.profit.toFixed(2)}` : `-¥${Math.abs(r.profit).toFixed(2)}`;
+                showStatus(`净值已补录: ${r.sell_nav.toFixed(4)} · ${profitStr} (${r.profit_pct}%)`, 'success');
+                loadStrategyPanel();
+            } catch (e) {
+                showStatus('补录失败: ' + e.message, 'error');
+            }
+        }
+
+        async function editMaxPosition(fundCode, currentMax) {
+            const input = prompt(`修改 ${fundCode} 的持仓上限（当前 ¥${currentMax}）：`, currentMax);
+            if (!input) return;
+            const newMax = parseInt(input);
+            if (!newMax || newMax <= 0) { showStatus('请输入有效金额', 'error'); return; }
+            try {
+                await fetchJson(`${API_BASE}/v1/position/${encodeURIComponent(fundCode)}/config`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ max_position: newMax })
+                }, '更新持仓上限');
+                showStatus(`上限已更新为 ¥${newMax}`, 'success');
+                loadStrategyPanel();
+            } catch (e) {
+                showStatus('更新失败: ' + e.message, 'error');
+            }
+        }
+
+        async function editFeeSchedule(fundCode) {
+            const currentSchedule = (window._feeCache && window._feeCache[fundCode]) || null;
+            // 当前费率显示
+            let desc = '当前费率: ';
+            if (currentSchedule && currentSchedule.length > 0) {
+                desc += currentSchedule.map(s => s.days ? `<${s.days}天=${s.rate}%` : `兜底=${s.rate}%`).join(', ');
+            } else {
+                desc += '使用默认(<7天=1.5%, <30天=0.5%, 之后=0%)';
+            }
+            const input = prompt(
+                `${desc}\n\n请输入新费率（格式: 天数:费率%, 多档用逗号分隔）\n示例:\n  7:1.5,30:0.5,0:0  （<7天1.5%, <30天0.5%, 之后0%）\n  7:1.5,0:0          （<7天1.5%, 之后0%）\n  0:0                （永远0%）`,
+                currentSchedule && currentSchedule.length > 0
+                    ? currentSchedule.map(s => `${s.days || 0}:${s.rate}`).join(',')
+                    : '7:1.5,30:0.5,0:0'
+            );
+            if (!input) return;
+
+            try {
+                const schedule = input.split(',').map(s => {
+                    const [days, rate] = s.trim().split(':');
+                    const d = parseInt(days);
+                    const r = parseFloat(rate);
+                    if (isNaN(r)) throw new Error(`无效费率: ${s}`);
+                    return { days: d > 0 ? d : null, rate: r };
+                });
+                await fetchJson(`${API_BASE}/v1/position/${encodeURIComponent(fundCode)}/fee-schedule`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ schedule })
+                }, '更新费率');
+                showStatus(`费率已更新`, 'success');
+                loadStrategyPanel();
+            } catch (e) {
+                showStatus('费率更新失败: ' + e.message, 'error');
+            }
+        }
+
+        // ============ 策略分组管理（localStorage持久化） ============
+        // v5.4 优化: 根据角色标签(owner tag)自动归类分组，支持手动移入移出覆盖
+        // 数据结构: { groups: [{id, name, fund_codes: []}], fund_group_map: {code: groupId}, overrides: {code: groupId|""} }
+        const STRATEGY_GROUPS_KEY = 'ease_grid_strategy_groups';
+
+        function loadStrategyGroups() {
+            try {
+                const raw = localStorage.getItem(STRATEGY_GROUPS_KEY);
+                if (raw) return JSON.parse(raw);
+            } catch {}
+            return { groups: [], fund_group_map: {}, overrides: {} };
+        }
+
+        function saveStrategyGroups(data) {
+            localStorage.setItem(STRATEGY_GROUPS_KEY, JSON.stringify(data));
+        }
+
+        /**
+         * v5.4 优化: 根据所有基金的角色标签自动同步分组
+         * - 从 fund_codes 中提取 owner tag (如 025500__老爸 → "老爸")
+         * - 自动创建/维护以 owner tag 命名的分组
+         * - 手动覆盖(overrides)优先：用户手动移入移出的记录不会被自动覆盖
+         */
+        function autoSyncGroupsFromOwnerTags(allFundCodes) {
+            const data = loadStrategyGroups();
+            if (!data.overrides) data.overrides = {};
+
+            // 1. 收集所有 owner tag
+            const tagToFunds = {};  // tag -> [code, ...]
+            const noTagFunds = [];
+            for (const code of allFundCodes) {
+                if (code.includes('__')) {
+                    const tag = code.split('__')[1] || '';
+                    if (tag) {
+                        (tagToFunds[tag] = tagToFunds[tag] || []).push(code);
+                        continue;
+                    }
+                }
+                noTagFunds.push(code);
+            }
+
+            // 2. 为每个 tag 确保存在对应分组（用 name 匹配，不重复创建）
+            const tagToGroupId = {};
+            for (const tag of Object.keys(tagToFunds)) {
+                let grp = data.groups.find(g => g.name === tag);
+                if (!grp) {
+                    grp = { id: 'grp_auto_' + tag, name: tag, fund_codes: [] };
+                    data.groups.push(grp);
+                }
+                tagToGroupId[tag] = grp.id;
+            }
+
+            // 3. 自动分配（overrides优先）
+            // 只清空自动分组的fund_codes，保留手动分组不变
+            for (const grp of data.groups) {
+                if (grp.id.startsWith('grp_auto_')) {
+                    grp.fund_codes = [];
+                }
+            }
+            // 重建 fund_group_map：先保留手动分组中的映射
+            data.fund_group_map = {};
+            for (const grp of data.groups) {
+                if (!grp.id.startsWith('grp_auto_')) {
+                    for (const code of grp.fund_codes) {
+                        data.fund_group_map[code] = grp.id;
+                    }
+                }
+            }
+
+            for (const code of allFundCodes) {
+                // 手动覆盖优先
+                if (code in data.overrides) {
+                    const overrideGroupId = data.overrides[code];
+                    if (overrideGroupId) {
+                        const grp = data.groups.find(g => g.id === overrideGroupId);
+                        if (grp) {
+                            if (!grp.fund_codes.includes(code)) grp.fund_codes.push(code);
+                            data.fund_group_map[code] = overrideGroupId;
+                        }
+                    }
+                    // overrideGroupId === "" 表示用户手动设为"不分组"
+                    continue;
+                }
+
+                // 已在手动分组中的基金，跳过自动分配
+                if (data.fund_group_map[code]) continue;
+
+                // 自动：按 owner tag 归类
+                if (code.includes('__')) {
+                    const tag = code.split('__')[1] || '';
+                    const gid = tagToGroupId[tag];
+                    if (gid) {
+                        const grp = data.groups.find(g => g.id === gid);
+                        if (grp) {
+                            grp.fund_codes.push(code);
+                            data.fund_group_map[code] = gid;
+                        }
+                        continue;
+                    }
+                }
+                // 无tag且无override → 不分组
+            }
+
+            // 4. 清理空的自动分组（仅清理自动创建的，保留手动创建的）
+            data.groups = data.groups.filter(g => g.fund_codes.length > 0 || !g.id.startsWith('grp_auto_'));
+
+            saveStrategyGroups(data);
+            return data;
+        }
+
+        function showGroupModal(editId) {
+            const data = loadStrategyGroups();
+            const existing = editId ? data.groups.find(g => g.id === editId) : null;
+            document.getElementById('groupModalTitle').textContent = existing ? '编辑分组' : '新建分组';
+            document.getElementById('groupNameInput').value = existing ? existing.name : '';
+            document.getElementById('groupEditId').value = editId || '';
+            document.getElementById('groupModal').classList.add('show');
+            document.getElementById('groupNameInput').focus();
+        }
+
+        function saveGroup() {
+            const name = document.getElementById('groupNameInput').value.trim();
+            if (!name) { showStatus('请输入分组名称', 'error'); return; }
+
+            const data = loadStrategyGroups();
+            const editId = document.getElementById('groupEditId').value;
+
+            if (editId) {
+                const grp = data.groups.find(g => g.id === editId);
+                if (grp) grp.name = name;
+            } else {
+                // 检查是否已存在同名分组，避免重复创建
+                const existing = data.groups.find(g => g.name === name);
+                if (existing) {
+                    showStatus(`分组"${name}"已存在，无需重复创建`, 'info');
+                    closeModal('groupModal');
+                    return;
+                }
+                const id = 'grp_' + Date.now();
+                data.groups.push({ id, name, fund_codes: [] });
+            }
+            saveStrategyGroups(data);
+            closeModal('groupModal');
+            loadStrategyPanel();
+        }
+
+        function deleteGroup(groupId) {
+            if (!confirm('确定删除该分组？（基金不会被删除，只是移出分组）')) return;
+            const data = loadStrategyGroups();
+            const grp = data.groups.find(g => g.id === groupId);
+            if (grp) {
+                // 解除映射
+                for (const code of grp.fund_codes) {
+                    delete data.fund_group_map[code];
+                }
+                data.groups = data.groups.filter(g => g.id !== groupId);
+            }
+            saveStrategyGroups(data);
+            loadStrategyPanel();
+        }
+
+        function showAssignGroupModal(fundCode) {
+            const data = loadStrategyGroups();
+            if (!data.overrides) data.overrides = {};
+            const currentGroupId = data.fund_group_map[fundCode] || '';
+            const fundName = valuations[fundCode]?.fund_name || fundCode;
+            const hasOverride = fundCode in data.overrides;
+            // v5.4: 提取自动归类的目标tag
+            const autoTag = fundCode.includes('__') ? fundCode.split('__')[1] : '';
+
+            document.getElementById('assignGroupTitle').textContent = `分配 ${fundCode} 到分组`;
+
+            let html = '';
+
+            // v5.4: 如果有手动覆盖，显示"恢复自动归类"选项
+            if (hasOverride && autoTag) {
+                html += `<div style="padding:8px 10px;border-bottom:1px solid #dbeafe;cursor:pointer;border-radius:4px;background:#fef3c7;" onclick="resetAutoGroup('${fundCode}')">
+                    <span style="font-size:12px;color:#92400e;">🔄 恢复自动归类（→ ${autoTag}）</span>
+                </div>`;
+            }
+
+            // 无分组选项
+            html += `<div style="padding:8px 10px;border-bottom:1px solid #f1f5f9;cursor:pointer;border-radius:4px;${!currentGroupId ? 'background:#eff6ff;' : ''}" onclick="assignFundToGroup('${fundCode}','')">
+                <span style="font-size:12px;color:#374151;">📂 不分组</span>
+                ${!currentGroupId ? '<span style="float:right;color:#4f46e5;font-size:11px;">✓ 当前</span>' : ''}
+            </div>`;
+
+            for (const grp of data.groups) {
+                const isCurrent = currentGroupId === grp.id;
+                const isEmpty = grp.fund_codes.length === 0;
+                html += `<div style="padding:8px 10px;border-bottom:1px solid #f1f5f9;cursor:pointer;border-radius:4px;display:flex;align-items:center;justify-content:space-between;${isCurrent ? 'background:#eff6ff;' : ''}${isEmpty ? 'opacity:0.7;' : ''}" onclick="assignFundToGroup('${fundCode}','${grp.id}')">
+                    <span>
+                        <span style="font-size:12px;color:#374151;">📁 ${grp.name}</span>
+                        <span style="font-size:11px;color:#9ca3af;margin-left:8px;">${grp.fund_codes.length}只基金</span>
+                        ${isCurrent ? '<span style="color:#4f46e5;font-size:11px;margin-left:8px;">✓ 当前</span>' : ''}
+                    </span>
+                    ${isEmpty ? `<button onclick="event.stopPropagation();deleteGroupFromModal('${grp.id}','${fundCode}')" title="删除空分组" style="background:none;border:none;color:#ef4444;cursor:pointer;font-size:14px;padding:2px 4px;">🗑</button>` : ''}
+                </div>`;
+            }
+
+            // 快捷新建分组 + 清理按钮
+            html += `<div style="padding:10px 10px 4px;">
+                <button class="btn-primary" onclick="closeModal('assignGroupModal');showGroupModal()" style="width:100%;padding:6px;font-size:12px;">➕ 新建分组</button>
+            </div>`;
+            // 如果存在空分组，显示一键清理按钮
+            const emptyCount = data.groups.filter(g => g.fund_codes.length === 0).length;
+            if (emptyCount > 0) {
+                html += `<div style="padding:4px 10px 4px;"><button onclick="cleanupDuplicateGroups();closeModal('assignGroupModal');" style="width:100%;padding:6px;font-size:12px;background:#fef3c7;border:1px solid #f59e0b;border-radius:6px;cursor:pointer;color:#92400e;">🧹 清理重复/空分组 (${emptyCount}个)</button></div>`;
+            }
+
+            document.getElementById('assignGroupList').innerHTML = html;
+            document.getElementById('assignGroupModal').classList.add('show');
+        }
+
+        // v5.5: 从分配弹窗中删除分组，然后刷新弹窗
+        function deleteGroupFromModal(groupId, currentFundCode) {
+            const data = loadStrategyGroups();
+            const grp = data.groups.find(g => g.id === groupId);
+            if (grp) {
+                for (const code of grp.fund_codes) {
+                    delete data.fund_group_map[code];
+                    delete data.overrides[code];
+                }
+                data.groups = data.groups.filter(g => g.id !== groupId);
+            }
+            saveStrategyGroups(data);
+            // 刷新弹窗内容
+            showAssignGroupModal(currentFundCode);
+        }
+
+        // v5.5: 一次性清理已有的重复/空分组（可在控制台调用 cleanupDuplicateGroups()）
+        function cleanupDuplicateGroups() {
+            const data = loadStrategyGroups();
+            const seen = new Map(); // name → first group
+            const toRemove = [];
+            for (const grp of data.groups) {
+                if (seen.has(grp.name)) {
+                    const first = seen.get(grp.name);
+                    // 合并 fund_codes 到第一个同名分组
+                    for (const code of grp.fund_codes) {
+                        if (!first.fund_codes.includes(code)) {
+                            first.fund_codes.push(code);
+                        }
+                        data.fund_group_map[code] = first.id;
+                    }
+                    // 合并 overrides 引用
+                    if (data.overrides) {
+                        for (const [code, gid] of Object.entries(data.overrides)) {
+                            if (gid === grp.id) data.overrides[code] = first.id;
+                        }
+                    }
+                    toRemove.push(grp.id);
+                } else {
+                    seen.set(grp.name, grp);
+                }
+            }
+            data.groups = data.groups.filter(g => !toRemove.includes(g.id));
+            saveStrategyGroups(data);
+            console.log(`清理完成: 合并了 ${toRemove.length} 个重复分组`);
+            showStatus(`清理完成: 合并了 ${toRemove.length} 个重复分组`, 'success');
+            loadStrategyPanel();
+        }
+
+        // v5.4: 恢复自动归类（删除手动覆盖）
+        function resetAutoGroup(fundCode) {
+            const data = loadStrategyGroups();
+            if (data.overrides) delete data.overrides[fundCode];
+            saveStrategyGroups(data);
+            closeModal('assignGroupModal');
+            showStatus('已恢复自动归类', 'success');
+            loadStrategyPanel();
+        }
+
+        function assignFundToGroup(fundCode, groupId) {
+            const data = loadStrategyGroups();
+            if (!data.overrides) data.overrides = {};
+            const oldGroupId = data.fund_group_map[fundCode];
+
+            // 从旧分组中移除
+            if (oldGroupId) {
+                const oldGrp = data.groups.find(g => g.id === oldGroupId);
+                if (oldGrp) {
+                    oldGrp.fund_codes = oldGrp.fund_codes.filter(c => c !== fundCode);
+                }
+            }
+
+            // 添加到新分组
+            if (groupId) {
+                const newGrp = data.groups.find(g => g.id === groupId);
+                if (newGrp && !newGrp.fund_codes.includes(fundCode)) {
+                    newGrp.fund_codes.push(fundCode);
+                }
+                data.fund_group_map[fundCode] = groupId;
+            } else {
+                delete data.fund_group_map[fundCode];
+            }
+
+            // v5.4 优化: 记录手动覆盖，防止自动同步冲掉用户选择
+            data.overrides[fundCode] = groupId || "";
+
+            saveStrategyGroups(data);
+            closeModal('assignGroupModal');
+            showStatus('分组已更新', 'success');
+            loadStrategyPanel();
+        }
+
+        // ============ 导出策略分组图片（完整卡片） ============
+        async function exportStrategyGroupImage(groupId) {
+            const data = loadStrategyGroups();
+            const grp = data.groups.find(g => g.id === groupId);
+            if (!grp || grp.fund_codes.length === 0) {
+                showStatus('分组为空，无法导出', 'error');
+                return;
+            }
+
+            // 找到该分组在 DOM 中的容器
+            const groupEl = document.querySelector(`.strategy-group[data-group-id="${groupId}"]`);
+            if (!groupEl) {
+                showStatus('请先加载策略面板再导出', 'error');
+                return;
+            }
+
+            showStatus('正在生成图片，请稍候...', 'info');
+
+            try {
+                // 临时隐藏不需要导出的按钮（操作按钮、删除按钮等）
+                const btnsToHide = groupEl.querySelectorAll(
+                    '.group-actions, .pos-actions, .signal-card-header button, .strategy-info-btn, ' +
+                    'td button, .pos-batches button'
+                );
+                btnsToHide.forEach(el => el.dataset._origDisplay = el.style.display);
+                btnsToHide.forEach(el => el.style.display = 'none');
+
+                // 临时折叠策略详情框（通常是隐藏的）
+                const infoBoxes = groupEl.querySelectorAll('.strategy-info-box');
+                const infoStates = [];
+                infoBoxes.forEach(el => {
+                    infoStates.push(el.style.display);
+                    if (!el.style.display || el.style.display === 'none') {
+                        // already hidden, keep it
+                    }
+                });
+
+                // 使用 html2canvas 截图
+                const canvas = await html2canvas(groupEl, {
+                    scale: 2,
+                    useCORS: true,
+                    backgroundColor: '#ffffff',
+                    logging: false,
+                    // 增大宽度以确保不被截断
+                    windowWidth: Math.max(groupEl.scrollWidth, 960),
+                });
+
+                // 恢复隐藏的按钮
+                btnsToHide.forEach(el => {
+                    el.style.display = el.dataset._origDisplay || '';
+                    delete el.dataset._origDisplay;
+                });
+
+                // 下载
+                const timeStr = new Date().toLocaleString('zh-CN', {
+                    month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'
+                });
+                const link = document.createElement('a');
+                link.download = `${grp.name}_${timeStr.replace(/[\/\s:]/g, '')}.png`;
+                link.href = canvas.toDataURL('image/png');
+                link.click();
+                showStatus('分组图片已导出', 'success');
+            } catch (e) {
+                showStatus('导出失败: ' + e.message, 'error');
+                // 确保按钮恢复
+                const btnsToRestore = groupEl.querySelectorAll('[data-_orig-display]');
+                btnsToRestore.forEach(el => {
+                    el.style.display = el.dataset._origDisplay || '';
+                    delete el.dataset._origDisplay;
+                });
+            }
+        }
+
+        // ============ 导出图片（实时估值板块） ============
+        async function exportSectorImage(sectorIndex) {
+            const sector = state.sectors[sectorIndex];
+            if (!sector || sector.funds.length === 0) {
+                showStatus('板块为空，无法导出', 'error');
+                return;
+            }
+
+            const sortedFunds = [...sector.funds]
+                .filter(f => {
+                    const v = valuations[f.code];
+                    if (!v) return false;
+                    // 净值来源（有✓标记）无视置信度判断，直接输出
+                    if (v._source === 'nav') return true;
+                    // 盘中估值：校准后置信度低于50%不输出
+                    return (v.calibrated_confidence ?? v.confidence) >= 0.50;
+                })
+                .sort((a, b) => {
+                const valA = valuations[a.code];
+                const valB = valuations[b.code];
+                return (valB?.estimation_change ?? -999) - (valA?.estimation_change ?? -999);
+            });
+
+            if (sortedFunds.length === 0) {
+                showStatus('没有置信度足够的基金可导出', 'error');
+                return;
+            }
+
+            const canvas = document.createElement('canvas');
+            const ctx = canvas.getContext('2d');
+
+            const P = 16, rowH = 26, headH = 36, thH = 22, W = 560;
+            const TWO_COL_THRESHOLD = 50;
+            const useTwoCols = sortedFunds.length > TWO_COL_THRESHOLD;
+
+            let WW, H, rowsPerCol;
+            if (useTwoCols) {
+                const COL_GAP = 24;
+                rowsPerCol = Math.ceil(sortedFunds.length / 2);
+                WW = W * 2 + COL_GAP;
+                H = headH + thH + rowsPerCol * rowH + P;
+            } else {
+                WW = W;
+                H = headH + thH + sortedFunds.length * rowH + P;
+            }
+
+            // 列位置（右对齐基准点）
+            const colCodeL = P;
+            const colNameL = P + 58;
+            const colChangeR = W - P - 155;  // 估值涨幅右边界
+            const col5dayR = W - P - 78;     // 近5日右边界
+            const col20dayR = W - P;          // 近20日右边界
+
+            canvas.width = WW * 2;
+            canvas.height = H * 2;
+            ctx.scale(2, 2);
+
+            ctx.fillStyle = '#ffffff';
+            ctx.fillRect(0, 0, WW, H);
+
+            // 标题（横跨整个宽度）
+            ctx.fillStyle = '#1e293b';
+            ctx.font = 'bold 14px -apple-system, BlinkMacSystemFont, sans-serif';
+            ctx.fillText(sector.name, P, P + 14);
+
+            ctx.fillStyle = '#9ca3af';
+            ctx.font = '11px -apple-system, BlinkMacSystemFont, sans-serif';
+            const timeStr = new Date().toLocaleString('zh-CN', {month:'2-digit', day:'2-digit', hour:'2-digit', minute:'2-digit'});
+            const timeLabel = useTwoCols ? timeStr + '  (' + sortedFunds.length + '只)' : timeStr;
+            ctx.fillText(timeLabel, WW - P - ctx.measureText(timeLabel).width, P + 14);
+
+            // 辅助函数：绘制一列
+            function drawColumn(xOff, fundList, startIdx) {
+                // 表头背景
+                ctx.fillStyle = '#f1f5f9';
+                ctx.fillRect(xOff, headH, W, thH);
+                ctx.fillStyle = '#64748b';
+                ctx.font = '10px -apple-system, BlinkMacSystemFont, sans-serif';
+                ctx.fillText('代码', xOff + colCodeL, headH + 15);
+                ctx.fillText('基金名称', xOff + colNameL, headH + 15);
+                let tw;
+                tw = ctx.measureText('估值涨幅').width;
+                ctx.fillText('估值涨幅', xOff + colChangeR - tw, headH + 15);
+                tw = ctx.measureText('近5日').width;
+                ctx.fillText('近5日', xOff + col5dayR - tw, headH + 15);
+                tw = ctx.measureText('近20日').width;
+                ctx.fillText('近20日', xOff + col20dayR - tw, headH + 15);
+
+                // 数据行
+                fundList.forEach((fund, j) => {
+                    const y = headH + thH + j * rowH;
+                    const val = valuations[fund.code];
+                    const textY = y + 17;
+                    const globalI = startIdx + j;
+
+                    if (globalI % 2 === 1) { ctx.fillStyle = '#f8fafc'; ctx.fillRect(xOff, y, W, rowH); }
+
+                    // 代码
+                    ctx.fillStyle = '#6366f1';
+                    ctx.font = '11px -apple-system, BlinkMacSystemFont, sans-serif';
+                    ctx.fillText(fund.code, xOff + colCodeL, textY);
+
+                    // 名称
+                    ctx.fillStyle = '#334155';
+                    ctx.font = '11px -apple-system, BlinkMacSystemFont, sans-serif';
+                    let name = fund.alias || val?.fund_name || '';
+                    if (name.length > 14) name = name.slice(0, 14) + '...';
+                    ctx.fillText(name, xOff + colNameL, textY);
+
+                    // 估值涨幅（右对齐）
+                    let chgTxt = '--', chgClr = '#64748b';
+                    if (val?.estimation_change != null) {
+                        const c = val.estimation_change;
+                        chgTxt = (c >= 0 ? '+' : '') + c.toFixed(2) + '%';
+                        chgClr = c > 0 ? '#ef4444' : c < 0 ? '#22c55e' : '#64748b';
+                    }
+                    ctx.fillStyle = chgClr;
+                    ctx.font = 'bold 12px -apple-system, BlinkMacSystemFont, sans-serif';
+                    ctx.fillText(chgTxt, xOff + colChangeR - ctx.measureText(chgTxt).width, textY);
+
+                    // 净值日期标注（非今天的历史净值时显示日期）
+                    if (val?._source === 'nav' && val?._nav_date) {
+                        const todayCheck = new Date().toISOString().slice(0, 10);
+                        if (val._nav_date !== todayCheck) {
+                            const md = val._nav_date.slice(5).replace(/^0/, '').replace(/-0?/, '/');
+                            ctx.fillStyle = '#f59e0b';
+                            ctx.font = '9px -apple-system, BlinkMacSystemFont, sans-serif';
+                            ctx.fillText(md, xOff + colChangeR + 2, textY);
+                        }
+                    }
+
+                    // 近5日（右对齐）
+                    let wTxt = '--', wClr = '#64748b';
+                    if (val?.week_change != null) {
+                        const w = val.week_change;
+                        wTxt = (w >= 0 ? '+' : '') + w.toFixed(2) + '%';
+                        wClr = w > 0 ? '#ef4444' : w < 0 ? '#22c55e' : '#64748b';
+                    }
+                    ctx.fillStyle = wClr;
+                    ctx.font = 'bold 12px -apple-system, BlinkMacSystemFont, sans-serif';
+                    ctx.fillText(wTxt, xOff + col5dayR - ctx.measureText(wTxt).width, textY);
+
+                    // 近20日（右对齐）
+                    let mTxt = '--', mClr = '#64748b';
+                    if (val?.month_change != null) {
+                        const m = val.month_change;
+                        mTxt = (m >= 0 ? '+' : '') + m.toFixed(2) + '%';
+                        mClr = m > 0 ? '#ef4444' : m < 0 ? '#22c55e' : '#64748b';
+                    }
+                    ctx.fillStyle = mClr;
+                    ctx.font = 'bold 12px -apple-system, BlinkMacSystemFont, sans-serif';
+                    ctx.fillText(mTxt, xOff + col20dayR - ctx.measureText(mTxt).width, textY);
+                });
+            }
+
+            // 渲染
+            if (useTwoCols) {
+                const mid = Math.ceil(sortedFunds.length / 2);
+                drawColumn(0, sortedFunds.slice(0, mid), 0);
+                drawColumn(W + 24, sortedFunds.slice(mid), mid);
+            } else {
+                drawColumn(0, sortedFunds, 0);
+            }
+
+            const link = document.createElement('a');
+            link.download = `${sector.name}_${timeStr.replace(/[\/\s:]/g, '')}.png`;
+            link.href = canvas.toDataURL('image/png');
+            link.click();
+            showStatus('图片已导出', 'success');
+        }
+
+        async function exportAllSectorImages() {
+            if (!state.sectors || state.sectors.length === 0) {
+                showStatus('没有板块可导出', 'error');
+                return;
+            }
+            let exported = 0;
+            for (let i = 0; i < state.sectors.length; i++) {
+                const sector = state.sectors[i];
+                if (sector.funds.length === 0) continue;
+                // 复用单板块导出，加延迟避免浏览器吞下载
+                await exportSectorImage(i);
+                exported++;
+                if (i < state.sectors.length - 1) {
+                    await new Promise(r => setTimeout(r, 500));
+                }
+            }
+            if (exported > 0) {
+                showStatus(`已导出 ${exported} 个板块图片`, 'success');
+            } else {
+                showStatus('没有可导出的板块', 'error');
+            }
+        }
+
+        // ============ 初始化 ============
+        document.addEventListener('input', markUserInteraction, true);
+        document.addEventListener('change', markUserInteraction, true);
+        document.addEventListener('focusin', event => {
+            if (event.target.matches?.('input, textarea, select') || event.target.isContentEditable) {
+                markUserInteraction();
+            }
+        }, true);
+
+        window.onload = async () => {
+            await loadState();
+            if (state.sectors.some(s => s.funds.length > 0)) {
+                await refreshAll();
+            }
+            startAutoRefresh();
+        };
+
+        // 回车/ESC 键处理
+        document.addEventListener('keydown', e => {
+            if (e.key === 'Enter' && document.getElementById('addSectorModal').classList.contains('show')) {
+                addSector();
+            }
+            if (e.key === 'Enter' && document.getElementById('etfLinkModal').classList.contains('show')) {
+                saveEtfLink();
+            }
+            if (e.key === 'Enter' && document.getElementById('buyModal').classList.contains('show')) {
+                submitBuy();
+            }
+            if (e.key === 'Enter' && document.getElementById('sellModal').classList.contains('show')) {
+                submitSell();
+            }
+            if (e.key === 'Enter' && document.getElementById('groupModal').classList.contains('show')) {
+                saveGroup();
+            }
+            if (e.key === 'Escape') {
+                closeModal('addSectorModal');
+                closeModal('etfLinkModal');
+                closeModal('navHistoryModal');
+                closeModal('buyModal');
+                closeModal('sellModal');
+                closeModal('groupModal');
+                closeModal('assignGroupModal');
+                closeModal('volSensModal');
+            }
+        });
+
+        // ============ 波动率灵敏度调整 ============
+        async function showVolSensitivityModal(fundCode) {
+            document.getElementById('volSensFundCode').value = fundCode;
+            const realCode = fundCode.includes('__') ? fundCode.split('__')[0] : fundCode;
+            const name = valuations[realCode]?.fund_name || realCode;
+            document.getElementById('volSensTitle').textContent = `调整灵敏度 · ${name}`;
+
+            // 加载当前信息
+            const infoEl = document.getElementById('volSensInfo');
+            infoEl.innerHTML = '<span class="loading"></span>加载中...';
+            document.getElementById('volSensModal').classList.add('show');
+
+            try {
+                const data = await fetchJson(`${API_BASE}/v1/position/${encodeURIComponent(fundCode)}/vol-sensitivity`, {}, '加载灵敏度');
+                const slider = document.getElementById('volSensSlider');
+                const display = document.getElementById('volSensDisplay');
+                slider.value = data.effective;
+                display.textContent = data.effective.toFixed(2);
+
+                const sourceMap = { manual: '手动设置', auto: '自动校准', default: '默认值' };
+                let infoHtml = `<div>当前生效: <b>${data.effective.toFixed(2)}×</b> (${sourceMap[data.source] || data.source})</div>`;
+                if (data.auto_cached != null) {
+                    infoHtml += `<div>自动校准值: ${data.auto_cached.toFixed(2)}× (${data.auto_cached_at || ''})</div>`;
+                }
+                if (data.manual != null) {
+                    infoHtml += `<div>手动设置值: ${data.manual.toFixed(2)}×</div>`;
+                }
+                infoHtml += `<div style="margin-top:4px;color:#9ca3af;font-size:10px;">
+                    灵敏度 < 1.0 = 阈值更灵敏(更易触发买卖) · > 1.0 = 阈值更宽(更不易触发)
+                </div>`;
+                infoEl.innerHTML = infoHtml;
+            } catch (e) {
+                infoEl.innerHTML = `<span style="color:#ef4444;">加载失败: ${e.message}</span>`;
+            }
+        }
+
+        async function saveVolSensitivity() {
+            const fundCode = document.getElementById('volSensFundCode').value;
+            const value = parseFloat(document.getElementById('volSensSlider').value);
+            try {
+                await fetchJson(`${API_BASE}/v1/position/${encodeURIComponent(fundCode)}/vol-sensitivity`, {
+                    method: 'PUT',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ sensitivity: value })
+                }, '设置灵敏度');
+                showStatus(`灵敏度已设为 ${value.toFixed(2)}×`, 'success');
+                closeModal('volSensModal');
+                loadStrategyPanel();
+            } catch (e) {
+                showStatus('设置失败: ' + e.message, 'error');
+            }
+        }
+
+        async function clearVolSensitivity() {
+            const fundCode = document.getElementById('volSensFundCode').value;
+            try {
+                await fetchJson(`${API_BASE}/v1/position/${encodeURIComponent(fundCode)}/vol-sensitivity`, {
+                    method: 'DELETE'
+                }, '恢复自动灵敏度');
+                showStatus('已恢复自动校准', 'success');
+                closeModal('volSensModal');
+                loadStrategyPanel();
+            } catch (e) {
+                showStatus('操作失败: ' + e.message, 'error');
+            }
+        }
+
+        async function recalibrateVolSensitivity() {
+            const fundCode = document.getElementById('volSensFundCode').value;
+            try {
+                const btn = event.target;
+                btn.textContent = '校准中...';
+                btn.disabled = true;
+                const data = await fetchJson(`${API_BASE}/v1/position/${encodeURIComponent(fundCode)}/vol-sensitivity/calibrate`, {
+                    method: 'POST'
+                }, '重新校准灵敏度');
+                showStatus(`重新校准完成: ${data.effective.toFixed(2)}×`, 'success');
+                // 刷新弹窗信息
+                showVolSensitivityModal(fundCode);
+            } catch (e) {
+                showStatus('校准失败: ' + e.message, 'error');
+            }
+        }
+    </script>
+</body>
+</html>

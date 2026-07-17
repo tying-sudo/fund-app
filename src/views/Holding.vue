@@ -8,14 +8,16 @@ defineOptions({ name: 'Holding' })
 import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useHoldingStore } from '@/stores/holding'
-import { searchFund, fetchFundEstimate, detectShareClass, fetchFundFeeInfo, calculateBuyFee, calculateDailyServiceFee } from '@/api/fund'
-import { fetchNetValueHistoryFast } from '@/api/fundFast'
+import { useFundStore } from '@/stores/fund'
+import { searchFund, fetchFundEstimate, detectShareClass, fetchFundFeeInfo, calculateBuyFee } from '@/api/fund'
+import { fetchNetValueHistoryFast, fetchRealDayChange } from '@/api/fundFast'
 import { showConfirmDialog, showToast, showLoadingToast, closeToast, showDialog } from 'vant'
 import { formatMoney, formatPercent, getChangeStatus, getJdFundLink } from '@/utils/format'
 import type { FundInfo, HoldingRecord, FundShareClass, FundFeeInfo, PendingAdjustment } from '@/types/fund'
 
 import { createWorker } from 'tesseract.js'
-import { PRECISION, round } from '@/utils/holdingCalculator'
+import { getTodayStr, isTradingHours as isBeijingTradingHours, PRECISION, round } from '@/utils/holdingCalculator'
+import { getSettlementNavStartDate } from '@/utils/tradingDate'
 
 // 集成风控系统和日志模块
 import { getRiskController } from '@/utils/riskControl'
@@ -23,6 +25,7 @@ import type { RiskCheckResult } from '@/utils/riskControl'
 
 const router = useRouter()
 const holdingStore = useHoldingStore()
+const fundStore = useFundStore()
 
 // ========== 类型筛选 ==========
 // [WHAT] 可选的基金类型列表
@@ -195,13 +198,13 @@ function openTradeDialog(code: string, name: string) {
   addTradeForm.value = {
     amount: '',
     feeRate: '0.00',
-    tradeDate: new Date().toISOString().split('T')[0],
+    tradeDate: getTodayStr(),
     // 默认根据当前时间判断交易时段
     tradeTimeSlot: isTradingHours.value ? 'before' : 'after'
   }
   reduceTradeForm.value = {
     shares: '',
-    tradeDate: new Date().toISOString().split('T')[0],
+    tradeDate: getTodayStr(),
     tradeTimeSlot: isTradingHours.value ? 'before' : 'after'
   }
   
@@ -213,34 +216,13 @@ function openTradeDialog(code: string, name: string) {
 /**
  * 计算交易确认日和收益起始日的核心逻辑
  * 
- * 基金交易规则：
- * - 15:00前提交 → T+1日确认份额，T+1日开始产生收益（盘中休盘时即有收益）
- * - 15:00后提交 → T+1日确认份额，T+2日才开始产生收益（相当于下个交易日）
+ * 普通场外基金：15:00 前按当日净值，15:00 后按下一开放日净值。
+ * 最终份额与确认时间以基金公司公布的官方净值为准。
  * 
- * @returns { confirmDate: 确认份额日期, profitStartDate: 收益计算起始日 }
+ * @returns { confirmDate: 官方净值结算的最早日期 }
  */
-function calcTradeDates(tradeDateStr: string, timeSlot: 'before' | 'after'): { confirmDate: string; profitStartOffset: number } {
-  const tradeDate = new Date(tradeDateStr + 'T12:00:00')
-  
-  if (timeSlot === 'before') {
-    // 15:00前买入：T日买入 → T+1确认份额 → T+1盘中就有收益
-    const nextDay = new Date(tradeDate)
-    nextDay.setDate(nextDay.getDate() + 1)
-    return {
-      confirmDate: nextDay.toISOString().split('T')[0],
-      profitStartOffset: 1  // T+1开始算收益
-    }
-  } else {
-    // 15:00后买入：T日买入 → T+1确认份额 → T+2才有收益
-    const nextDay = new Date(tradeDate)
-    nextDay.setDate(nextDay.getDate() + 1)
-    const dayAfterNext = new Date(tradeDate)
-    dayAfterNext.setDate(dayAfterNext.getDate() + 2)
-    return {
-      confirmDate: nextDay.toISOString().split('T')[0],
-      profitStartOffset: 2  // T+2开始算收益
-    }
-  }
+function calcTradeDates(tradeDateStr: string, timeSlot: 'before' | 'after'): { confirmDate: string } {
+  return { confirmDate: getSettlementNavStartDate(tradeDateStr, timeSlot) }
 }
 
 /** 生成唯一ID */
@@ -306,7 +288,7 @@ async function confirmAddTrade() {
     await holdingStore.addPendingAdjustment(pending)
 
     closeToast()
-    showToast(`已记录加仓，确认日 ${confirmDate} 后自动生效`)
+    showToast(`已记录加仓，将按 ${confirmDate} 起的官方净值自动结算`)
 
     // 刷新估值
     await holdingStore.refreshEstimates()
@@ -334,18 +316,22 @@ async function confirmReduceTrade() {
   }
 
   const currentShares = holding.shares || 0
-  if (sellShares > currentShares) {
-    showToast(`持有份额不足！当前仅${currentShares.toFixed(2)}份`)
+  const pendingReduceShares = holdingStore.pendingAdjustments
+    .filter((item: PendingAdjustment) => item.code === code && item.type === 'reduce' && item.status === 'pending')
+    .reduce((total: number, item: PendingAdjustment) => total + item.shares, 0)
+  const availableShares = Math.max(0, currentShares - pendingReduceShares)
+  if (sellShares > availableShares) {
+    showToast(`可减仓份额不足！当前可用${availableShares.toFixed(2)}份`)
     return
   }
 
   // 检查是否全部卖出
-  const isFullSell = sellShares >= currentShares
+  const isFullSell = sellShares >= availableShares
   if (isFullSell) {
     try {
       await showConfirmDialog({
         title: '清仓提示',
-        message: `将提交卖出全部${currentShares.toFixed(2)}份，确认日到达后自动删除持仓。\n\n如需保留部分仓位，请减少卖出份额。`
+        message: `将提交卖出全部可用的${availableShares.toFixed(2)}份，基金公司公布成交净值后自动结算。\n\n如需保留部分仓位，请减少卖出份额。`
       })
     } catch {
       return // 用户取消
@@ -392,8 +378,8 @@ async function confirmReduceTrade() {
 
     closeToast()
     showToast(isFullSell
-      ? `已提交清仓，确认日 ${confirmDate} 后自动生效`
-      : `已记录减仓，确认日 ${confirmDate} 后自动生效`)
+      ? `已提交清仓，将按官方净值自动结算`
+      : `已记录减仓，将按 ${confirmDate} 起的官方净值自动结算`)
 
     // 刷新估值
     await holdingStore.refreshEstimates()
@@ -409,7 +395,7 @@ async function confirmReduceTrade() {
 const shareClass = ref<FundShareClass>('A')
 
 // 今日日期字符串（用于限制日期选择器最大值）
-const todayStr = new Date().toISOString().split('T')[0]
+const todayStr = getTodayStr()
 const feeInfo = ref<FundFeeInfo | null>(null)
 // A类：是否扣除买入手续费（默认不勾选）
 const deductBuyFee = ref(false)
@@ -507,23 +493,7 @@ const summaryTodayClass = computed(() => {
   return getChangeStatus(holdingStore.summary.todayProfit)
 })
 
-// [WHAT] 判断当前是否为交易时段（盘中）
-const isTradingHours = computed(() => {
-  const now = new Date()
-  const day = now.getDay() // 0=周日, 1-5=周一至周五, 6=周六
-  const hours = now.getHours()
-  const minutes = now.getMinutes()
-  const currentTime = hours * 60 + minutes // 转换为分钟数
-  
-  // 周末不交易
-  if (day === 0 || day === 6) return false
-  
-  // 交易时段: 9:30-15:00
-  const marketOpen = 9 * 60 + 30 // 9:30
-  const marketClose = 15 * 60 // 15:00
-  
-  return currentTime >= marketOpen && currentTime < marketClose
-})
+const isTradingHours = computed(() => isBeijingTradingHours())
 
 /** 获取某基金的待确认调仓标签列表 */
 function getPendingTags(holding: any): { label: string; type: 'add' | 'reduce' }[] {
@@ -570,15 +540,14 @@ const getStatusTagClass = (holding: any) => {
 // [WHAT] 基金名称动态字体大小
 const getFundNameStyle = (name: string) => {
   const len = (name || '加载中...').length
-  // 根据名称长度动态调整字体大小，让长名称能显示更多
-  let fontSize = 14
-  if (len > 6) fontSize = 13
-  if (len > 10) fontSize = 12
-  if (len > 14) fontSize = 11
-  if (len > 18) fontSize = 10
+  // 基金名称使用更紧凑的字号；较长名称会以横幅形式完整展示。
+  let fontSize = 11
+  if (len > 14) fontSize = 10
   if (len > 22) fontSize = 9
   return { fontSize: `${fontSize}px` }
 }
+
+const shouldScrollFundName = (name: string) => (name || '').length > 14
 
 // [WHAT] 实差/均差计算
 // 根据 isRealChangeToday 判断：
@@ -640,6 +609,31 @@ const getDisplayRealChange = (holding: any) => {
   return formatPercent(holding.realChange)
 }
 
+// 列表金额使用当前市值（而不是历史成本），与顶部账户资产口径一致。
+const getHoldingMarketValue = (holding: any) => {
+  const value = Number(holding.marketValue)
+  return Number.isFinite(value) && value > 0 ? formatMoney(value) : '--'
+}
+
+// 最新收益使用当前估值/官方净值计算出的金额，不展示基金单位净值。
+const getLatestIncome = (holding: any) => {
+  const value = Number(holding.todayProfit)
+  if (!Number.isFinite(value)) return '--'
+  return `${value >= 0 ? '+' : ''}${formatMoney(value)}`
+}
+
+const getTodayRate = (holding: any) => {
+  const value = holding.isRealChangeToday ? (holding.realChange ?? holding.todayChange) : holding.todayChange
+  return value === '--' || value === undefined || value === null ? '--' : formatPercent(value)
+}
+
+// 估值、真实涨跌幅和实差互不依赖：任意一项可用都应显示，避免真实数据
+// 尚未返回时把盘中估值整块隐藏。
+const hasDiffData = (holding: any) => {
+  const hasEstimate = holding.estimateChange !== undefined && holding.estimateChange !== null && holding.estimateChange !== '--'
+  return hasEstimate || getDisplayRealChange(holding) !== null || getDisplayDiff(holding) !== null
+}
+
 // [WHAT] 真实涨跌幅标签（盘中显示"昨"，盘后根据数据日期显示"真实"或"昨"）
 const getRealChangeLabel = (holding: any) => {
   if (isTradingHours.value) return '昨'
@@ -665,12 +659,12 @@ async function onRefresh() {
   }
 }
 
-// [WHAT] 打开添加持仓弹窗
+// [WHAT] 打开添加基金弹窗
 function openAddDialog() {
   isEditing.value = false
   resetForm()
-  // 默认买入日期为今天
-  formData.value.buyDate = new Date().toISOString().split('T')[0]
+  // 仅作内部记录，不向添加基金流程暴露或据此计算持有天数。
+  formData.value.buyDate = getTodayStr()
   showAddDialog.value = true
 }
 
@@ -681,24 +675,22 @@ function handleEdit(code: string) {
   
   isEditing.value = true
   
-  // [NEW] 根据数据判断使用哪种模式
-  // 如果有金额且>0，默认用金额模式；如果金额为0但有份额，用份额模式
-  const hasValidAmount = holding.amount && holding.amount > 0
-  const hasValidShares = holding.shares && holding.shares > 0
-  
-  inputMode.value = hasValidAmount ? 'amount' : (hasValidShares ? 'shares' : 'amount')
+  // 编辑默认使用金额模式：金额是当前市值，收益是相对成本的盈亏。
+  // 用户仍可切换到按份额模式精确维护份额和成本单价。
+  inputMode.value = 'amount'
+  const marketAmount = holding.marketValue ?? ((holding.amount || 0) + (holding.profit || 0))
   
   formData.value = {
     code: holding.code,
     name: holding.name,
-    amount: holding.amount ? holding.amount.toString() : '',
+    amount: marketAmount > 0 ? marketAmount.toFixed(2) : '',
     profit: holding.profit !== undefined ? holding.profit.toString() : '',
     shares: holding.shares ? holding.shares.toString() : '',
     buyDate: holding.buyDate,
     costPrice: holding.costPrice ? holding.costPrice.toString() : '',
     costUnitPrice: holding.costUnitPrice ? holding.costUnitPrice.toString() : ''
   }
-  currentNetValue.value = holding.costUnitPrice || holding.costPrice || holding.buyNetValue || currentNetValue.value
+  currentNetValue.value = holding.currentValue || holding.costPrice || holding.costUnitPrice || holding.buyNetValue || currentNetValue.value
   selectedFund.value = { code: holding.code, name: holding.name, type: '', pinyin: '' }
   showAddDialog.value = true
 }
@@ -799,11 +791,18 @@ async function selectFund(fund: FundInfo) {
   // [WHY] 获取当前净值和费率信息
   showLoadingToast({ message: '获取净值...', forbidClick: true })
   try {
-    const [estimate, fee] = await Promise.all([
+    const [estimate, fee, realData] = await Promise.all([
       fetchFundEstimate(fund.code),
-      fetchFundFeeInfo(fund.code)
+      fetchFundFeeInfo(fund.code),
+      fetchRealDayChange(fund.code).catch(() => null)
     ])
-    currentNetValue.value = parseFloat(estimate.gsz) || parseFloat(estimate.dwjz) || 1
+    // 盘中使用当日估值，盘后优先使用已公布的官方净值；没有官方净值时
+    // 才退回接口的最新净值，避免用前一日净值反推当日份额。
+    const estimateValue = parseFloat(estimate.gsz) || 0
+    const lastValue = parseFloat(estimate.dwjz) || 0
+    currentNetValue.value = isTradingHours.value
+      ? (estimateValue || lastValue || 1)
+      : (realData?.nav || lastValue || estimateValue || 1)
     feeInfo.value = fee
     
     // [WHAT] 根据费率信息更新默认费率
@@ -841,14 +840,13 @@ const actualBuyAmount = computed(() => {
   return amount
 })
 
-// [WHAT] 计算持有份额（任何模式下都优先使用手动输入的份额）
+// [WHAT] 金额模式按当前参考净值反推份额；份额模式使用用户输入。
 const calculatedShares = computed(() => {
-  // [FIX] 任何模式下，只要手动输入了有效份额，都优先使用
   const manualShares = parseFloat(formData.value.shares)
-  if (manualShares > 0) return manualShares
-  // 否则根据金额和净值估算
-  if (actualBuyAmount.value <= 0 || currentNetValue.value <= 0) return 0
-  return actualBuyAmount.value / currentNetValue.value
+  if (inputMode.value === 'shares') return manualShares > 0 ? manualShares : 0
+  const marketAmount = parseFloat(formData.value.amount) || 0
+  if (marketAmount <= 0 || currentNetValue.value <= 0) return 0
+  return marketAmount / currentNetValue.value
 })
 
 // [NEW] ★ 按份额模式：根据份额和成本价反推总成本/持仓金额
@@ -869,18 +867,12 @@ const calculatedTotalCost = computed(() => {
   return round(amount - profitVal, PRECISION.AMOUNT)
 })
 
-// [NEW] ★ 统一计算成本单价（优先用户输入，其次推导）
+// [NEW] ★ 统一计算成本单价（优先用户输入，其次由成本反推）
 const calculatedCostUnitPrice = computed(() => {
-  // 优先使用用户输入的成本单价
-  const manualCostUnit = parseFloat(formData.value.costUnitPrice)
-  if (manualCostUnit > 0) return manualCostUnit
-  
-  // 其次使用用户输入的成本价/份额
   const manualCostPrice = parseFloat(formData.value.costPrice)
-  const shares = calculatedShares.value
-  if (manualCostPrice > 0 && shares > 0) return round(manualCostPrice / shares, PRECISION.RATE)
+  if (manualCostPrice > 0) return manualCostPrice
   
-  // 最后根据金额和收益推导
+  const shares = calculatedShares.value
   const totalCost = calculatedTotalCost.value
   if (totalCost > 0 && shares > 0) return round(totalCost / shares, PRECISION.RATE)
   
@@ -903,23 +895,6 @@ const calculatedProfitFromShares = computed(() => {
   return round(marketValue - totalCost, PRECISION.AMOUNT)
 })
 
-// [WHAT] 计算C类每日销售服务费预估
-const dailyServiceFee = computed(() => {
-  if (shareClass.value !== 'C') return 0
-  const shares = calculatedShares.value
-  if (shares <= 0 || currentNetValue.value <= 0) return 0
-  return calculateDailyServiceFee(shares, currentNetValue.value, serviceFeeRate.value)
-})
-
-// [WHAT] 计算持仓天数
-const calculatedDays = computed(() => {
-  if (!formData.value.buyDate) return 0
-  const buyDate = new Date(formData.value.buyDate)
-  const today = new Date()
-  const diffTime = today.getTime() - buyDate.getTime()
-  return Math.max(0, Math.ceil(diffTime / (1000 * 60 * 60 * 24)))
-})
-
 // ========== 风控相关状态 ==========
 /** 风控检查结果（用于显示警告） */
 const riskCheckResult = ref<RiskCheckResult | null>(null)
@@ -928,13 +903,9 @@ const showRiskDetail = ref(false)
 
 // [WHAT] 提交表单 - 支持按金额/按份额双模式 + 风控检查
 async function submitForm() {
-  // 基础校验：基金必选、日期必填
+  // 基础校验：基金必选
   if (!formData.value.code) {
     showToast('请选择基金')
-    return
-  }
-  if (!formData.value.buyDate) {
-    showToast('请选择买入日期')
     return
   }
 
@@ -943,9 +914,13 @@ async function submitForm() {
   let finalCostPrice = 0
 
   if (inputMode.value === 'amount') {
-    // [FIX] 按金额模式：金额可为0（允许仅记录收益或直接添加基金）
+    // 按金额模式：输入的是当前市值和持有收益，成本 = 市值 - 收益。
     const amount = parseFloat(formData.value.amount) || 0
     const profitVal = formData.value.profit !== '' ? parseFloat(formData.value.profit) : undefined
+    if (amount <= 0 || currentNetValue.value <= 0) {
+      showToast('请输入有效的持仓金额')
+      return
+    }
     
     // [FIX] 如果用户输入了收益，amount 表示市值；否则 amount 表示成本
     // 成本 = 市值 - 收益
@@ -953,56 +928,21 @@ async function submitForm() {
       ? amount - profitVal 
       : amount
     
-    finalAmount = cost > 0 ? cost : amount
-
-    // [FIX] 优先使用用户输入的份额和成本单价
-    const manualShares = parseFloat(formData.value.shares)
-    const manualCostUnit = parseFloat(formData.value.costUnitPrice)
-    const manualCostPrice = parseFloat(formData.value.costPrice)
-    // 是否有用户输入的持有收益（用于精确反推成本）
-    const hasProfitInput = profitVal !== undefined && profitVal !== null
-    
-    if (manualShares > 0) {
-      finalShares = manualShares
-      // 成本单价优先级：costUnitPrice > costPrice > 推导 > currentNav
-      // [FIX] formData.costPrice 在UI中也是成本单价，不再除以份额
-      if (manualCostUnit > 0) {
-        finalCostPrice = manualCostUnit
-      } else if (manualCostPrice > 0) {
-        finalCostPrice = round(manualCostPrice, PRECISION.RATE)
-      } else if (finalAmount > 0) {
-        finalCostPrice = round(finalAmount / manualShares, PRECISION.RATE)
-      } else if (currentNetValue.value > 0) {
-        finalCostPrice = currentNetValue.value
-      }
-      // [FIX] 只有当用户没有输入收益时，才用 shares × costUnitPrice 覆盖成本
-      // 否则保持 amount - profit 反推的成本，避免四舍五入导致 0.01 级误差
-      if (finalCostPrice > 0 && !hasProfitInput) {
-        finalAmount = round(manualShares * finalCostPrice, PRECISION.AMOUNT)
-      }
-      // [NEW] 如果用户输入了收益，用精确成本 / 份额 反推高精度成本单价，
-      // 确保 shares × costUnitPrice 四舍五入后仍等于精确成本
-      if (hasProfitInput && finalAmount > 0) {
-        finalCostPrice = finalAmount / manualShares
-      }
-    } else if (finalAmount > 0 && currentNetValue.value > 0) {
-      // 用户没输入份额，根据成本和净值估算
-      finalShares = finalAmount / currentNetValue.value
-      finalCostPrice = currentNetValue.value
+    if (cost <= 0) {
+      showToast('持有收益不能大于持仓金额')
+      return
     }
-
-
-
-    // [FIX] 允许只添加基金代码，后续再补全数据
-    if (amount <= 0 && (profitVal === undefined || profitVal === null) && finalShares <= 0) {
-      finalAmount = 0
-      finalShares = 0
-      finalCostPrice = currentNetValue.value > 0 ? currentNetValue.value : 0
-    }
+    finalAmount = round(cost, PRECISION.AMOUNT)
+    finalShares = amount / currentNetValue.value
+    finalCostPrice = finalAmount / finalShares
   } else {
-    // [NEW] 按份额模式：份额和金额都可为0（允许先添加基金后续补全）
+    // 按份额模式：份额和成本单价共同决定总成本。
     const shares = parseFloat(formData.value.shares) || 0
     const costPrice = parseFloat(formData.value.costPrice) || 0
+    if (shares <= 0 || costPrice <= 0) {
+      showToast('请输入有效的持有份额和成本单价')
+      return
+    }
     
     finalShares = shares
     finalCostPrice = costPrice > 0 ? costPrice : (currentNetValue.value > 0 ? currentNetValue.value : 0)
@@ -1019,14 +959,14 @@ async function submitForm() {
     name: formData.value.name,
     shareClass: shareClass.value,
     amount: finalAmount,
-    buyNetValue: finalCostPrice > 0 ? finalCostPrice : (currentNetValue.value > 0 ? currentNetValue.value : 0),
+    buyNetValue: currentNetValue.value > 0 ? currentNetValue.value : finalCostPrice,
     shares: finalShares,
     costPrice: finalCostPrice,
-    costUnitPrice: formData.value.costUnitPrice 
-      ? parseFloat(formData.value.costUnitPrice) 
-      : (finalCostPrice || currentNetValue.value),
+    costUnitPrice: finalCostPrice || currentNetValue.value,
     buyDate: formData.value.buyDate,
-    holdingDays: calculatedDays.value,
+    holdingDays: isEditing.value
+      ? (holdingStore.getHoldingByCode(formData.value.code)?.holdingDays ?? 0)
+      : 0,
     createdAt: Date.now(),
     // A类基金费用字段
     buyFeeRate: shareClass.value === 'A' ? (feeInfo.value?.buyFeeRate || 0.15) : undefined,
@@ -1126,6 +1066,24 @@ async function submitForm() {
       `提交表单失败: ${errorMessage}`,
       { code: formData.value.code, error: String(error) } as Record<string, unknown>
     )
+  }
+}
+
+// Skip creating a position and keep the selected fund in the watchlist instead.
+async function skipHolding() {
+  if (!formData.value.code || !formData.value.name) {
+    showToast('请选择基金')
+    return
+  }
+
+  try {
+    const added = await fundStore.addFund(formData.value.code, formData.value.name)
+    showToast(added ? '已添加到自选' : '已在自选中')
+    showAddDialog.value = false
+    resetForm()
+  } catch (error) {
+    console.error('[Holding] 添加自选失败:', error)
+    showToast('添加自选失败，请重试')
   }
 }
 
@@ -3942,7 +3900,7 @@ async function confirmImportFunds() {
         shares: Math.round(shares * 10000) / 10000,      // 持有份额
         costPrice: Math.round(costPriceVal * 10000) / 10000, // 持仓成本单价
         costUnitPrice: Math.round(costPriceVal * 10000) / 10000,
-        buyDate: new Date().toISOString().split('T')[0],
+        buyDate: getTodayStr(),
         holdingDays: 0,
         createdAt: Date.now()
       }
@@ -4074,18 +4032,10 @@ function closeImportDialog() {
       </div>
     </div>
 
-                <!-- 持仓列表表头 -->
-        <div v-if="holdingStore.holdings.length > 0" class="list-header">
-      <span class="col-name">基金名称</span>
-      <div class="col-right">
-        <span class="col-change">当日涨幅</span>
-        <span class="col-profit">持有收益</span>
-        <span class="col-today">当日收益</span>
-      </div>
-    </div>
-
     <!-- 筛选和排序下拉菜单 -->
-    <div v-if="holdingStore.holdings.length > 0" class="filter-bar">
+    <div v-if="holdingStore.holdings.length > 0" class="list-toolbar">
+      <h2>基金列表</h2>
+      <div class="filter-bar">
       <!-- 类型筛选 -->
       <div class="filter-dropdown" @click.stop="showTypeDropdown = !showTypeDropdown; showSortDropdown = false">
         <span class="filter-label">类型: {{ currentTypeLabel }}</span>
@@ -4120,6 +4070,17 @@ function closeImportDialog() {
           </div>
         </div>
       </div>
+      </div>
+    </div>
+
+    <!-- 持仓列表表头 -->
+    <div v-if="holdingStore.holdings.length > 0" class="list-header">
+      <span class="col-name">基金</span>
+      <div class="col-right">
+        <span class="col-position">金额/最新收益</span>
+        <span class="col-profit">持有收益/率</span>
+        <span class="col-today">今日收益/率</span>
+      </div>
     </div>
 
     <!-- 持仓列表 -->
@@ -4132,7 +4093,12 @@ function closeImportDialog() {
         <van-swipe-cell v-for="holding in filteredHoldings" :key="holding.code">
                                                                                 <div class="holding-item" @click="goToDetail(holding.code)">
                                                 <div class="col-name">
-              <div class="fund-name" :style="getFundNameStyle(holding.name)">{{ holding.name || '加载中...' }}</div>
+              <div class="fund-name" :style="getFundNameStyle(holding.name)">
+                <span v-if="shouldScrollFundName(holding.name)" class="fund-name-track">
+                  <span>{{ holding.name || '加载中...' }}</span>
+                </span>
+                <span v-else>{{ holding.name || '加载中...' }}</span>
+              </div>
               <div class="fund-meta">
                 <a class="fund-code" :href="getJdFundLink(holding.code)" @click.stop>{{ holding.code }}</a>
                 <span :class="['fund-tag', getStatusTagClass(holding)]">{{ getStatusTag(holding) }}</span>
@@ -4141,21 +4107,23 @@ function closeImportDialog() {
                 </template>
               </div>
                                                                                                                                                                         <!-- 估值、真实涨跌幅、实差/均差 -->
-              <div class="fund-diff-info" v-if="getDisplayRealChange(holding)">
+              <div class="fund-diff-info" v-if="hasDiffData(holding)">
                 <span class="diff-label">估值</span>
-                <span :class="['diff-value', getChangeStatus(holding.estimateChange || holding.todayChange || 0)]">{{ formatPercent(holding.estimateChange || holding.todayChange || 0) }}</span>
+                <span :class="['diff-value', getChangeStatus(holding.estimateChange || holding.todayChange || 0)]">
+                  {{ holding.estimateChange === '--' ? '--' : formatPercent(holding.estimateChange ?? holding.todayChange ?? 0) }}
+                </span>
                 <span class="diff-separator">|</span>
                 <span class="diff-label">{{ getRealChangeLabel(holding) }}</span>
-                <span :class="['diff-value', getRealChangeClass(holding)]">{{ getDisplayRealChange(holding) }}</span>
+                <span :class="['diff-value', getRealChangeClass(holding)]">{{ getDisplayRealChange(holding) || '--' }}</span>
                 <span class="diff-separator">|</span>
                 <span class="diff-label">{{ getDiffLabel(holding) }}</span>
                 <span :class="['diff-value', getDiffClass(holding)]">{{ getDisplayDiff(holding) || '待计算' }}</span>
               </div>
             </div>
                                                 <div class="col-right">
-              <!-- 根据机构是否公布真实涨跌幅来显示：未公布显示估值，公布后显示真实涨跌幅 -->
-              <div class="col-change" :class="getChangeStatus((holding.isRealChangeToday ? (holding.realChange ?? holding.todayChange) : holding.todayChange) || 0)">
-                {{ formatPercent((holding.isRealChangeToday ? (holding.realChange ?? holding.todayChange) : holding.todayChange) || 0) }}
+              <div class="col-position">
+                <div class="position-amount">{{ getHoldingMarketValue(holding) }}</div>
+                <div class="position-nav" :class="getChangeStatus(holding.todayProfit || 0)">{{ getLatestIncome(holding) }}</div>
               </div>
               <div class="col-profit" :class="getChangeStatus(holding.profit || 0)">
                 <div class="profit-amount">
@@ -4165,9 +4133,9 @@ function closeImportDialog() {
                   {{ holding.profitRate !== undefined ? formatPercent(holding.profitRate) : '--' }}
                 </div>
               </div>
-                            <div class="col-today" :class="getChangeStatus(holding.todayProfit || 0)">
-              <span class="today-profit">{{ holding.todayProfit !== undefined ? (holding.todayProfit >= 0 ? '+' : '') + formatMoney(holding.todayProfit) : '--' }}</span>
-              <span class="today-fee" v-if="holding.todayServiceFee && holding.todayServiceFee > 0">费 {{ holding.todayServiceFee.toFixed(2) }}</span>
+              <div class="col-today" :class="getChangeStatus(holding.todayProfit || 0)">
+                <span class="today-profit">{{ holding.todayProfit !== undefined ? (holding.todayProfit >= 0 ? '+' : '') + formatMoney(holding.todayProfit) : '--' }}</span>
+                <span class="today-rate">{{ getTodayRate(holding) }}</span>
             </div>
             </div>
           </div>
@@ -4184,7 +4152,7 @@ function closeImportDialog() {
       <!-- 空状态 -->
       <van-empty v-else description="暂无持仓记录">
         <van-button round type="primary" @click="openAddDialog">
-          添加持仓
+          添加基金
         </van-button>
       </van-empty>
     </van-pull-refresh>
@@ -4194,11 +4162,11 @@ function closeImportDialog() {
       v-model:show="showAddDialog"
       position="bottom"
       round
-      :style="{ height: '75%' }"
+      :style="{ height: '68%' }"
     >
       <div class="add-dialog">
         <div class="dialog-header">
-          <span>{{ isEditing ? '编辑持仓' : '添加持仓' }}</span>
+          <span>{{ isEditing ? '编辑持仓' : '添加基金' }}</span>
           <van-icon name="cross" @click="showAddDialog = false" />
         </div>
 
@@ -4246,11 +4214,11 @@ function closeImportDialog() {
             readonly
           />
 
-          <!-- 当前净值显示 -->
+          <!-- 当前参考净值：盘中为估值，盘后为已公布的官方净值 -->
           <van-field
             v-if="currentNetValue > 0"
             :model-value="currentNetValue.toFixed(4)"
-            label="当前净值"
+            :label="isTradingHours ? '当前估值' : '最新净值'"
             readonly
           />
 
@@ -4265,39 +4233,6 @@ function closeImportDialog() {
               </div>
             </template>
           </van-field>
-
-          <!-- A类基金：买入手续费选项 -->
-          <template v-if="shareClass === 'A' && (selectedFund || isEditing)">
-            <van-field label="买入手续费">
-              <template #input>
-                <div class="fee-option">
-                  <van-checkbox v-model="deductBuyFee" shape="square">
-                    从金额中扣除
-                  </van-checkbox>
-                  <span class="fee-rate">费率 {{ feeInfo?.buyFeeRate || 0.15 }}%</span>
-                </div>
-              </template>
-            </van-field>
-            <div v-if="buyFeeAmount > 0" class="fee-tip">
-              <van-icon name="info-o" />
-              <span>手续费约 ¥{{ buyFeeAmount.toFixed(2) }}，实际买入 ¥{{ actualBuyAmount.toFixed(2) }}</span>
-            </div>
-          </template>
-
-          <!-- C类基金：销售服务费说明 -->
-          <template v-if="shareClass === 'C' && (selectedFund || isEditing)">
-            <van-field label="销售服务费">
-              <template #input>
-                <div class="fee-option">
-                  <span class="fee-rate">年化 {{ serviceFeeRate }}%（按日计提）</span>
-                </div>
-              </template>
-            </van-field>
-            <div v-if="dailyServiceFee > 0" class="fee-tip">
-              <van-icon name="info-o" />
-              <span>每日约扣 ¥{{ dailyServiceFee.toFixed(2) }}（不满1分按1分计）</span>
-            </div>
-          </template>
 
           <!-- ★ 输入模式切换 Tab -->
           <div class="input-mode-tabs">
@@ -4315,12 +4250,12 @@ function closeImportDialog() {
 
           <!-- ========== 按金额模式的字段 ========== -->
           <template v-if="inputMode === 'amount'">
-          <!-- 持仓金额 -->
+          <!-- 当前持仓市值 -->
           <van-field
             v-model="formData.amount"
             type="number"
             label="持仓金额"
-            placeholder="请输入持仓总金额（元）"
+            placeholder="请输入当前持仓总金额"
           />
 
           <!-- 持有收益 [NEW] 支持负数 -->
@@ -4337,13 +4272,6 @@ function closeImportDialog() {
             </template>
           </van-field>
 
-          <!-- 持有份额（按金额模式下为只读计算值或手动覆盖） -->
-          <van-field
-            v-model="formData.shares"
-            type="number"
-            label="持有份额"
-            :placeholder="calculatedShares > 0 ? `自动计算: ${calculatedShares.toFixed(2)}份` : '可手动输入或留空'"
-          />
           </template>
 
           <!-- ========== 按份额模式的字段 ========== -->
@@ -4383,33 +4311,6 @@ function closeImportDialog() {
           </div>
           </template>
 
-          <!-- 持仓成本价 -->
-          <van-field
-            v-model="formData.costPrice"
-            type="number"
-            label="持仓成本价"
-            placeholder="总成本/持有份额（元）"
-          />
-
-          <!-- 持仓成本单价 -->
-          <van-field
-            v-model="formData.costUnitPrice"
-            type="number"
-            label="持仓成本单价"
-            placeholder="买入时净值（元）"
-          />
-
-          <!-- 买入日期 -->
-          <div class="date-input-wrapper">
-            <label class="date-label">买入日期</label>
-            <input
-              type="date"
-              v-model="formData.buyDate"
-              :max="todayStr"
-              class="date-input"
-            />
-          </div>
-
           <!-- 风险提示区域 -->
           <div v-if="riskCheckResult && (riskCheckResult.warnings.length > 0 || riskCheckResult.errors.length > 0)" 
                class="risk-warning-box"
@@ -4436,10 +4337,10 @@ function closeImportDialog() {
           <!-- 计算结果展示 -->
           <div v-if="(inputMode === 'amount' && calculatedShares > 0) || (inputMode === 'shares' && calculatedAmountFromShares > 0)" class="calc-result">
             <div class="calc-item">
-              <span class="calc-label">{{ inputMode === 'amount' ? (formData.shares ? '持有份额' : '预估份额') : '持有份额' }}</span>
+              <span class="calc-label">{{ inputMode === 'amount' ? '预估份额' : '持有份额' }}</span>
               <span class="calc-value">{{ inputMode === 'amount' ? calculatedShares.toFixed(2) : formData.shares }} 份</span>
             </div>
-            <div class="calc-item" v-if="inputMode === 'shares' && calculatedCostUnitPrice > 0">
+            <div class="calc-item" v-if="inputMode === 'amount' && calculatedCostUnitPrice > 0">
               <span class="calc-label">反推成本单价</span>
               <span class="calc-value">¥{{ calculatedCostUnitPrice.toFixed(4) }}</span>
             </div>
@@ -4447,15 +4348,14 @@ function closeImportDialog() {
               <span class="calc-label">总成本估算</span>
               <span class="calc-value">¥{{ calculatedTotalCost.toFixed(2) }}</span>
             </div>
-            <div class="calc-item">
-              <span class="calc-label">持仓天数</span>
-              <span class="calc-value">{{ calculatedDays }} 天</span>
-            </div>
           </div>
         </div>
 
-                <div class="dialog-footer">
-          <van-button block type="primary" @click="submitForm">
+        <div class="dialog-footer">
+          <van-button v-if="!isEditing" plain type="primary" @click="skipHolding">
+            跳过持仓
+          </van-button>
+          <van-button type="primary" @click="submitForm">
             {{ isEditing ? '保存修改' : '确认添加' }}
           </van-button>
         </div>
@@ -4556,10 +4456,10 @@ function closeImportDialog() {
             <div class="trade-time-tip" v-if="addTradeForm.tradeDate && addTradeForm.amount">
               <van-icon name="info-o" size="14" />
               <span v-if="addTradeForm.tradeTimeSlot === 'before'">
-                15:00前买入 → 明日盘中确认份额，当天即有收益
+                15:00前提交 → 按当日净值成交，官方净值公布后自动结算
               </span>
               <span v-else>
-                15:00后买入 → 明日确认份额，后天才有收益
+                15:00后提交 → 按下一开放日净值成交，周末和节假日自动顺延
               </span>
             </div>
           </template>
@@ -4630,10 +4530,10 @@ function closeImportDialog() {
             <div class="trade-time-tip" v-if="reduceTradeForm.tradeDate && reduceTradeForm.shares">
               <van-icon name="info-o" size="14" />
               <span v-if="reduceTradeForm.tradeTimeSlot === 'before'">
-                15:00前卖出 → 明日确认，当日收益按剩余份额计算
+                15:00前提交 → 按当日净值赎回，官方净值公布后自动结算
               </span>
               <span v-else>
-                15:00后卖出 → 明日确认，明日收益才反映变化
+                15:00后提交 → 按下一开放日净值赎回，周末和节假日自动顺延
               </span>
             </div>
           </template>
@@ -4657,12 +4557,12 @@ function closeImportDialog() {
                   <span class="pending-type" :class="item.type">
                     {{ item.type === 'add' ? '加仓' : '减仓' }}
                   </span>
-                  <span class="pending-date">确认日 {{ item.confirmDate }}</span>
+                  <span class="pending-date">净值结算起始日 {{ item.confirmDate }}</span>
                 </div>
                 <div class="pending-detail">
                   {{ item.timeSlot === 'before' ? '15:00前' : '15:00后' }} |
                   {{ item.type === 'add' ? '金额' : '份额' }} {{ item.type === 'add' ? formatMoney(item.amount) : item.shares.toFixed(2) }} |
-                  {{ item.type === 'add' ? '新增份额' : '扣减成本' }} {{ item.type === 'add' ? item.shares.toFixed(2) : formatMoney(item.amount) }}
+                  {{ item.type === 'add' ? '预计新增份额' : '扣减成本' }} {{ item.type === 'add' ? item.shares.toFixed(2) : formatMoney(item.amount) }}
                 </div>
               </div>
               <van-button
@@ -4896,7 +4796,7 @@ function closeImportDialog() {
 .holding-page :deep(.van-nav-bar) {
   flex-shrink: 0;
   height: auto;
-  min-height: 44px;
+  min-height: 38px;
 }
 
 /* [FIX] 顶部固定区域不压缩 */
@@ -4938,16 +4838,16 @@ function closeImportDialog() {
 /* 汇总卡片 */
 .summary-card {
   background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  margin: 12px;
-  padding: 16px;
-  border-radius: 12px;
+  margin: 8px 10px;
+  padding: 10px 12px;
+  border-radius: 8px;
   color: #fff;
 }
 
 .summary-row {
   display: flex;
   justify-content: space-between;
-  margin-bottom: 12px;
+  margin-bottom: 8px;
 }
 
 .summary-row:last-child {
@@ -4959,13 +4859,13 @@ function closeImportDialog() {
 }
 
 .summary-label {
-  font-size: 12px;
+  font-size: 10px;
   opacity: 0.8;
-  margin-bottom: 4px;
+  margin-bottom: 2px;
 }
 
 .summary-value {
-  font-size: 18px;
+  font-size: 15px;
   font-weight: 600;
 }
 
@@ -4982,8 +4882,8 @@ function closeImportDialog() {
   display: flex;
   justify-content: space-between;
   align-items: center;
-  padding: 8px 16px;
-  font-size: 12px;
+  padding: 6px 8px;
+  font-size: 10px;
   color: var(--text-secondary);
   background: var(--bg-secondary);
   border-bottom: 1px solid var(--border-color);
@@ -5004,7 +4904,7 @@ function closeImportDialog() {
   display: flex;
   justify-content: space-between;
   align-items: flex-start;
-  padding: 12px 8px;
+  padding: 8px;
   background: var(--bg-secondary);
   border-bottom: 1px solid var(--border-color);
 }
@@ -5012,13 +4912,13 @@ function closeImportDialog() {
 .col-name {
   flex: 1;
   min-width: 0;
-  max-width: 65%;
+  max-width: 44%;
   overflow: hidden;
 }
 
 .col-name .fund-name {
   color: var(--text-primary);
-  margin-bottom: 2px;
+  margin-bottom: 1px;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -5028,17 +4928,17 @@ function closeImportDialog() {
 .col-name .fund-meta {
   display: flex;
   align-items: center;
-  gap: 6px;
+  gap: 4px;
 }
 
 .col-name .fund-code {
-  font-size: 11px;
+  font-size: 10px;
   color: var(--text-secondary);
 }
 
 .col-name .fund-tag {
-  font-size: 10px;
-  padding: 1px 4px;
+  font-size: 9px;
+  padding: 1px 3px;
   border-radius: 2px;
   margin-left: 4px;
 }
@@ -5087,52 +4987,66 @@ function closeImportDialog() {
 }
 
 .col-right {
-  display: flex;
+  display: grid;
+  grid-template-columns: 62px 62px 62px;
   align-items: center;
-  gap: 10px;
+  gap: 3px;
   flex-shrink: 0;
-  margin-left: 12px;
+  margin-left: 5px;
 }
 
-.col-change {
-  text-align: center;
-  font-size: 13px;
-  min-width: 42px;
+.col-position {
+  text-align: right;
+  font-size: 10px;
+  min-width: 0;
 }
 
 .col-profit {
-  text-align: center;
-  font-size: 13px;
-  min-width: 48px;
+  text-align: right;
+  font-size: 11px;
+  min-width: 0;
 }
 
 .col-profit .profit-amount {
-  font-size: 13px;
+  font-size: 11px;
 }
 
 .col-profit .profit-rate {
-  font-size: 11px;
+  font-size: 10px;
   opacity: 0.8;
 }
 
 .col-today {
   text-align: right;
-  font-size: 13px;
-  min-width: 52px;
+  font-size: 11px;
+  min-width: 0;
 }
 
 .col-today .today-profit {
-  font-size: 18.5px;
-  font-weight: 700;
+  font-size: 11px;
+  font-weight: 600;
   display: block;
 }
 
-.col-today .today-fee {
+.position-amount,
+.position-nav,
+.today-rate {
   display: block;
-  font-size: 10px;
-  color: var(--text-tertiary);
-  margin-top: 2px;
+  line-height: 1.35;
 }
+
+.position-amount {
+  color: var(--text-primary);
+  font-size: 11px;
+  font-weight: 500;
+}
+
+.position-nav,
+.today-rate {
+  color: var(--text-secondary);
+  font-size: 10px;
+}
+
 
 .up { color: var(--color-up); }
 .down { color: var(--color-down); }
@@ -5142,9 +5056,9 @@ function closeImportDialog() {
 .fund-diff-info {
   display: flex;
   align-items: center;
-  gap: 3px;
-  margin-top: 4px;
-  font-size: 10px;
+  gap: 2px;
+  margin-top: 2px;
+  font-size: 9px;
   font-family: -apple-system, 'SF Mono', 'Roboto Mono', monospace;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
@@ -5153,12 +5067,12 @@ function closeImportDialog() {
 
 .diff-label {
   color: var(--text-secondary);
-  font-size: 9px;
+  font-size: 8px;
 }
 
 .diff-value {
   font-weight: 500;
-  font-size: 10px;
+  font-size: 9px;
 }
 
 .diff-separator {
@@ -5536,6 +5450,12 @@ function closeImportDialog() {
 
 .dialog-footer {
   padding: 16px;
+  display: flex;
+  gap: 12px;
+}
+
+.dialog-footer .van-button {
+  flex: 1;
 }
 
 /* 导航栏右侧图标 */
@@ -6394,5 +6314,98 @@ function closeImportDialog() {
   color: var(--text-tertiary, #c8c9cc);
   line-height: 1.3;
   max-width: 120px;
+}
+
+/* 较长基金名称不截断，使用单行横幅完整展示。 */
+.col-name .fund-name {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  height: 14px;
+  line-height: 14px;
+  overflow: hidden;
+  text-overflow: clip;
+  white-space: nowrap;
+}
+
+.fund-name-track {
+  display: inline-block;
+  width: max-content;
+  white-space: nowrap;
+  will-change: transform;
+  animation: fund-name-marquee 9s linear 1s infinite;
+}
+
+@keyframes fund-name-marquee {
+  from { transform: translateX(0); }
+  to { transform: translateX(-100%); }
+}
+
+.list-toolbar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  flex-shrink: 0;
+  padding: 0 18px 12px;
+}
+
+.list-toolbar h2 {
+  margin: 0;
+  font-size: 23px;
+  line-height: 1;
+  color: #13243a;
+}
+
+.filter-bar {
+  display: flex;
+  gap: 8px;
+  padding: 0;
+  background: transparent;
+  border: 0;
+}
+
+.filter-dropdown {
+  min-width: 88px;
+  justify-content: center;
+  gap: 5px;
+  padding: 9px 8px;
+  color: #2f516b;
+  background: #fff;
+  border: 1px solid #e0e5e8;
+  border-radius: 6px;
+  box-shadow: 0 1px 2px rgba(20, 44, 63, .04);
+}
+
+.filter-label { font-size: 13px; white-space: nowrap; }
+.dropdown-menu { z-index: 20; top: calc(100% + 6px); right: 0; border-radius: 8px; }
+
+.list-header {
+  padding: 0 20px 7px;
+  color: #8b96a2;
+  font-size: 12px;
+  background: transparent;
+  border-bottom: 1px solid #e5e8eb;
+}
+
+.list-header .col-name {
+  flex: 0 0 calc(100% - 197px);
+  max-width: none;
+}
+.list-header .col-right { grid-template-columns: 62px 62px 62px; gap: 3px; margin-left: 5px; }
+.list-header .col-right > span {
+  font-size: 8px;
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.holding-item .col-name {
+  flex: 0 0 calc(100% - 197px);
+  max-width: none;
+  padding-right: 4px;
+}
+
+@media (max-width: 390px) {
+  .list-toolbar { padding-right: 12px; padding-left: 12px; }
+  .filter-dropdown { min-width: 78px; }
 }
 </style>

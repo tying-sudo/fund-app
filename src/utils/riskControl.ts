@@ -3,6 +3,8 @@
 // [SECURITY] 所有校验规则可配置，支持动态调整
 
 /** 风险级别 */
+import { getBeijingDateString } from '@/utils/tradingDate'
+
 export type RiskLevel = 'LOW' | 'MEDIUM' | 'HIGH' | 'CRITICAL'
 
 /** 风险检测结果 */
@@ -182,14 +184,16 @@ export class RiskController {
 
     // 日期合理性
     if (record.buyDate) {
-      const buyDate = new Date(record.buyDate)
-      const today = new Date()
+      // Date-only form values must be compared as Beijing calendar dates.
+      // Comparing against the current timestamp rejects the current day before 08:00.
+      const buyDate = record.buyDate.replace(/\//g, '-').slice(0, 10)
+      const today = getBeijingDateString()
       if (buyDate > today) {
         errors.push('买入日期不能晚于今天')
       }
       
       // 不支持太早的日期（1990年之前）
-      if (buyDate.getFullYear() < 1990) {
+      if (Number(buyDate.slice(0, 4)) < 1990) {
         errors.push('买入日期不合理')
       }
     }

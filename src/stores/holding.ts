@@ -20,7 +20,7 @@ import {
   savePendingAdjustments
 } from '@/utils/storage'
 
-import { fetchFundEstimateFast, fetchRealDayChange } from '@/api/fundFast'
+import { fetchFundEstimateFast, fetchNetValueHistoryFast, fetchRealDayChange } from '@/api/fundFast'
 import { getFundTypes } from '@/api/fund'
 import { persistCache } from '@/api/tiantianApi'
 
@@ -38,6 +38,13 @@ import {
 
 import { getRiskController } from '@/utils/riskControl'
 import { getHoldingLogger } from '@/utils/holdingLogger'
+import {
+  findSettlementNav,
+  calculateSubscriptionShares,
+  getBeijingDateString,
+  getCalendarDayDifference,
+  getSettlementNavStartDate
+} from '@/utils/tradingDate'
 
 /** 持仓项（包含实时估值和收益计算） */
 export interface HoldingWithProfit extends HoldingRecord {
@@ -55,12 +62,12 @@ export interface HoldingWithProfit extends HoldingRecord {
   estimateChange?: string
   /** 当日收益金额 */
   todayProfit?: number
-  /** 当日销售服务费（C类） */
-  todayServiceFee?: number
   /** 是否加载中 */
   loading?: boolean
   /** 当日真实涨跌幅（盘后基金机构公布） */
   realChange?: number
+  /** 真实涨跌幅对应的净值日期，用于区分今日公布与最近一次公布 */
+  realChangeDate?: string
   /** 真实涨跌幅是否为今日数据 */
   isRealChangeToday?: boolean
 }
@@ -97,6 +104,7 @@ export const useHoldingStore = defineStore('holding', () => {
   let writeQueue: WriteOperation[] = []
   let writeTimer: ReturnType<typeof setTimeout> | null = null
   let isWriting = false
+  const pendingSettlementLocks = new Set<string>()
 
   /**
    * 写入防抖延迟（毫秒）
@@ -354,6 +362,7 @@ export const useHoldingStore = defineStore('holding', () => {
       return
     }
 
+    updateHoldingDays()
     isRefreshing.value = true
     const startTime = performance.now()
     const codes = holdings.value.map((h) => h.code)
@@ -393,8 +402,8 @@ export const useHoldingStore = defineStore('holding', () => {
                 realData.date,
                 realData.nav
               )
-              // 官方净值更新后，自动确认到确认日的待确认调仓
-              confirmPendingAdjustments(realData.date)
+              // Only settle records for the fund whose official NAV was received.
+              void confirmPendingAdjustments(code, realData.date)
             }
           }).catch(() => {})
         } catch (error) {
@@ -466,7 +475,9 @@ export const useHoldingStore = defineStore('holding', () => {
       ? realChange 
       : holding.realChange
     
-    const isRealChangeToday = dateCheck.valid || holding.isRealChangeToday
+    // 仅“今日”官方净值可覆盖主涨跌幅；盘后或休市保留最近净值仅供展示，
+    // 不能把它误标为今天的真实涨跌幅。
+    const isRealChangeToday = dateCheck.isToday
     
     // 构建今日涨跌幅显示值
     let displayTodayChange: string
@@ -493,11 +504,11 @@ export const useHoldingStore = defineStore('holding', () => {
       todayChange: displayTodayChange,
       estimateChange: isEstimateToday ? (data.gszzl || '--') : '--',
       todayProfit: result.todayProfit,
-      todayServiceFee: result.todayServiceFee,
       loading: false,
       shares: result.effectiveShares,
-      serviceFeeDeducted: holding.shareClass === 'C' ? result.totalServiceFee : undefined,
+      serviceFeeDeducted: undefined,
       realChange: effectiveRealChange,
+      realChangeDate: realChangeDate || holding.realChangeDate,
       isRealChangeToday
     }
 
@@ -689,13 +700,10 @@ export const useHoldingStore = defineStore('holding', () => {
    * [COMPATIBLE] 保持原有 API 不变
    */
   function updateHoldingDays() {
-    const today = new Date()
+    const today = getBeijingDateString()
     holdings.value.forEach((h) => {
       if (h.buyDate) {
-        const buyDate = new Date(h.buyDate)
-        const diffTime = today.getTime() - buyDate.getTime()
-        const diffDays = Math.ceil(diffTime / (1000 * 60 * 60 * 24))
-        h.holdingDays = diffDays
+        h.holdingDays = getCalendarDayDifference(h.buyDate, today)
       }
     })
   }
@@ -735,20 +743,20 @@ export const useHoldingStore = defineStore('holding', () => {
   /**
    * 立即应用待确认调仓到持仓（内部使用）
    */
-  async function applyAdjustment(pending: PendingAdjustment): Promise<void> {
+  async function applyAdjustment(pending: PendingAdjustment, settlementNav: number): Promise<void> {
     const holding = holdings.value.find((h) => h.code === pending.code)
     if (!holding) return
 
     if (pending.type === 'add') {
-      const actualAmount = pending.amount - pending.fee
-      const newShares = (holding.shares || 0) + pending.shares
-      const newAmount = (holding.amount || 0) + actualAmount
+      const settledShares = round(calculateSubscriptionShares(pending.amount, pending.fee, settlementNav), 4)
+      const newShares = (holding.shares || 0) + settledShares
+      const newAmount = (holding.amount || 0) + pending.amount
       const newCostPrice = newShares > 0 ? newAmount / newShares : 0
       const updatedRecord: HoldingRecord = {
         ...holding,
         amount: round(newAmount, PRECISION.AMOUNT),
         shares: newShares,
-        buyNetValue: round(newCostPrice, PRECISION.RATE),
+        buyNetValue: round(settlementNav, PRECISION.RATE),
         costUnitPrice: round(newCostPrice, PRECISION.RATE),
         costPrice: round(newCostPrice, PRECISION.RATE),
         buyFeeAmount: (holding.buyFeeAmount || 0) + pending.fee
@@ -792,20 +800,34 @@ export const useHoldingStore = defineStore('holding', () => {
    * 检查并确认已到确认日的待确认调仓记录
    * [WHEN] 每次官方净值更新后调用（realNav 有值且日期有效）
    */
-  async function confirmPendingAdjustments(realNavDate?: string | null): Promise<void> {
+  async function confirmPendingAdjustments(code?: string, realNavDate?: string | null): Promise<void> {
     if (pendingAdjustments.value.length === 0) return
 
-    const today = getTodayStr(new Date())
-    const effectiveDate = realNavDate || today
+    const effectiveDate = realNavDate || getTodayStr(new Date())
 
     const toConfirm = pendingAdjustments.value.filter(
-      (p) => p.status === 'pending' && p.confirmDate <= effectiveDate
+      (p) => p.status === 'pending' && (!code || p.code === code) && !pendingSettlementLocks.has(p.id)
     )
 
     if (toConfirm.length === 0) return
 
     for (const pending of toConfirm) {
-      await applyAdjustment(pending)
+      pendingSettlementLocks.add(pending.id)
+      try {
+        const history = await fetchNetValueHistoryFast(pending.code, 1500)
+        const settlementStartDate = getSettlementNavStartDate(pending.tradeDate, pending.timeSlot)
+        const settlement = findSettlementNav(history, settlementStartDate, effectiveDate)
+        if (!settlement) continue
+
+        await applyAdjustment(pending, settlement.netValue)
+      } catch (error) {
+        logger.error('PENDING', 'SETTLEMENT_FAILED', `Settlement failed: ${pending.code}`, {
+          code: pending.code,
+          error
+        })
+      } finally {
+        pendingSettlementLocks.delete(pending.id)
+      }
     }
 
     // addOrUpdateHolding 内部已触发刷新，这里不再额外调用

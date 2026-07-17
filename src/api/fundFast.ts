@@ -6,6 +6,7 @@ import { cache, CACHE_TTL } from './cache'
 import { persistCache } from './tiantianApi'
 import { API_BASE_URL, USE_PROXY } from '@/config/api'
 import type { FundEstimate, NetValueRecord, StockHolding, DataSource, FundEstimateWithSource, MultiSourceEstimate } from '@/types/fund'
+import { getBeijingDateString, getBeijingDayAndMinutes } from '@/utils/tradingDate'
 
 // ========== 股票实时行情接口 ==========
 
@@ -304,7 +305,7 @@ export async function fetchFundEstimateFast(code: string): Promise<FundEstimate>
   //       需要判断估值日期是否为今天，如果不是，说明该市场今日没有开盘
   function isEstimateToday(d: FundEstimate): boolean {
     if (!d.gztime) return false
-    const today = new Date().toISOString().slice(0, 10) // YYYY-MM-DD
+    const today = getBeijingDateString()
     // [FIX] gztime 格式可能是 "2026/07/07 23:45" 或 "2026-07-07 23:45"
     //       需要提取日期部分进行比较
     const datePart = d.gztime.split(' ')[0] // 提取日期部分
@@ -928,7 +929,7 @@ export async function fetchNetValueHistoryFast(code: string, days = 30): Promise
             // [WHAT] 按时间倒序取最近 days 条
             const recent = trend.slice(-days).reverse()
             const records: NetValueRecord[] = recent.map((item: any) => ({
-              date: item.x ? new Date(item.x).toISOString().slice(0, 10) : '',
+              date: item.x ? getBeijingDateString(new Date(item.x)) : '',
               netValue: typeof item.y === 'number' ? item.y : 0,
               totalValue: 0,
               changeRate: typeof item.equityReturn === 'number' ? item.equityReturn : 0
@@ -1036,10 +1037,8 @@ async function fetchTodayRealNav(code: string): Promise<{ nav: number; changeRat
  * [WHY] 盘后基金机构会公布真实净值，需要使用更短的缓存以获取最新数据
  */
 function isAfterMarketClose(): boolean {
-  const now = new Date()
-  const hours = now.getHours()
-  const minutes = now.getMinutes()
-  const day = now.getDay()
+  const { day, minutes } = getBeijingDayAndMinutes()
+  const hours = Math.floor(minutes / 60)
   // 周末也算盘后
   if (day === 0 || day === 6) return true
   // 工作日 15:00 之后算盘后
@@ -1051,11 +1050,8 @@ function isAfterMarketClose(): boolean {
  * [WHY] 盘前应使用盘后缓存策略，因为此时数据与盘后一致
  */
 function isBeforeMarketOpen(): boolean {
-  const now = new Date()
-  const hours = now.getHours()
-  const minutes = now.getMinutes()
-  const time = hours * 60 + minutes
-  return time < 9 * 60 + 30 // 09:30 之前
+  const { minutes } = getBeijingDayAndMinutes()
+  return minutes < 9 * 60 + 30
 }
 
 /**
@@ -1083,10 +1079,7 @@ export async function fetchRealDayChange(code: string): Promise<{ nav: number; c
   if (cached !== null && cached !== undefined) return cached
 
   // [WHAT] 使用北京时间（UTC+8）
-  const now = new Date()
-  const utc = now.getTime() + now.getTimezoneOffset() * 60000
-  const bjTime = new Date(utc + 8 * 3600000)
-  const today = bjTime.toISOString().slice(0, 10) // YYYY-MM-DD
+  const today = getBeijingDateString()
 
   try {
     // [WHAT] 盘后优先使用 lsjz 接口获取当天真实净值
@@ -1530,7 +1523,7 @@ export async function fetchManagerProfit(fundCode: string): Promise<ManagerProfi
           if (Array.isArray(item) && item.length >= 2) {
             const date = new Date(item[0])
             result.push({
-              date: `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`,
+              date: getBeijingDateString(date),
               profit: item[1] || 0
             })
           }
@@ -1539,10 +1532,10 @@ export async function fetchManagerProfit(fundCode: string): Promise<ManagerProfi
         // [EDGE] 确保包含最后一个点
         const last = grandTotal[grandTotal.length - 1]
         const lastResult = result[result.length - 1]
-        if (last && lastResult && lastResult.date !== new Date(last[0]).toISOString().split('T')[0]) {
+        if (last && lastResult && lastResult.date !== getBeijingDateString(new Date(last[0]))) {
           const date = new Date(last[0])
           result.push({
-            date: `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`,
+            date: getBeijingDateString(date),
             profit: last[1] || 0
           })
         }

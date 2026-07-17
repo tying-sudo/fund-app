@@ -84,6 +84,9 @@ input, textarea {
 
 #app {
   min-height: 100vh;
+  /* 保持全站组件比例一致，统一收紧 10%。 */
+  zoom: 0.9;
+  min-height: 111.112vh;
 }
 
 /* [WHY] 安全区域适配（iPhone X 及以上刘海屏） */

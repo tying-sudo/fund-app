@@ -27,7 +27,7 @@ onMounted(() => {
   
   plugins.App.addListener('backButton', () => {
     // [WHY] 如果不在主页，正常返回上一页
-    const mainPages = ['home', 'market', 'holding', 'analysis']
+    const mainPages = ['home', 'market', 'holding', 'analysis', 'valuationGrid']
     const isMainPage = mainPages.includes(route.name as string)
     
     if (!isMainPage && window.history.length > 1) {
@@ -70,7 +70,8 @@ watch(
       home: 'home',
       market: 'market',
       holding: 'holding',
-      analysis: 'analysis'
+      analysis: 'analysis',
+      valuationGrid: 'valuationGrid'
     }
     if (name && tabMap[name as string]) {
       activeTab.value = tabMap[name as string]
@@ -84,8 +85,9 @@ function onTabChange(name: string | number) {
   const routeMap: Record<string, string> = {
     home: '/home',
     market: '/market',
-    holding: '/',
-    analysis: '/analysis'
+      holding: '/',
+      analysis: '/analysis',
+      valuationGrid: '/valuation-grid'
   }
   if (routeMap[name as string]) {
     router.push(routeMap[name as string])
@@ -113,6 +115,7 @@ function onTabChange(name: string | number) {
       <van-tabbar-item name="home" icon="home-o">自选</van-tabbar-item>
       <van-tabbar-item name="market" icon="chart-trending-o">行情</van-tabbar-item>
       <van-tabbar-item name="analysis" icon="bar-chart-o">分析</van-tabbar-item>
+      <van-tabbar-item name="valuationGrid" icon="apps-o">估值网格</van-tabbar-item>
     </van-tabbar>
   </div>
 </template>
