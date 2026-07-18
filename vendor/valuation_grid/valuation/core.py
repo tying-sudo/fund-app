@@ -4,6 +4,7 @@ core.py - 估值计算 + state管理 + coverage/confidence
 import json
 import threading
 from datetime import datetime, timedelta
+from math import isfinite
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -111,6 +112,106 @@ def flush_deviations():
             devs[fund_code] = records[:_MAX_DEVIATION_RECORDS]
         _save_deviations(devs)
         _deviation_buffer.clear()
+
+def get_latest_settlement(fund_code: str) -> dict:
+    """Return the latest completed trading-day estimate and official NAV pair.
+
+    This is intentionally read-only. It lets clients recover a missing
+    non-trading-session display without treating a stale NAV as live data.
+    """
+    _ensure_intraday_cache_loaded()
+    from .providers import get_fund_nav_history, get_fundgz_estimation
+
+    history = get_fund_nav_history(fund_code, 30)
+    nav_by_date = {
+        item.get("date"): item.get("change")
+        for item in history
+        if isinstance(item, dict) and item.get("date") and item.get("change") is not None
+    }
+
+    # Prefer the fund provider's own intraday estimate whenever it has the
+    # same date as an official NAV. The grid's holdings-weighted estimate is
+    # only a fallback and may be stale for funds with changed allocations.
+    fundgz = get_fundgz_estimation(fund_code)
+    if fundgz:
+        try:
+            estimate_change = float(fundgz.get("gszzl"))
+            estimate_date = str(fundgz.get("gztime") or "")[:10]
+            real_change = float(nav_by_date[estimate_date])
+        except (KeyError, TypeError, ValueError):
+            estimate_change = real_change = None
+        if estimate_change is not None and real_change is not None and \
+                isfinite(estimate_change) and isfinite(real_change):
+            return {
+                "fund_code": fund_code,
+                "date": estimate_date,
+                "estimate_change": round(estimate_change, 4),
+                "real_change": round(real_change, 4),
+                "difference": round(real_change - estimate_change, 4),
+            }
+
+    # Always prefer one canonical calculation path for every fund: the raw
+    # intraday estimate paired with the fund company's official same-day NAV.
+    # The cached records below are only a recovery path when this calculation
+    # cannot provide a completed pair.
+    valuation = calculate_valuation(fund_code)
+    raw_estimate = valuation.get("_estimation_change_raw")
+    nav_date = valuation.get("_nav_date")
+    official_change = valuation.get("estimation_change")
+    if valuation.get("_source") == "nav" and nav_date:
+        try:
+            estimate_change = float(raw_estimate)
+            real_change = float(official_change)
+        except (TypeError, ValueError):
+            estimate_change = real_change = None
+        if estimate_change is not None and real_change is not None and \
+                isfinite(estimate_change) and isfinite(real_change):
+            return {
+                "fund_code": fund_code,
+                "date": nav_date,
+                "estimate_change": round(estimate_change, 4),
+                "real_change": round(real_change, 4),
+                "difference": round(real_change - estimate_change, 4),
+            }
+
+    candidates = []
+    cached = _intraday_estimation_cache.get(fund_code)
+    if isinstance(cached, dict):
+        candidates.append({"date": cached.get("date"), "est": cached.get("est")})
+
+    with _deviation_lock:
+        deviations = _load_deviations().get(fund_code, [])
+    candidates.extend({"date": item.get("date"), "est": item.get("est")}
+                      for item in deviations if isinstance(item, dict))
+
+    seen_dates = set()
+    for item in sorted(candidates, key=lambda value: str(value.get("date") or ""), reverse=True):
+        date = item.get("date")
+        if not date or date in seen_dates:
+            continue
+        seen_dates.add(date)
+        try:
+            estimate_change = float(item.get("est"))
+            real_change = float(nav_by_date[date])
+        except (KeyError, TypeError, ValueError):
+            continue
+        if not (isfinite(estimate_change) and isfinite(real_change)):
+            continue
+        return {
+            "fund_code": fund_code,
+            "date": date,
+            "estimate_change": round(estimate_change, 4),
+            "real_change": round(real_change, 4),
+            "difference": round(real_change - estimate_change, 4),
+        }
+
+    return {
+        "fund_code": fund_code,
+        "date": None,
+        "estimate_change": None,
+        "real_change": None,
+        "difference": None,
+    }
 
 def calibrate_confidence(fund_code: str, raw_confidence: float) -> float:
     """基于历史偏差校准置信度。

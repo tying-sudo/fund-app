@@ -17,11 +17,19 @@ import uvicorn
 
 from valuation.core import (
     load_state, save_state, validate_state,
-    calculate_valuation, calculate_valuation_batch, calculate_valuation_by_state
+    calculate_valuation, calculate_valuation_batch, calculate_valuation_by_state,
+    get_latest_settlement,
 )
 from valuation.providers import (
     get_fund_name, set_etf_link_target, get_etf_link_target, clear_etf_link_target,
     refresh_stale_holdings
+)
+from data_sources import (
+    DataSourceError,
+    get_akshare_fund_nav_history,
+    get_data_source_status,
+    get_eastmoney_fund_estimate,
+    get_eastmoney_fund_nav_history,
 )
 from positions import (
     add_batch, sell_batch, delete_batch, update_fund_config,
@@ -42,7 +50,7 @@ from grid import (
     auto_calibrate_vol_sensitivity,
     backfill_signal_outcomes, calc_signal_win_rate,
     set_market_regime, get_market_regime_info,
-    get_fitness_scores, get_fund_fitness
+    get_fitness_scores, get_fund_fitness, save_fitness_scores
 )
 
 # ============================================================
@@ -93,6 +101,15 @@ async def position_data_error_handler(_request, exc: PositionDataError):
     return JSONResponse(
         status_code=503,
         content={"detail": str(exc), "error": "position_data_unavailable"},
+    )
+
+
+@app.exception_handler(DataSourceError)
+async def data_source_error_handler(_request, exc: DataSourceError):
+    """Upstream data failures remain explicit and never crash the API worker."""
+    return JSONResponse(
+        status_code=502,
+        content={"detail": str(exc), "error": "market_data_unavailable"},
     )
 
 # CORS
@@ -165,6 +182,39 @@ def get_nav_history(fund_code: str, days: int = 15):
     from valuation.providers import get_fund_nav_history
     data = get_fund_nav_history(fund_code, days)
     return {"fund_code": fund_code, "days": len(data), "history": data}
+
+@app.get("/v1/fund/{fund_code}/settlement")
+def get_latest_fund_settlement(fund_code: str):
+    """Latest completed trading-day estimate/NAV pair for UI recovery."""
+    return get_latest_settlement(fund_code)
+
+
+# ============================================================
+# 可选数据源 API（AKShare / 东方财富）
+# ============================================================
+
+@app.get("/v1/data-sources/status")
+def get_market_data_source_status():
+    """返回可选数据源的依赖可用性，不触发外部行情请求。"""
+    return get_data_source_status()
+
+
+@app.get("/v1/data/eastmoney/fund/{fund_code}/nav-history")
+def get_eastmoney_nav_history(fund_code: str, limit: int = 30):
+    """通过东方财富读取开放式基金历史净值。"""
+    return get_eastmoney_fund_nav_history(fund_code, limit)
+
+
+@app.get("/v1/data/eastmoney/fund/{fund_code}/estimate")
+def get_eastmoney_estimate(fund_code: str):
+    """通过东方财富读取盘中估值（没有估值时字段为 null）。"""
+    return get_eastmoney_fund_estimate(fund_code)
+
+
+@app.get("/v1/data/akshare/fund/{fund_code}/nav-history")
+def get_akshare_nav_history(fund_code: str, limit: int = 30):
+    """通过 AKShare 读取开放式基金历史净值。"""
+    return get_akshare_fund_nav_history(fund_code, limit)
 
 # ============================================================
 # ETF联接基金映射 API
@@ -631,6 +681,20 @@ def get_single_fitness(fund_code: str):
     return {"fund_code": fund_code, "score": None, "grade": None}
 
 
+class FitnessScoresRequest(BaseModel):
+    scores: dict
+
+
+@app.put("/v1/fund-fitness")
+def import_fitness_scores(req: FitnessScoresRequest):
+    """Import generated scores without modifying state, holdings, or trades."""
+    try:
+        count = save_fitness_scores(req.scores)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
+    return {"success": True, "count": count}
+
+
 # ============================================================
 # v5.X: 延迟回补挂单查询/维护接口
 # ============================================================
@@ -660,7 +724,10 @@ def cleanup_pending_rebuys_api():
 
 @app.get("/")
 async def serve_index():
-    return FileResponse(os.path.join(os.path.dirname(__file__), "demo.html"))
+    return FileResponse(
+        os.path.join(os.path.dirname(__file__), "demo.html"),
+        headers={"Cache-Control": "no-store, max-age=0"},
+    )
 
 
 @app.get("/favicon.ico")

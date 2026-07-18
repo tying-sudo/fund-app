@@ -620,6 +620,18 @@ def get_fund_fitness(fund_code: str) -> dict:
     return cache.get(fund_code) or cache.get(real_code) or {}
 
 
+def save_fitness_scores(scores: dict) -> int:
+    """Atomically replace only the generated fitness-score cache."""
+    if not isinstance(scores, dict):
+        raise ValueError("scores must be an object")
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_file = FITNESS_CACHE_FILE.with_suffix(".tmp")
+    with open(tmp_file, "w", encoding="utf-8") as handle:
+        json.dump(scores, handle, ensure_ascii=False, indent=2)
+    tmp_file.replace(FITNESS_CACHE_FILE)
+    return len(scores)
+
+
 # --- 以波动率倍数表达的核心阈值 ---
 DIP_BUY_VOL_MULTIPLE = 1.8
 SUPPLEMENT_TRIGGER_VOL_MULTIPLE = 1.2
