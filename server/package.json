@@ -7,11 +7,14 @@
   "scripts": {
     "start": "node server.mjs",
     "dev": "node --watch server.mjs",
-    "scrape": "node scrape-funds.mjs"
+    "scrape": "node scrape-funds.mjs",
+    "sync:holdings": "node sync-market-holdings.mjs",
+    "test": "node --test"
   },
   "dependencies": {
     "express": "^4.21.0",
     "http-proxy-middleware": "^3.0.0",
-    "node-cron": "^3.0.3"
+    "node-cron": "^3.0.3",
+    "pg": "^8.16.3"
   }
 }

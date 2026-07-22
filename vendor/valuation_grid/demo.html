@@ -427,6 +427,17 @@
             color: #92400e;
             margin-bottom: 4px;
         }
+        .decision-note {
+            margin: 2px 0;
+            padding: 5px 9px;
+            background: #fff7df;
+            border: 1px solid #f0d691;
+            border-left: 3px solid #d49b16;
+            border-radius: 4px;
+            font-size: 10px;
+            color: #705515;
+            line-height: 1.55;
+        }
 
         .pos-summary {
             display: flex;
@@ -656,6 +667,7 @@
             margin-bottom: 10px;
             box-shadow: 0 1px 3px rgba(0,0,0,.08);
             display: flex;
+            flex-wrap: wrap;
             gap: 8px;
             align-items: center;
         }
@@ -669,6 +681,364 @@
         }
         .add-position-bar input:focus { border-color: #4f46e5; }
         .add-position-bar span { font-size: 12px; color: #6b7280; }
+        .quick-add-main {
+            display: flex;
+            flex: 1 1 100%;
+            flex-wrap: wrap;
+            gap: 8px;
+            align-items: center;
+        }
+        .quick-add-label { white-space: nowrap; }
+        .quick-add-name {
+            flex: 1 1 120px;
+            min-width: 0;
+            color: #4f46e5 !important;
+            font-weight: 500;
+        }
+        .quick-add-name.is-loading { color: #9ca3af !important; }
+        .quick-add-name.is-missing { color: #d97706 !important; }
+        .quick-add-imports {
+            display: flex;
+            flex: 1 1 100%;
+            flex-wrap: wrap;
+            gap: 6px;
+            align-items: center;
+            padding-top: 2px;
+        }
+        .quick-add-import-label {
+            color: #6b7280;
+            white-space: nowrap;
+        }
+        .quick-add-holding {
+            max-width: 180px;
+            overflow: hidden;
+            text-overflow: ellipsis;
+            white-space: nowrap;
+            padding: 4px 8px;
+            border: 1px solid #c7d2fe;
+            border-radius: 4px;
+            background: #eef2ff;
+            color: #4338ca;
+            font-size: 11px;
+            cursor: pointer;
+        }
+        .quick-add-holding:hover {
+            border-color: #818cf8;
+            background: #e0e7ff;
+        }
+        .quick-add-collapse-header,
+        .sector-collapse-toggle,
+        .code-confidence {
+            display: none;
+        }
+        .quick-add-host-empty { color: #9ca3af !important; }
+        .fund-name-link {
+            margin-left: 6px;
+            color: #6b7280;
+            font-size: 12px;
+            font-weight: 400;
+            text-decoration: none;
+        }
+        .fund-name-link:hover { color: #4f46e5; text-decoration: underline; }
+        .fund-name-rest {
+            color: #6b7280;
+            font-size: 12px;
+            font-weight: 400;
+        }
+        .fund-name-placeholder {
+            margin-left: 6px;
+            color: #9ca3af;
+            font-size: 12px;
+            font-weight: 400;
+        }
+
+        /* Host-app embedding: one panel per bottom tab, with no duplicate navigation. */
+        body.embed-mode .container { max-width: none; padding: 10px; }
+        body.embed-mode .tab-bar { display: none; }
+        body.embed-mode[data-grid-tab="valuation"] #tab-strategy,
+        body.embed-mode[data-grid-tab="strategy"] #tab-valuation { display: none !important; }
+        body.embed-mode[data-grid-tab="valuation"] #tab-valuation,
+        body.embed-mode[data-grid-tab="strategy"] #tab-strategy { display: block !important; }
+
+        /* Align the embedded tools with the fund app's dark surface tokens. */
+        body.embed-dark {
+            background: #0b0e11;
+            color: #eaecef;
+        }
+        body.embed-dark .sector,
+        body.embed-dark .add-position-bar,
+        body.embed-dark .strategy-group,
+        body.embed-dark .signal-card,
+        body.embed-dark .modal-content,
+        body.embed-dark .pos-summary {
+            background: #1e2329 !important;
+            border-color: #2b3139 !important;
+            box-shadow: none;
+            color: #eaecef;
+        }
+        body.embed-dark .sector-header,
+        body.embed-dark .fund-table th,
+        body.embed-dark .nav-history-table th,
+        body.embed-dark .strategy-group-header,
+        body.embed-dark .signal-card-header,
+        body.embed-dark .add-row,
+        body.embed-dark .fund-table tr:hover,
+        body.embed-dark .nav-history-table tr:hover {
+            background: #171b20 !important;
+            border-color: #2b3139 !important;
+            color: #848e9c;
+        }
+        body.embed-dark .sector-name,
+        body.embed-dark .td-name,
+        body.embed-dark .strategy-group-header .group-name,
+        body.embed-dark .modal-content h3,
+        body.embed-dark td,
+        body.embed-dark th {
+            color: #eaecef !important;
+        }
+        body.embed-dark .fund-table td,
+        body.embed-dark .nav-history-table td,
+        body.embed-dark .sector-header,
+        body.embed-dark .add-row {
+            border-color: #2b3139 !important;
+        }
+        body.embed-dark input,
+        body.embed-dark select,
+        body.embed-dark textarea {
+            background: #0b0e11 !important;
+            border-color: #3b4350 !important;
+            color: #eaecef !important;
+        }
+        body.embed-dark .btn-secondary,
+        body.embed-dark .btn-export,
+        body.embed-dark .strategy-group-header .group-actions button {
+            background: #2b3139 !important;
+            border-color: #3b4350 !important;
+            color: #eaecef !important;
+        }
+        body.embed-dark .empty,
+        body.embed-dark .update-time,
+        body.embed-dark .refresh-status,
+        body.embed-dark .td-confidence,
+        body.embed-dark .ungrouped-label {
+            color: #848e9c !important;
+        }
+        body.embed-dark .fund-info { color: #eaecef !important; }
+        body.embed-dark .fund-name-link { color: #b7c0cc; }
+        body.embed-dark .fund-name-link:hover { color: #a5c9ff; }
+        body.embed-dark .fund-name-rest { color: #b7c0cc; }
+        body.embed-dark .fund-name-placeholder,
+        body.embed-dark .quick-add-host-empty { color: #848e9c !important; }
+        body.embed-dark .quick-add-name { color: #a5c9ff !important; }
+        body.embed-dark .quick-add-name.is-loading { color: #848e9c !important; }
+        body.embed-dark .quick-add-name.is-missing { color: #fcd34d !important; }
+        body.embed-dark .quick-add-holding {
+            background: #202b3a;
+            border-color: #34455d;
+            color: #a5c9ff;
+        }
+        body.embed-dark .quick-add-holding:hover {
+            background: #28384b;
+            border-color: #4f6a8e;
+        }
+        body.embed-dark .fitness-badge.grade-A { background: #173c32; color: #6ee7b7; }
+        body.embed-dark .fitness-badge.grade-B { background: #202b3a; color: #a5c9ff; }
+        body.embed-dark .fitness-badge.grade-C { background: #3d3216; color: #fcd34d; }
+        body.embed-dark .fitness-badge.grade-D { background: #422c18; color: #fdba74; }
+        body.embed-dark .fitness-badge.grade-E { background: #472326; color: #fca5a5; }
+        body.embed-dark .ri-btn {
+            background: #2b3139 !important;
+            border-color: #3b4350 !important;
+            color: #eaecef !important;
+        }
+        body.embed-dark .ri-btn.active-neutral,
+        body.embed-dark .regime-auto-badge {
+            background: #202b3a !important;
+            border-color: #34455d !important;
+            color: #a5c9ff !important;
+        }
+        body.embed-dark .ri-btn.active-bear {
+            background: #173c32 !important;
+            border-color: #24644f !important;
+            color: #6ee7b7 !important;
+        }
+        body.embed-dark .signal-badge.alert,
+        body.embed-dark .signal-alert {
+            background: #3d3216 !important;
+            border-color: #6d571d !important;
+            color: #fcd34d !important;
+        }
+        /* Keep long strategy explanations legible without introducing an unrelated blue callout. */
+        body.embed-dark .signal-reason,
+        body.embed-dark .strategy-info-box,
+        body.embed-dark .decision-note {
+            background: #211f19 !important;
+            border: 1px solid #4d4323 !important;
+            border-left: 3px solid #f0b90b !important;
+            color: #d7dde5 !important;
+            border-radius: 4px;
+            padding: 7px 9px;
+            line-height: 1.55;
+        }
+        body.embed-dark .signal-reason { font-size: 11px; }
+        body.embed-dark .strategy-info-box { font-size: 10px; }
+        body.embed-dark .decision-note { font-size: 10px; }
+        body.embed-dark .strategy-info-btn {
+            background: #2b3139;
+            border-color: #4d5663;
+            color: #d7dde5;
+        }
+        body.embed-dark .strategy-info-btn:hover {
+            background: #3b4350;
+            color: #f0b90b;
+        }
+        body.embed-dark {
+            color-scheme: dark;
+            scrollbar-color: #3b4350 #0b0e11;
+        }
+        body.embed-dark ::-webkit-scrollbar { width: 8px; }
+        body.embed-dark ::-webkit-scrollbar-track { background: #0b0e11; }
+        body.embed-dark ::-webkit-scrollbar-thumb { background: #3b4350; border-radius: 8px; }
+        body.embed-dark [style*="background:#f8fafc"],
+        body.embed-dark [style*="background:#f1f5f9"],
+        body.embed-dark [style*="background:#fafafa"] {
+            background: #171b20 !important;
+            border-color: #2b3139 !important;
+        }
+        body.embed-dark [style*="background:#eef2ff"],
+        body.embed-dark [style*="background:#eff6ff"] {
+            background: #202b3a !important;
+            border-color: #34455d !important;
+        }
+
+        /* Phone layout: cards stay readable without changing the desktop table. */
+        @media (max-width: 640px) {
+            body { font-size: 12px; }
+            .container, body.embed-mode .container { padding: 8px; }
+            .toolbar { margin-bottom: 8px; }
+            .valuation-actions { flex-wrap: wrap; }
+            .valuation-actions button { flex: 1 1 auto; min-height: 34px; }
+
+            .quick-add-collapse-header {
+                width: 100%;
+                display: flex;
+                align-items: center;
+                justify-content: space-between;
+                color: #374151;
+                font-size: 13px;
+                font-weight: 600;
+            }
+            .quick-add-collapse-header button,
+            .sector-collapse-toggle {
+                width: 28px;
+                height: 28px;
+                border: 1px solid #d1d5db;
+                border-radius: 4px;
+                background: transparent;
+                color: #6b7280;
+                cursor: pointer;
+                line-height: 1;
+            }
+            .quick-add-content { display: flex; flex: 1 1 100%; flex-wrap: wrap; gap: 8px; }
+            .quick-add-content.is-collapsed { display: none; }
+            .add-position-bar { padding: 10px 12px; }
+            .quick-add-main { gap: 6px; }
+            .quick-add-main input { width: 86px; }
+            .quick-add-name { flex-basis: 100%; order: 3; }
+            .quick-add-imports { max-height: 126px; overflow-y: auto; }
+
+            .sector { margin-bottom: 8px; }
+            .sector-header { padding: 9px 10px; }
+            .sector-name { font-size: 13px; }
+            .sector-collapse-toggle { display: inline-flex; align-items: center; justify-content: center; }
+            .sector.is-collapsed .fund-table,
+            .sector.is-collapsed .add-row { display: none; }
+            .sector.is-collapsed .sector-collapse-toggle { transform: rotate(-90deg); }
+
+            .fund-table-scroll {
+                width: 100%;
+                overflow-x: auto;
+                overscroll-behavior-x: contain;
+                -webkit-overflow-scrolling: touch;
+            }
+            #tab-valuation {
+                --valuation-table-width: 660px;
+                width: 100%;
+                overflow-x: auto;
+                overscroll-behavior-x: contain;
+                -webkit-overflow-scrolling: touch;
+            }
+            #tab-valuation .valuation-actions,
+            #tab-valuation #sectors {
+                min-width: var(--valuation-table-width);
+            }
+            #tab-valuation .sector,
+            #tab-valuation .fund-table-scroll {
+                overflow: visible;
+            }
+            .fund-table { display: table; min-width: 660px; }
+            .fund-table thead { display: table-header-group; }
+            .fund-table tbody { display: table-row-group; }
+            .fund-table tr { display: table-row; }
+            .fund-table td { display: table-cell; padding: 8px 10px; border-bottom: 1px solid #f1f5f9; }
+            .fund-table th { display: table-cell; }
+            .fund-table td:nth-child(6) { display: table-cell; }
+            .td-code {
+                position: sticky;
+                left: 0;
+                z-index: 2;
+                display: table-cell !important;
+                min-width: 112px;
+                background: #fff;
+                box-shadow: 1px 0 0 #e5e7eb;
+                font-size: 12px;
+            }
+            .fund-table th:first-child {
+                position: sticky;
+                left: 0;
+                z-index: 3;
+                min-width: 112px;
+                background: #f1f5f9;
+                box-shadow: 1px 0 0 #e2e8f0;
+            }
+            .code-confidence {
+                display: inline-flex;
+                align-items: center;
+                min-height: 18px;
+                padding: 0 5px;
+                border-radius: 3px;
+                font-size: 10px;
+                font-weight: 700;
+                letter-spacing: 0;
+            }
+            .code-confidence.high { color: #0f766e; background: #ccfbf1; }
+            .code-confidence.medium { color: #a16207; background: #fef3c7; }
+            .code-confidence.low { color: #b91c1c; background: #fee2e2; }
+            .td-name { min-width: 150px; }
+            .td-action { text-align: center; }
+            .td-action button { min-height: 28px; padding: 3px 8px; }
+            .add-row { flex-wrap: wrap; padding: 9px 10px; }
+            .add-row input[name="code"] { width: 88px; }
+            .add-row input[name="alias"] { flex: 1 1 calc(100% - 96px); }
+            .add-row button { margin-left: auto; }
+            .sector-header { border-radius: 7px 7px 0 0; }
+            .add-row { border-radius: 0 0 7px 7px; }
+            .pos-batches {
+                overscroll-behavior-x: contain;
+                -webkit-overflow-scrolling: touch;
+            }
+            .pos-batches table { min-width: 720px; }
+
+            body.embed-dark .quick-add-collapse-header { color: #eaecef; }
+            body.embed-dark .quick-add-collapse-header button,
+            body.embed-dark .sector-collapse-toggle { border-color: #3b4350; color: #b7c0cc; }
+            body.embed-dark .fund-table td { border-color: #2b3139; }
+            body.embed-dark .td-code { background: #1e2329; box-shadow: 1px 0 0 #2b3139; }
+            body.embed-dark .fund-table th:first-child { background: #171b20; box-shadow: 1px 0 0 #2b3139; }
+            body.embed-dark .code-confidence.high { color: #6ee7b7; background: #173c32; }
+            body.embed-dark .code-confidence.medium { color: #fcd34d; background: #3d3216; }
+            body.embed-dark .code-confidence.low { color: #fca5a5; background: #472326; }
+        }
     </style>
 </head>
 <body>
@@ -691,7 +1061,7 @@
 
         <!-- 估值看板 -->
         <div class="tab-panel active" id="tab-valuation">
-            <div style="display:flex;gap:8px;margin-bottom:10px;">
+            <div class="valuation-actions" style="display:flex;gap:8px;margin-bottom:10px;">
                 <button class="btn-primary" onclick="refreshAll()" id="refreshBtn">🔄 刷新</button>
                 <button class="btn-success" onclick="showAddSectorModal()">➕ 新建板块</button>
                 <button class="btn-warning" onclick="exportAllSectorImages()">📷 批量导出</button>
@@ -929,18 +1299,45 @@
 
     <script>
         const API_BASE = '';
+        const embedParams = new URLSearchParams(window.location.search);
+        const isEmbedded = embedParams.get('embed') === '1';
+        const requestedTab = ['valuation', 'strategy'].includes(embedParams.get('tab'))
+            ? embedParams.get('tab')
+            : 'valuation';
+
+        if (isEmbedded) {
+            document.body.classList.add('embed-mode');
+            document.body.dataset.gridTab = requestedTab;
+            if (embedParams.get('theme') === 'dark') {
+                document.body.classList.add('embed-dark');
+            }
+        }
+
         let state = { version: 1, sectors: [] };
         let valuations = {};
+        let fitnessScores = {};
         let autoRefreshTimer = null;
+        let refreshStatusTimer = null;
         let isRefreshing = false;
         let lastRefreshTime = null;
-        let currentTab = 'valuation';
+        let currentTab = requestedTab;
         let strategyLoadPromise = null;
+        let lastStrategyLoadAt = 0;
+        let hostActive = true;
         let lastUserInteractionAt = 0;
+        let hostHoldings = [];
+        let quickAddLookupSequence = 0;
+        let quickAddCollapsed = false;
+        const valuationAddLookupSequence = Object.create(null);
+        const fundNameCache = Object.create(null);
+        const pendingFundNameLookups = Object.create(null);
 
         const RETRYABLE_API_STATUS = new Set([502, 503, 504]);
         const API_RETRY_DELAYS = [400, 1000];
         const USER_INTERACTION_GRACE_MS = 6000;
+        const DASHBOARD_CACHE_KEY = 'valuation-grid:dashboard-cache:v1';
+        const STRATEGY_CACHE_KEY = 'valuation-grid:strategy-cache:v1';
+        const STRATEGY_CACHE_TTL_MS = 5 * 60 * 1000;
 
         function wait(ms) {
             return new Promise(resolve => setTimeout(resolve, ms));
@@ -955,11 +1352,68 @@
                 .replace(/'/g, '&#039;');
         }
 
+        function writeDashboardCache() {
+            try {
+                localStorage.setItem(DASHBOARD_CACHE_KEY, JSON.stringify({
+                    state,
+                    valuations,
+                    fitnessScores,
+                    refreshedAt: lastRefreshTime?.toISOString() || null
+                }));
+            } catch {}
+        }
+
+        function restoreDashboardCache() {
+            try {
+                const cached = JSON.parse(localStorage.getItem(DASHBOARD_CACHE_KEY) || 'null');
+                if (!cached?.state || !Array.isArray(cached.state.sectors)) return false;
+                state = cached.state;
+                valuations = cached.valuations && typeof cached.valuations === 'object'
+                    ? cached.valuations
+                    : {};
+                fitnessScores = cached.fitnessScores && typeof cached.fitnessScores === 'object'
+                    ? cached.fitnessScores
+                    : {};
+                lastRefreshTime = cached.refreshedAt ? new Date(cached.refreshedAt) : null;
+                render();
+                if (lastRefreshTime && Number.isFinite(lastRefreshTime.getTime())) {
+                    document.getElementById('updateTime').textContent =
+                        `缓存于 ${lastRefreshTime.toLocaleTimeString()}`;
+                }
+                return true;
+            } catch {
+                return false;
+            }
+        }
+
+        function writeStrategyPanelCache(panel) {
+            try {
+                lastStrategyLoadAt = Date.now();
+                sessionStorage.setItem(STRATEGY_CACHE_KEY, JSON.stringify({
+                    html: panel.innerHTML,
+                    refreshedAt: lastStrategyLoadAt
+                }));
+            } catch {}
+        }
+
+        function restoreStrategyPanelCache() {
+            try {
+                const cached = JSON.parse(sessionStorage.getItem(STRATEGY_CACHE_KEY) || 'null');
+                if (!cached?.html || !Number.isFinite(Number(cached.refreshedAt))) return false;
+                document.getElementById('strategyPanel').innerHTML = cached.html;
+                lastStrategyLoadAt = Number(cached.refreshedAt);
+                return true;
+            } catch {
+                return false;
+            }
+        }
+
         function markUserInteraction() {
             lastUserInteractionAt = Date.now();
         }
 
         function getRefreshPauseReason() {
+            if (isEmbedded && !hostActive) return '页面未打开';
             if (document.hidden) return '页面在后台';
             if (document.querySelector('.modal.show')) return '正在填写或确认';
 
@@ -1088,16 +1542,17 @@
         }
 
         // ============ Tab 切换 ============
-        function switchTab(tab) {
+        function switchTab(tab, forceRefresh = false) {
             currentTab = tab;
+            if (isEmbedded) document.body.dataset.gridTab = tab;
             document.querySelectorAll('.tab-btn').forEach(b => b.classList.remove('active'));
             document.querySelectorAll('.tab-panel').forEach(p => p.classList.remove('active'));
             document.querySelector(`.tab-btn[onclick="switchTab('${tab}')"]`).classList.add('active');
             document.getElementById(`tab-${tab}`).classList.add('active');
 
-            if (tab === 'strategy') {
+            if (tab === 'strategy' && (!isEmbedded || hostActive)) {
                 loadRegimeStatus();
-                loadStrategyPanel();
+                loadStrategyPanel(forceRefresh);
             }
         }
 
@@ -1120,8 +1575,16 @@
         // ============ API 调用 ============
         async function loadState() {
             try {
-                state = await fetchJson(`${API_BASE}/v1/state`, {}, '加载状态');
+                const [nextState, fitnessData] = await Promise.all([
+                    fetchJson(`${API_BASE}/v1/state`, {}, '加载状态'),
+                    fetchJson(`${API_BASE}/v1/fund-fitness`, {}, '加载适配评分').catch(() => ({ scores: {} }))
+                ]);
+                state = nextState;
+                fitnessScores = fitnessData?.scores && typeof fitnessData.scores === 'object'
+                    ? fitnessData.scores
+                    : {};
                 render();
+                writeDashboardCache();
             } catch (e) {
                 showStatus('加载失败: ' + e.message, 'error');
             }
@@ -1134,6 +1597,7 @@
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(state)
                 }, '保存状态');
+                writeDashboardCache();
             } catch (e) {
                 showStatus('保存失败: ' + e.message, 'error');
             }
@@ -1146,6 +1610,244 @@
             } catch {
                 return '';
             }
+        }
+
+        function isFundCode(code) {
+            return /^\d{6}$/.test(String(code || '').trim());
+        }
+
+        function getJdFundLink(code) {
+            if (!isFundCode(code)) return '';
+            const fundUrl = `https://lc.jr.jd.com/finance/funddetail/home/?fundCode=${code}&fundUtmSource=340&fundUtmParam=AppShare`;
+            return `jdmobile://share?jumpType=7&jumpUrl=${encodeURIComponent(fundUrl)}`;
+        }
+
+        function getKnownFundName(code) {
+            const valuationName = valuations[code]?.fund_name;
+            if (typeof valuationName === 'string' && valuationName.trim()) return valuationName.trim();
+
+            const hostHolding = hostHoldings.find(holding => holding.code === code);
+            if (hostHolding?.name) return hostHolding.name;
+
+            return fundNameCache[code] || '';
+        }
+
+        function resolveFundName(code) {
+            if (!isFundCode(code)) return Promise.resolve('');
+
+            const knownName = getKnownFundName(code);
+            if (knownName) return Promise.resolve(knownName);
+            if (Object.prototype.hasOwnProperty.call(fundNameCache, code)) {
+                return Promise.resolve(fundNameCache[code] || '');
+            }
+
+            if (!pendingFundNameLookups[code]) {
+                pendingFundNameLookups[code] = getFundName(code)
+                    .then((name) => {
+                        const normalizedName = typeof name === 'string' ? name.trim() : '';
+                        fundNameCache[code] = normalizedName;
+                        return normalizedName;
+                    })
+                    .finally(() => {
+                        delete pendingFundNameLookups[code];
+                    });
+            }
+
+            return pendingFundNameLookups[code];
+        }
+
+        function renderFundNameLink(code, name) {
+            const fundName = typeof name === 'string' ? name.trim() : '';
+            if (!fundName) return '<span class="fund-name-placeholder">名称待获取</span>';
+
+            const shortName = fundName.slice(0, 5);
+            const remainingName = fundName.slice(5);
+            const title = escapeHtml(fundName);
+            if (!isFundCode(code)) {
+                return `<span class="fund-name-placeholder" title="${title}">${escapeHtml(fundName)}</span>`;
+            }
+
+            return `<a class="fund-name-link" href="${getJdFundLink(code)}" title="${title}" onclick="event.stopPropagation()">${escapeHtml(shortName)}</a>${remainingName ? `<span class="fund-name-rest">${escapeHtml(remainingName)}</span>` : ''}`;
+        }
+
+        function renderQuickAddBar() {
+            const holdingButtons = hostHoldings.map((holding) => {
+                const label = holding.name ? `${holding.code} ${holding.name}` : holding.code;
+                return `<button type="button" class="quick-add-holding" onclick="selectHostHolding('${holding.code}')" title="${escapeHtml(label)}">${escapeHtml(label)}</button>`;
+            }).join('');
+            const importSection = isEmbedded
+                ? `<div class="quick-add-imports">
+                    <span class="quick-add-import-label">从持仓导入：</span>
+                    ${holdingButtons || '<span class="quick-add-host-empty">暂无可导入持仓</span>'}
+                </div>`
+                : '';
+
+            return `<div class="add-position-bar">
+                <div class="quick-add-collapse-header">
+                    <span>录入基金</span>
+                    <button type="button" onclick="toggleQuickAddPanel()" aria-expanded="${!quickAddCollapsed}" title="展开或收起录入基金">${quickAddCollapsed ? '⌄' : '⌃'}</button>
+                </div>
+                <div id="quickAddContent" class="quick-add-content${quickAddCollapsed ? ' is-collapsed' : ''}">
+                    <div class="quick-add-main">
+                        <span class="quick-add-label">快速录入：</span>
+                        <input type="text" id="quickAddCode" placeholder="6位代码" maxlength="6" inputmode="numeric" autocomplete="off" oninput="handleQuickAddCodeInput()" onkeydown="handleQuickAddKeydown(event)">
+                        <span id="quickAddName" class="quick-add-name" aria-live="polite">输入基金代码后显示名称</span>
+                        <button class="btn-success" onclick="quickAddPosition()" style="padding:6px 12px;font-size:12px;border:none;border-radius:4px;cursor:pointer;">录入买入</button>
+                    </div>
+                    ${importSection}
+                </div>
+            </div>`;
+        }
+
+        function toggleQuickAddPanel() {
+            quickAddCollapsed = !quickAddCollapsed;
+            const content = document.getElementById('quickAddContent');
+            const toggle = document.querySelector('.quick-add-collapse-header button');
+            if (content) content.classList.toggle('is-collapsed', quickAddCollapsed);
+            if (toggle) {
+                toggle.textContent = quickAddCollapsed ? '⌄' : '⌃';
+                toggle.setAttribute('aria-expanded', String(!quickAddCollapsed));
+            }
+        }
+
+        function toggleSectorCollapse(sectorIndex) {
+            const sector = document.getElementById(`sector-${sectorIndex}`);
+            const toggle = sector?.querySelector('.sector-collapse-toggle');
+            if (!sector) return;
+            const isCollapsed = sector.classList.toggle('is-collapsed');
+            if (toggle) toggle.setAttribute('aria-expanded', String(!isCollapsed));
+        }
+
+        async function handleValuationFundCodeInput(sectorIndex) {
+            const form = document.querySelector(`#sector-${sectorIndex} .add-row`);
+            const codeInput = form?.querySelector('input[name="code"]');
+            const aliasInput = form?.querySelector('input[name="alias"]');
+            if (!codeInput || !aliasInput) return;
+
+            const code = codeInput.value.replace(/\D/g, '').slice(0, 6);
+            if (codeInput.value !== code) codeInput.value = code;
+            const sequence = (valuationAddLookupSequence[sectorIndex] || 0) + 1;
+            valuationAddLookupSequence[sectorIndex] = sequence;
+            aliasInput.value = '';
+            aliasInput.placeholder = '名称（自动获取）';
+
+            if (!isFundCode(code)) return;
+            const knownName = getKnownFundName(code);
+            if (knownName) {
+                aliasInput.value = knownName;
+                return;
+            }
+
+            aliasInput.placeholder = '正在查询名称...';
+            const name = await resolveFundName(code);
+            if (valuationAddLookupSequence[sectorIndex] !== sequence || codeInput.value.trim() !== code) return;
+            aliasInput.value = name || '';
+            aliasInput.placeholder = name ? '名称（自动获取）' : '未找到名称，可手动填写';
+        }
+
+        function updateQuickAddName(text, state = '') {
+            const nameEl = document.getElementById('quickAddName');
+            if (!nameEl) return;
+            nameEl.className = `quick-add-name${state ? ` is-${state}` : ''}`;
+            nameEl.textContent = text;
+        }
+
+        function selectHostHolding(code) {
+            const input = document.getElementById('quickAddCode');
+            if (!input || !isFundCode(code)) return;
+
+            input.value = code;
+            updateQuickAddName(getKnownFundName(code) || '名称待获取');
+            input.focus();
+        }
+
+        function handleQuickAddKeydown(event) {
+            if (event.key !== 'Enter') return;
+            event.preventDefault();
+            quickAddPosition();
+        }
+
+        async function handleQuickAddCodeInput() {
+            const input = document.getElementById('quickAddCode');
+            if (!input) return;
+
+            const code = input.value.replace(/\D/g, '').slice(0, 6);
+            if (input.value !== code) input.value = code;
+            const lookupSequence = ++quickAddLookupSequence;
+
+            if (!isFundCode(code)) {
+                updateQuickAddName(code ? '请输入6位基金代码' : '输入基金代码后显示名称', code ? 'missing' : '');
+                return;
+            }
+
+            const knownName = getKnownFundName(code);
+            if (knownName) {
+                updateQuickAddName(knownName);
+                return;
+            }
+
+            updateQuickAddName('正在查询基金名称...', 'loading');
+            const name = await resolveFundName(code);
+            if (lookupSequence !== quickAddLookupSequence || input.value.trim() !== code) return;
+            updateQuickAddName(name || '未找到基金名称', name ? '' : 'missing');
+        }
+
+        function normalizeHostHoldings(items) {
+            if (!Array.isArray(items)) return [];
+
+            const holdingsByCode = new Map();
+            for (const item of items) {
+                const code = String(item?.code || '').trim();
+                if (!isFundCode(code) || holdingsByCode.has(code)) continue;
+                const name = typeof item?.name === 'string' ? item.name.trim() : '';
+                holdingsByCode.set(code, { code, name });
+            }
+            return [...holdingsByCode.values()];
+        }
+
+        function handleHostMessage(event) {
+            if (!isEmbedded || event.source !== window.parent) return;
+            const data = event.data;
+            if (!data) return;
+
+            if (data.type === 'fund-app:grid-context') {
+                hostActive = data.active !== false;
+                if (data.theme === 'dark' || data.theme === 'light') {
+                    document.body.classList.toggle('embed-dark', data.theme === 'dark');
+                }
+                if (data.tab === 'valuation' || data.tab === 'strategy') {
+                    switchTab(data.tab, false);
+                }
+                if (hostActive) {
+                    startAutoRefresh();
+                } else {
+                    if (autoRefreshTimer) {
+                        clearTimeout(autoRefreshTimer);
+                        autoRefreshTimer = null;
+                    }
+                    if (refreshStatusTimer) {
+                        clearTimeout(refreshStatusTimer);
+                        refreshStatusTimer = null;
+                    }
+                }
+                return;
+            }
+
+            if (data.type !== 'fund-app:holdings') return;
+
+            const nextHostHoldings = normalizeHostHoldings(data.holdings);
+            const holdingsChanged = nextHostHoldings.length !== hostHoldings.length
+                || nextHostHoldings.some((holding, index) =>
+                    holding.code !== hostHoldings[index]?.code || holding.name !== hostHoldings[index]?.name
+                );
+            hostHoldings = nextHostHoldings;
+            if (holdingsChanged && hostActive && currentTab === 'strategy') {
+                loadStrategyPanel(true);
+            }
+        }
+
+        if (isEmbedded) {
+            window.addEventListener('message', handleHostMessage);
         }
 
         async function refreshAll() {
@@ -1193,6 +1895,7 @@
                 lastRefreshTime = new Date();
                 document.getElementById('updateTime').textContent =
                     `更新于 ${lastRefreshTime.toLocaleTimeString()}`;
+                writeDashboardCache();
             } catch (e) {
                 showStatus('刷新失败: ' + e.message, 'error');
             } finally {
@@ -1393,13 +2096,17 @@
         }
 
         function startAutoRefresh() {
-            if (autoRefreshTimer) return;
+            if (!hostActive || autoRefreshTimer) return;
             _scheduleNextRefresh();
             updateRefreshTimer();
         }
 
         function _scheduleNextRefresh(delayOverride = null) {
             if (autoRefreshTimer) clearTimeout(autoRefreshTimer);
+            if (!hostActive) {
+                autoRefreshTimer = null;
+                return;
+            }
             const interval = delayOverride ?? (isTradeTime() ? 30000 : 300000); // 交易时段30s，非交易5min
             autoRefreshTimer = setTimeout(async () => {
                 autoRefreshTimer = null;
@@ -1416,6 +2123,7 @@
         }
 
         function updateRefreshTimer() {
+            if (refreshStatusTimer) clearTimeout(refreshStatusTimer);
             const el = document.getElementById('refreshTimer');
             const dot = document.querySelector('.refresh-status .dot');
             const trading = isTradeTime();
@@ -1424,7 +2132,7 @@
             if (pauseReason) {
                 if (dot) dot.style.background = '#f59e0b';
                 el.textContent = `⏸ ${pauseReason} · 自动刷新已暂停`;
-                setTimeout(updateRefreshTimer, 1000);
+                refreshStatusTimer = setTimeout(updateRefreshTimer, 1000);
                 return;
             }
 
@@ -1446,7 +2154,7 @@
                     el.textContent = '⏸ 非交易时段';
                 }
             }
-            setTimeout(updateRefreshTimer, 1000);
+            refreshStatusTimer = setTimeout(updateRefreshTimer, 1000);
         }
 
         // ============ 渲染界面（估值看板） ============
@@ -1478,13 +2186,14 @@
                     <div class="sector-header">
                         <span class="sector-name">${sector.name}</span>
                         <div style="display:flex;gap:4px;">
+                            <button class="sector-collapse-toggle" type="button" onclick="toggleSectorCollapse(${si})" aria-expanded="true" title="展开或收起基金列表">⌃</button>
                             <button class="btn-export" onclick="exportSectorImage(${si})" title="导出图片">📷</button>
                             <button class="btn-export" onclick="deleteSector(${si})" title="删除板块" style="color:#ef4444;">🗑</button>
                         </div>
                     </div>
                     ${sector.funds.length === 0 ?
                         '<div style="padding:20px;text-align:center;color:#9ca3af;font-size:12px;">暂无基金</div>' :
-                        `<table class="fund-table">
+                        `<div class="fund-table-scroll"><table class="fund-table">
                             <thead>
                                 <tr>
                                     <th>代码</th>
@@ -1502,10 +2211,10 @@
                                     return renderFundRow(fund, si, fi);
                                 }).join('')}
                             </tbody>
-                        </table>`
+                        </table></div>`
                     }
                     <div class="add-row">
-                        <input type="text" name="code" placeholder="代码" maxlength="6">
+                        <input type="text" name="code" placeholder="代码" maxlength="6" inputmode="numeric" autocomplete="off" oninput="handleValuationFundCodeInput(${si})">
                         <input type="text" name="alias" placeholder="名称（自动获取）">
                         <button class="btn-primary" onclick="addFund(${si})">添加</button>
                     </div>
@@ -1518,6 +2227,7 @@
             let changeText = '--';
             let changeClass = 'flat';
             let confidence = '--';
+            let confidenceClass = 'low';
             let weekText = '--';
             let weekClass = 'flat';
             let monthText = '--';
@@ -1525,6 +2235,19 @@
             let displayName = fund.alias || '';
             let needsEtfLink = false;
             let isNav = false;
+            let fitnessBadge = '';
+
+            const fitness = fitnessScores[fund.code];
+            const fitnessScore = Number(fitness?.score);
+            if (Number.isFinite(fitnessScore)) {
+                const fitnessClass = fitnessScore >= 70 ? 'grade-A'
+                    : fitnessScore >= 55 ? 'grade-B'
+                    : fitnessScore >= 40 ? 'grade-C'
+                    : fitnessScore >= 25 ? 'grade-D'
+                    : 'grade-E';
+                const grade = typeof fitness?.grade === 'string' ? fitness.grade : '';
+                fitnessBadge = `<span class="fitness-badge ${fitnessClass}" title="适配评分 ${Math.round(fitnessScore)}分${grade ? ` (${escapeHtml(grade)})` : ''}">${Math.round(fitnessScore)}</span>`;
+            }
 
             if (val) {
                 if (val.estimation_change !== null && val.estimation_change !== undefined) {
@@ -1543,7 +2266,11 @@
                     monthText = (mc >= 0 ? '+' : '') + mc.toFixed(2) + '%';
                     monthClass = mc > 0 ? 'up' : mc < 0 ? 'down' : 'flat';
                 }
-                confidence = ((val.calibrated_confidence ?? val.confidence) * 100).toFixed(0) + '%';
+                const confidenceScore = Number(val.calibrated_confidence ?? val.confidence);
+                if (Number.isFinite(confidenceScore)) {
+                    confidence = (confidenceScore * 100).toFixed(0) + '%';
+                    confidenceClass = confidenceScore >= 0.7 ? 'high' : confidenceScore >= 0.4 ? 'medium' : 'low';
+                }
                 if (!displayName && val.fund_name) {
                     displayName = val.fund_name;
                 }
@@ -1571,7 +2298,7 @@
 
             return `
                 <tr>
-                    <td class="td-code" onclick="showNavHistory('${fund.code}')" title="点击查看近期涨跌">${fund.code}</td>
+                    <td class="td-code" onclick="showNavHistory('${fund.code}')" title="点击查看近期涨跌"><span>${fund.code}</span>${fitnessBadge}<span class="code-confidence ${confidenceClass}">${confidence}</span></td>
                     <td class="td-name" title="${displayName}">${displayName}</td>
                     <td class="td-change ${changeClass}" style="white-space:nowrap;">${changeText}${navMark}</td>
                     <td class="td-change ${weekClass}">${weekText}</td>
@@ -1729,7 +2456,12 @@
             }
         }
 
-        async function loadStrategyPanel() {
+        async function loadStrategyPanel(force = true) {
+            const panel = document.getElementById('strategyPanel');
+            const hasCachedContent = Boolean(panel.querySelector('.signal-card, .strategy-group'));
+            if (!force && hasCachedContent && Date.now() - lastStrategyLoadAt < STRATEGY_CACHE_TTL_MS) {
+                return;
+            }
             if (strategyLoadPromise) {
                 return strategyLoadPromise;
             }
@@ -1759,6 +2491,29 @@
                 const signals = sigData.signals || [];
                 const funds = posData.funds || {};
 
+                // Some low-frequency positions do not arrive with a name. Resolve those names in the
+                // background: a slow name endpoint must never block the complete strategy panel.
+                const strategyCodes = new Set();
+                for (const [fundKey, fund] of Object.entries(funds)) {
+                    const realCode = fundKey.split('__')[0];
+                    if (!isFundCode(realCode)) continue;
+                    const positionName = typeof fund?.fund_name === 'string' ? fund.fund_name.trim() : '';
+                    if (positionName) fundNameCache[realCode] = positionName;
+                    strategyCodes.add(realCode);
+                }
+                for (const signal of signals) {
+                    const realCode = String(signal.fund_code || '').split('__')[0];
+                    if (isFundCode(realCode)) strategyCodes.add(realCode);
+                }
+                const missingNameCodes = [...strategyCodes].filter(code =>
+                    !getKnownFundName(code) && !Object.prototype.hasOwnProperty.call(fundNameCache, code)
+                );
+                if (missingNameCodes.length > 0) {
+                    Promise.all(missingNameCodes.map(code => resolveFundName(code))).then((names) => {
+                        if (names.some(Boolean)) loadStrategyPanel();
+                    });
+                }
+
                 const pauseReason = getRefreshPauseReason();
                 if (hadContent && pauseReason) {
                     showStatus(`信号已获取，${pauseReason}，页面暂不重绘`, 'info');
@@ -1772,11 +2527,7 @@
                             <p>暂无持仓和信号数据</p>
                             <p style="font-size:11px;color:#9ca3af;margin-top:8px;">在实时估值中观察基金，然后在此录入持仓</p>
                         </div>
-                        <div class="add-position-bar">
-                            <span>快速添加持仓基金：</span>
-                            <input type="text" id="quickAddCode" placeholder="6位代码" maxlength="6">
-                            <button class="btn-success" onclick="quickAddPosition()" style="padding:6px 12px;font-size:12px;border:none;border-radius:4px;cursor:pointer;">录入买入</button>
-                        </div>
+                        ${renderQuickAddBar()}
                     `;
                     return;
                 }
@@ -1784,7 +2535,8 @@
                 const pb = sigData.portfolio_budget;
                 const cashReserveRatio = pb ? pb.cash_reserve_ratio : 0.30;
 
-                let html = `<div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
+                let html = `${renderQuickAddBar()}
+                    <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:10px;">
                     <div style="display:flex;align-items:center;">
                         <span style="font-size:12px;color:#6b7280;">信号生成于 ${sigData.generated_at || '--'}</span>
                         <div class="regime-inline" id="regimeInline">
@@ -1919,8 +2671,9 @@
                         ownerTag = parts[1] || '';
                     }
 
-                    const fundName = fundPos?.fund_name || valuations[realCode]?.fund_name || '';
-                    const ownerBadge = ownerTag ? `<span style="margin-left:6px;background:#e0e7ff;color:#4338ca;font-size:10px;font-weight:600;padding:1px 6px;border-radius:3px;">${ownerTag}</span>` : '';
+                    const fundName = fundPos?.fund_name || getKnownFundName(realCode) || '';
+                    const ownerBadge = ownerTag ? `<span style="margin-left:6px;background:#e0e7ff;color:#4338ca;font-size:10px;font-weight:600;padding:1px 6px;border-radius:3px;">${escapeHtml(ownerTag)}</span>` : '';
+                    const fundNameMarkup = renderFundNameLink(realCode, fundName);
                     // 使用 encodeURIComponent 确保复合键在 URL 中安全
                     const safeCode = encodeURIComponent(code);
 
@@ -1944,9 +2697,9 @@
                     let html = `<div class="signal-card" data-fund-key="${escapeHtml(code)}">
                         <div class="signal-card-header">
                             <div class="fund-info">
-                                <span class="code" onclick="showNavHistory('${realCode}')">${realCode}</span>
+                                <span class="code" onclick="showNavHistory('${realCode}')">${escapeHtml(realCode)}</span>
                                 ${ownerBadge}${fitBadge}${regimeBadge}
-                                ${fundName ? `<span style="margin-left:6px;font-weight:400;color:#6b7280;font-size:12px;">${fundName}</span>` : ''}
+                                ${fundNameMarkup}
                             </div>
                             <div style="display:flex;align-items:center;gap:6px;">
                                 <span class="signal-badge ${badgeCls}">${sig.signal_name}</span>
@@ -2195,9 +2948,7 @@
                             </div>
                         </div>`;
                         if (ma.decision_note) {
-                            html += `<div style="margin:2px 0 2px;padding:4px 10px;background:#eff6ff;border:1px solid #bfdbfe;border-radius:4px;font-size:10px;color:#1e40af;line-height:1.5;">
-                                ${ma.decision_note}
-                            </div>`;
+                            html += `<div class="decision-note">${escapeHtml(ma.decision_note)}</div>`;
                         }
                         html += `</div>`;
                     }
@@ -2344,6 +3095,7 @@
                     return html;
                 }
                 panel.innerHTML = html;
+                writeStrategyPanelCache(panel);
                 restorePanelView(panel, viewState);
                 lastRefreshTime = new Date();
                 document.getElementById('updateTime').textContent =
@@ -2368,10 +3120,13 @@
 
         function quickAddPosition() {
             const input = document.getElementById('quickAddCode');
+            if (!input) return;
             const code = input.value.trim();
-            if (/^\d{6}$/.test(code)) {
+            if (isFundCode(code)) {
                 showBuyModal(code);
                 input.value = '';
+                ++quickAddLookupSequence;
+                updateQuickAddName('输入基金代码后显示名称');
             } else {
                 showStatus('请输入6位基金代码', 'error');
             }
@@ -2473,7 +3228,7 @@
             delete _modal.dataset.pendingRebuyId;
 
             const val = valuations[realCode];
-            const name = val?.fund_name || realCode;
+            const name = val?.fund_name || getKnownFundName(realCode) || realCode;
             const ownerLabel = ownerTag ? ` [${ownerTag}]` : '';
             document.getElementById('buyModalTitle').textContent = `录入买入 · ${name}${ownerLabel}`;
 
@@ -2487,6 +3242,14 @@
 
             document.getElementById('buyModal').classList.add('show');
             document.getElementById('buyAmount').focus();
+
+            if (name === realCode && isFundCode(realCode)) {
+                resolveFundName(realCode).then((resolvedName) => {
+                    if (!resolvedName || !_modal.classList.contains('show')) return;
+                    if (document.getElementById('buyFundCode').value !== realCode) return;
+                    document.getElementById('buyModalTitle').textContent = `录入买入 · ${resolvedName}${ownerLabel}`;
+                });
+            }
         }
 
         async function submitBuy() {
@@ -3460,11 +4223,14 @@
         }, true);
 
         window.onload = async () => {
+            const restoredDashboard = restoreDashboardCache();
+            restoreStrategyPanelCache();
             await loadState();
-            if (state.sectors.some(s => s.funds.length > 0)) {
+            if (!restoredDashboard && currentTab === 'valuation' && state.sectors.some(s => s.funds.length > 0)) {
                 await refreshAll();
             }
-            startAutoRefresh();
+            switchTab(currentTab, false);
+            if (hostActive) startAutoRefresh();
         };
 
         // 回车/ESC 键处理

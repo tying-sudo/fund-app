@@ -182,6 +182,7 @@ function initChart() {
       layout: {
         background: { type: ColorType.Solid, color: '#ffffff' },
         textColor: '#999999',
+        attributionLogo: false,
       },
       grid: {
         vertLines: { color: '#f5f5f5' },

@@ -1,7 +1,7 @@
 {
   "name": "fund-app",
   "private": true,
-  "version": "1.0.0",
+  "version": "1.0.58",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -9,6 +9,8 @@
     "dev:all": "concurrently \"npm run dev:api\" \"npm run dev\"",
     "build": "vite build",
     "test:holding": "node --experimental-strip-types scripts/verify-holding-settlement.mjs",
+    "test:grid-trade-import": "node --experimental-strip-types --test src/utils/gridTradeImport.test.ts",
+    "test:grid-strategy-order": "node --experimental-strip-types --test src/utils/gridStrategyOrder.test.ts",
     "preview": "vite preview",
     "update-funds": "node scripts/fetch-fund-list.mjs",
     "cap:init": "npx cap init",
@@ -21,8 +23,10 @@
     "@capacitor/app": "^7.1.1",
     "@capacitor/core": "^7.0.0",
     "@vant/use": "^1.6.0",
+    "d3-force": "^3.0.0",
     "lightweight-charts": "^5.1.0",
     "pinia": "^3.0.0",
+    "sortablejs": "^1.15.7",
     "tesseract.js": "^7.0.0",
     "vant": "^4.9.0",
     "vue": "^3.5.24",
@@ -30,7 +34,9 @@
   },
   "devDependencies": {
     "@capacitor/cli": "^7.0.0",
+    "@types/d3-force": "^3.0.10",
     "@types/node": "^24.10.1",
+    "@types/sortablejs": "^1.15.9",
     "@vant/auto-import-resolver": "^1.2.0",
     "@vitejs/plugin-vue": "^6.0.1",
     "@vue/tsconfig": "^0.8.1",

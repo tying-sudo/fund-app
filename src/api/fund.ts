@@ -4,7 +4,7 @@
 
 import type { FundEstimate, FundInfo, NetValueRecord, StockHolding, MarketIndex, FundRankItem, FundFeeInfo, FundShareClass } from '@/types/fund'
 import { API_BASE_URL, USE_PROXY } from '@/config/api'
-import { fetchFundEstimateFast } from './fundFast'
+import { fetchFundEstimateFast, fetchFundEstimatesBatch } from './fundFast'
 
 // [WHAT] 带超时的 fetch 封装
 async function fetchWithTimeout(url: string, options: RequestInit = {}, timeoutMs: number = 5000): Promise<Response> {
@@ -58,11 +58,8 @@ export async function fetchFundEstimates(
 ): Promise<(FundEstimate | null)[]> {
   if (codes.length === 0) return []
 
-  // [WHAT] 直接使用 JSONP 逐个获取，通过 Vite proxy 代理东方财富接口
-  const promises = codes.map((code) =>
-    fetchFundEstimateFast(code).catch(() => null)
-  )
-  return Promise.all(promises)
+  const estimates = await fetchFundEstimatesBatch(codes)
+  return codes.map(code => estimates.get(code) || null)
 }
 
 /**
@@ -385,7 +382,31 @@ export async function fetchNetValueHistory(
  *        4. 批量获取股票实时涨跌幅
  * @param code 基金代码
  */
-export function fetchStockHoldings(code: string): Promise<StockHolding[]> {
+export async function fetchStockHoldings(code: string): Promise<StockHolding[]> {
+  try {
+    const response = await fetchWithTimeout(`${API_BASE_URL}/api/funds/${code}/holdings?quotes=1`, {}, 7000)
+    if (response.ok) {
+      const payload = await response.json()
+      const holdings: StockHolding[] = (payload?.data?.holdings || []).map((item: any) => ({
+        stockCode: item.stockCode || '',
+        stockName: item.stockName || '',
+        holdingRatio: Number(item.holdingRatio) || 0,
+        holdingAmount: item.holdingMarketValue ? String(item.holdingMarketValue) : '0',
+        changeFromLast: '--',
+        marketPrefix: item.marketPrefix || '',
+        dayChange: Number.isFinite(Number(item.dayChange)) ? Number(item.dayChange) : undefined,
+        quarterChange: Number.isFinite(Number(item.quarterChange)) ? Number(item.quarterChange) : null,
+        sector: typeof item.sector === 'string' && item.sector ? item.sector : null
+      })).filter((item: StockHolding) => item.stockCode && item.stockName && item.holdingRatio > 0)
+      if (holdings.length > 0) return holdings
+    }
+  } catch {
+    // 后端不可用时继续使用原 JSONP 流程。
+  }
+  return fetchStockHoldingsFromJsonp(code)
+}
+
+function fetchStockHoldingsFromJsonp(code: string): Promise<StockHolding[]> {
   return new Promise((resolve) => {
     const timeout = setTimeout(() => {
       cleanup()
@@ -473,7 +494,9 @@ function fetchPreviousHoldings(
     const timeout = setTimeout(() => {
       cleanup()
       resolve(holdings)
-    }, 8000)
+    // The chart is supplementary to the detail page. Fall back promptly when
+    // the external JSONP endpoint stalls instead of holding its loading state.
+    }, 3500)
 
     ;(window as any).apidata = undefined
 
@@ -887,28 +910,28 @@ const timeShareCache: Map<string, { data: TimeShareData[]; timestamp: number }> 
  * @param code 基金代码
  */
 export async function fetchTimeShareData(code: string): Promise<TimeShareData[]> {
-  // [EDGE] 5秒内返回缓存
+  // Keep the client cache shorter than the backend's one-second curve write.
+  // The server owns persistence, finalization, and source validation.
   const cached = timeShareCache.get(code)
-  if (cached && Date.now() - cached.timestamp < 5000) {
+  if (cached && Date.now() - cached.timestamp < 500) {
     return cached.data
   }
 
-  // [WHAT] 方案1：通过东方财富移动端API获取分时估值趋势
   try {
-    const result = await fetchTimeShareFromMobile(code)
-    if (result.length > 0) {
-      timeShareCache.set(code, { data: result, timestamp: Date.now() })
-      return result
-    }
-  } catch {}
-
-  // [WHAT] 方案2：通过JSONP获取单点估值，结合历史净值生成分时走势
-  try {
-    const result = await fetchTimeShareFromJSONP(code)
-    if (result.length > 0) {
-      timeShareCache.set(code, { data: result, timestamp: Date.now() })
-      return result
-    }
+    const response = await fetchWithTimeout(`${API_BASE_URL}/api/funds/${encodeURIComponent(code)}/intraday`, {
+      cache: 'no-store'
+    }, 5_000)
+    if (!response.ok) return []
+    const payload = await response.json()
+    const result = (payload?.data?.points || [])
+      .map((point: any) => ({
+        time: String(point?.time || ''),
+        value: Number(point?.value),
+        change: Number(point?.change)
+      }))
+      .filter((point: TimeShareData) => point.time && Number.isFinite(point.value) && Number.isFinite(point.change))
+    timeShareCache.set(code, { data: result, timestamp: Date.now() })
+    return result
   } catch {}
 
   return []
@@ -1670,46 +1693,66 @@ export interface AccumulatedReturnData {
 export async function fetchAccumulatedReturn(
   code: string, 
   range = '1n', 
-  indexCode = '000300'
+  _indexCode = '000300'
 ): Promise<AccumulatedReturnData[]> {
-  return new Promise((resolve) => {
-    const callbackName = `acc_${Date.now()}_${Math.random().toString(36).slice(2)}`
-    const timeout = setTimeout(() => {
-      cleanup()
-      resolve([])
-    }, 15000)
-
-    ;(window as any)[callbackName] = (data: any) => {
-      cleanup()
-      if (!data || !data.Datas) {
-        resolve([])
-        return
-      }
-      
-      const result: AccumulatedReturnData[] = data.Datas.map((item: any) => ({
-        date: item.PDATE,
-        fundReturn: parseFloat(item.YIELD) || 0,
-        indexReturn: parseFloat(item.INDEXYIELD) || 0,
-        avgReturn: parseFloat(item.FUNDTYPEYIELD) || 0
-      }))
-      
-      resolve(result)
+  const rangeDays: Record<string, number> = { y: 31, '3y': 93, '6y': 186 }
+  if (!rangeDays[range]) return []
+  try {
+    const response = await fetchWithTimeout(`${API_BASE_URL}/api/funds/${encodeURIComponent(code)}/performance?range=${encodeURIComponent(range)}`, {
+      cache: 'no-store'
+    }, 5_000)
+    if (response.ok) {
+      const payload = await response.json()
+      const cached = (payload?.data?.points || [])
+        .map((item: any) => ({
+          date: String(item?.date || ''),
+          fundReturn: Number(item?.fundReturn),
+          avgReturn: item?.avgReturn === null ? Number.NaN : Number(item?.avgReturn),
+          indexReturn: item?.indexReturn === null ? Number.NaN : Number(item?.indexReturn)
+        }))
+        .filter((item: AccumulatedReturnData) => item.date && Number.isFinite(item.fundReturn))
+      if (cached.length >= 2) return cached
     }
+  } catch {
+    // Retain the established read-only upstream fallback for a backend outage.
+  }
 
-    function cleanup() {
-      clearTimeout(timeout)
-      delete (window as any)[callbackName]
-      const script = document.getElementById(callbackName)
-      if (script) document.body.removeChild(script)
-    }
+  // Backend failure only: pingzhongdata remains a read-only fallback.
+  try {
+    const baseUrl = USE_PROXY ? `${API_BASE_URL}/tiantian` : 'https://fund.eastmoney.com'
+    const response = await fetchWithTimeout(`${baseUrl}/pingzhongdata/${code}.js?v=${Date.now()}`, {}, 10000)
+    if (!response.ok) return []
+    const source = await response.text()
+    const matched = source.match(/var\s+Data_grandTotal\s*=\s*(.*?);/s)
+    if (!matched?.[1]) return []
+    const series = JSON.parse(matched[1]) as Array<{ name?: string; data?: Array<[number, number]> }>
+    const fund = series[0]?.data || []
+    const average = series.find(item => item.name?.includes('同类'))?.data || series[1]?.data || []
+    const index = series.find(item => item.name?.includes('沪深300'))?.data || series[2]?.data || []
+    if (fund.length < 2) return []
 
-    const script = document.createElement('script')
-    script.id = callbackName
-    script.src = `https://fundmobapi.eastmoney.com/FundMNewApi/FundVPageAcc?callback=${callbackName}&FCODE=${code}&RANGE=${range}&INDEXCODE=${indexCode}&_=${Date.now()}`
-    script.onerror = () => {
-      cleanup()
-      resolve([])
+    const days = rangeDays[range]
+    // The comparison source currently contains about six months. Returning no
+    // data for longer ranges lets the caller use complete NAV history instead
+    // of presenting a six-month curve under a one-year label.
+    if (!days) return []
+    const latestTime = fund.at(-1)?.[0] || 0
+    const cutoff = latestTime - days * 24 * 60 * 60 * 1000
+    const filterAndRebase = (items: Array<[number, number]>) => {
+      const filtered = items.filter(item => item[0] >= cutoff)
+      const base = filtered[0]?.[1] || 0
+      return new Map(filtered.map(item => [item[0], item[1] - base]))
     }
-    document.body.appendChild(script)
-  })
+    const fundMap = filterAndRebase(fund)
+    const averageMap = filterAndRebase(average)
+    const indexMap = filterAndRebase(index)
+    return [...fundMap.entries()].map(([timestamp, fundReturn]) => ({
+      date: new Date(timestamp).toISOString().slice(0, 10),
+      fundReturn,
+      avgReturn: averageMap.get(timestamp) ?? Number.NaN,
+      indexReturn: indexMap.get(timestamp) ?? Number.NaN
+    }))
+  } catch {
+    return []
+  }
 }

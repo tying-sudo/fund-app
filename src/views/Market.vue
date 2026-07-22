@@ -1,1019 +1,587 @@
 <script setup lang="ts">
 defineOptions({ name: 'Market' })
-// [WHAT] 行情页 - 参考meliauk/fund重构
-// 数据源：qt.gtimg.cn(指数+分时) / tyingfund.com(板块+排行)
 
-import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
+// Layout adapted for Vue from tying-sudo/tying-fund MarketTab (AGPL-3.0).
+// Market quotes are fetched exclusively from fund-app's public proxy.
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import {
-  fetchOTCRankAPI, fetchSectorAPI,
-  type OTCFundItem, type SectorInfo
-} from '@/api/tiantianApi'
-import { formatPercent, getChangeStatus } from '@/utils/format'
 import { showToast } from 'vant'
+import MarketIndexBoard from '@/components/MarketIndexBoard.vue'
+import SectorBubbleChart from '@/components/SectorBubbleChart.vue'
+import SectorFlowTracker from '@/components/SectorFlowTracker.vue'
+import { getBeijingDayAndMinutes } from '@/utils/tradingDate'
+import {
+  fetchAllMarketSectors,
+  fetchMarketOverview,
+  fetchMarketRanking,
+  type MarketFundRank,
+  type MarketIndex,
+  type MarketOverview,
+  type MarketRankTab,
+  type MarketSector
+  , type MarketSectorSort
+  , type MarketSectorType
+} from '@/api/market'
 
 const router = useRouter()
-
-// ========== 下拉刷新 ==========
+const overview = ref<MarketOverview | null>(null)
+const ranking = ref<MarketFundRank[]>([])
 const isRefreshing = ref(false)
-
-// ========== 大盘指数（参考 fund-ref MarketIndexAccordion）==========
-interface IndexCard {
-  name: string
-  code: string
-  price: number
-  change: number
-  changePercent: number
-}
-
-const DEFAULT_INDEX_CODES = ['sh000001', 'sz399001', 'sz399006']
-const marketIndices = ref<IndexCard[]>([])
-const indicesLoading = ref(true)
-
-// 分时走势缓存：code => SVG path d字符串
-const trendPaths = ref<Record<string, string>>({})
-
-/**
- * [REF] 从 qt.gtimg.cn 批量获取大盘指数实时数据
- * 对应 fund-ref/api/fund.js 的 fetchMarketIndices()
- */
-async function loadIndices() {
-  indicesLoading.value = true
-  try {
-    const codes = DEFAULT_INDEX_CODES.join(',')
-    const url = `https://qt.gtimg.cn/q=${codes}&_t=${Date.now()}`
-
-    // 使用 JSONP 方式（动态script注入）
-    const data = await jsonpFetch(url, DEFAULT_INDEX_CODES.map(c => `v_${c}`))
-
-    marketIndices.value = DEFAULT_INDEX_CODES.map((code, i) => {
-      const raw = data[`v_${code}`]
-      if (!raw) return { name: ['', '', ''][i] || '--', code, price: 0, change: 0, changePercent: 0 }
-      const parts = raw.split('~')
-      return {
-        name: parts[1] || '',
-        code,
-        price: parseFloat(parts[3]) || 0,
-        change: parseFloat(parts[31]) || 0,
-        changePercent: parseFloat(parts[32]) || 0
-      }
-    })
-
-    // 加载每个指数的分时迷你走势
-    for (const idx of marketIndices.value) {
-      if (idx.code) loadMinuteTrend(idx.code)
-    }
-  } catch (err) {
-    console.error('[Market] 加载指数失败:', err)
-    // fallback到后端API
-    tryLoadIndicesFallback()
-  } finally {
-    indicesLoading.value = false
-  }
-}
-
-/** fallback: 通过后端获取指数 */
-async function tryLoadIndicesFallback() {
-  try {
-    const res = await fetch('https://tyingfund.com/api/market-indices')
-    const json = await res.json()
-    const data = json.data || []
-    marketIndices.value = data.slice(0, 3).map((item: any) => ({
-      name: item.name || '',
-      code: item.code || '',
-      price: Number(item.price) || 0,
-      change: Number(item.change) || 0,
-      changePercent: Number(item.changePercent) || 0
-    }))
-  } catch {}
-}
-
-/**
- * [REF] 腾讯分时API - 获取当日真实迷你走势图
- * 对应 fund-ref MarketIndexAccordion.jsx MiniTrendLine 组件
- * API: https://web.ifzq.gtimg.cn/appstock/app/minute/query?_var=xxx&code=sh000001
- */
-function loadMinuteTrend(code: string) {
-  if (typeof window === 'undefined') return
-  const varName = `min_data_${code}_${Date.now()}`
-  const url = `https://web.ifzq.gtimg.cn/appstock/app/minute/query?_var=${varName}&code=${code}&_=${Date.now()}`
-
-  jsonpFetch(url, [varName], 10000).then((data) => {
-    const series = data[varName]
-    if (!series?.data?.[code]?.data?.data) return
-    const rows: string[] = series.data[code].data.data
-    if (!rows.length) return
-
-    // 解析 "HHMM price volume amount" 行
-    const points = rows.map((row: string) => {
-      const parts = String(row).split(' ')
-      const price = parseFloat(parts[1])
-      return Number.isFinite(price) ? price : null
-    }).filter((p): p is number => p !== null)
-
-    if (points.length < 2) return
-
-    const minP = Math.min(...points)
-    const maxP = Math.max(...points)
-    const span = maxP - minP || 1
-
-    const w = 70; const h = 26; const pad = 3
-    const innerW = w - 2 * pad; const innerH = h - 2 * pad
-
-    const pathPoints = points.map((p, i) => {
-      const t = points.length > 1 ? i / (points.length - 1) : 0
-      const x = pad + t * innerW
-      const norm = (p - minP) / span
-      const y = pad + (1 - norm) * innerH
-      return `${i === 0 ? 'M' : 'L'} ${x.toFixed(1)} ${Math.max(pad, Math.min(h - pad, y)).toFixed(1)}`
-    })
-
-    trendPaths.value[code] = pathPoints.join(' ')
-  }).catch(() => {
-    // 分时加载失败时忽略
-  })
-}
-
-/**
- * 通用 JSONP fetch 封装
- * 动态创建 script 标签，等待回调，返回全局变量数据
- */
-function jsonpFetch(url: string, varNames: string[], timeoutMs = 8000): Promise<Record<string, string>> {
-  return new Promise((resolve, reject) => {
-    if (typeof document === 'undefined') { reject(new Error('no document')); return }
-
-    const script = document.createElement('script')
-    script.src = url
-    script.async = true
-    let done = false
-
-    const cleanup = () => {
-      done = true
-      varNames.forEach(v => { try { delete (window as any)[v] } catch {} })
-      if (document.body.contains(script)) document.body.removeChild(script)
-    }
-
-    const timer = setTimeout(() => {
-      cleanup()
-      resolve({})
-    }, timeoutMs)
-
-    script.onload = () => {
-      if (done) return
-      const result: Record<string, string> = {}
-      for (const v of varNames) {
-        result[v] = (window as any)[v] || ''
-      }
-      cleanup()
-      resolve(result)
-    }
-    script.onerror = () => {
-      cleanup()
-      resolve({})
-    }
-
-    document.body.appendChild(script)
-  })
-}
-
-function getIndexColor(idx: IndexCard): string {
-  if (idx.changePercent > 0) return '#ff4d4f'
-  if (idx.changePercent < 0) return '#3fb950'
-  return 'var(--text-secondary)'
-}
-
-// ========== 热门板块（参考 fund-ref MarketTab）==========
-const sectors = ref<SectorInfo[]>([])
-const sectorsLoading = ref(true)
-const sectorTab = ref<'industry' | 'concept' | 'skill' | 'money'>('industry')
-
-// [REF] 板块排序模式：涨跌幅 / 资金流入
-const sectorSortMode = ref<'change_pct' | 'net_inflow'>('change_pct')
+const snapshotLoading = ref(true)
+const featuredSectorsLoading = ref(true)
+const rankingLoading = ref(true)
+const loadError = ref('')
+const activeRankTab = ref<MarketRankTab>('increase')
+const sectorFilter = ref<'all' | 'industry' | 'concept'>('industry')
+const sectorSort = ref<'changePercent' | 'netInflow'>('changePercent')
 const sectorSortOrder = ref<'asc' | 'desc'>('desc')
+const sectorsExpanded = ref(false)
+const allSectorsOpen = ref(false)
+const allSectorType = ref<MarketSectorType>('industry')
+const allSectorSort = ref<MarketSectorSort>('change')
+const allSectorOrder = ref<'asc' | 'desc'>('desc')
+const allSectors = ref<MarketSector[]>([])
+const allSectorsLoading = ref(false)
+const featuredSectors = ref<MarketSector[]>([])
+const activeMarketTool = ref<'index' | 'bubble' | 'tracker'>('index')
+const bubbleSectors = ref<MarketSector[]>([])
+const bubbleSectorsLoading = ref(false)
+const bubbleSectorsError = ref('')
+const trackerSectors = ref<MarketSector[]>([])
+const trackerSectorsLoading = ref(false)
+const trackerSectorsError = ref('')
+const indexManagerOpen = ref(false)
+const INDEX_STORAGE_KEY = 'market:index-watchlist:v1'
+const MAX_INDEX_COUNT = 6
+const DEFAULT_INDEX_CODES = ['000001', '399001', '399006', 'HSTECH', '000300', '000688']
+const INTRADAY_SECTOR_REFRESH_MS = 5_000
+const indexOrder = ref<string[]>([...DEFAULT_INDEX_CODES])
+const draggedIndexCode = ref<string | null>(null)
 
-// 资金流向：in=流入, out=流出（仅当 sortMode=net_inflow 时生效）
-const moneyFlowDirection = ref<'in' | 'out'>('out')
-const showMoneyFlowPopup = ref(false)
-
-const sectorTabs = [
-  { key: 'industry' as const, label: '行业' },
-  { key: 'concept' as const, label: '概念' },
-  { key: 'skill' as const, label: '技能组' },
-  { key: 'money' as const, label: '按资金流入', hasArrow: true }
+const rankTabs: Array<{ key: MarketRankTab; label: string }> = [
+  { key: 'increase', label: '股票涨幅' },
+  { key: 'decrease', label: '股票跌幅' },
+  { key: 'hot', label: '混合基金' },
+  { key: 'actual', label: '债券基金' }
 ]
 
-const moneyTabLabel = computed(() =>
-  moneyFlowDirection.value === 'in' ? '按资金流入' : '按资金流出'
-)
+const indices = computed<MarketIndex[]>(() => overview.value?.indices || [])
+const visibleIndices = computed<MarketIndex[]>(() => {
+  const byCode = new Map(indices.value.map(index => [index.code, index]))
+  return indexOrder.value.map(code => byCode.get(code)).filter((index): index is MarketIndex => Boolean(index)).slice(0, MAX_INDEX_COUNT)
+})
+const availableIndices = computed(() => indices.value.filter(index => !indexOrder.value.includes(index.code)))
+const sectors = computed<MarketSector[]>(() => featuredSectors.value)
+const sectorUpdatedAt = computed(() => formatTime(sectors.value[0]?.updatedAt))
+const bubbleIndex = computed<MarketIndex | null>(() => indices.value.find(index => index.code === '000001') || indices.value[0] || null)
+const bubbleUpdatedAt = computed(() => bubbleSectors.value[0]?.updatedAt || null)
 
-function selectMoneyFlow(dir: 'in' | 'out') {
-  moneyFlowDirection.value = dir
-  sectorTab.value = 'money'
-  sectorSortMode.value = 'net_inflow'
-  showMoneyFlowPopup.value = false
-  loadSectors()
+const filteredSectors = computed(() => {
+  return sectors.value.slice(0, sectorsExpanded.value ? 24 : 12)
+})
+
+function formatTime(value: string | null | undefined) {
+  if (!value) return '--'
+  const date = new Date(value)
+  return Number.isNaN(date.getTime()) ? '--' : date.toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit' })
 }
 
-function getSecMoney(sec: SectorInfo): number { return (sec as Record<string, unknown>).money as number || 0 }
-function getSecCap(sec: SectorInfo): string { return (sec as Record<string, unknown>).cap as string || '0.00' }
-
-// [REF] 切换排序模式（参考 MarketTab ToggleGroup）
-function toggleSectorSort(mode: 'change_pct' | 'net_inflow') {
-  if (sectorSortMode.value === mode) {
-    // 同模式切换排序方向
-    sectorSortOrder.value = sectorSortOrder.value === 'desc' ? 'asc' : 'desc'
-  } else {
-    sectorSortMode.value = mode
-    sectorSortOrder.value = 'desc'
-  }
-  loadSectors()
+function number(value: number | null | undefined, digits = 2) {
+  return value === null || value === undefined || !Number.isFinite(value) ? '--' : value.toFixed(digits)
 }
 
-async function loadSectors() {
-  sectorsLoading.value = true
+function percent(value: number | null | undefined) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '--'
+  return `${value > 0 ? '+' : ''}${value.toFixed(2)}%`
+}
+
+function valueClass(value: number | null | undefined) {
+  if (!value || !Number.isFinite(value)) return 'flat'
+  return value > 0 ? 'up' : 'down'
+}
+
+function formatFlow(value: number | null | undefined) {
+  if (value === null || value === undefined || !Number.isFinite(value)) return '--'
+  const amount = value / 100000000
+  return `${amount > 0 ? '+' : ''}${amount.toFixed(2)}亿`
+}
+
+function rankingDate(item: MarketFundRank) {
+  return item.navDate ? item.navDate.slice(5) : '--'
+}
+
+function persistIndexOrder() {
   try {
-    console.log('[Market] 加载行业板块数据...')
-    const data = await fetchSectorAPI(20)
-    
-    if (!data || data.length === 0) {
-      console.warn('[Market] 行业板块数据为空 - 可能是 API 不可用或非交易时间')
-      sectors.value = []
-      return
-    }
-    
-    console.log(`[Market] 获取到 ${data.length} 条板块数据`)
-
-    let mapped = data.map((s: any) => {
-      const dr = parseFloat(s.dayReturn) || 0
-      // [REF] 模拟资金流数据（亿）- 正值=流入, 负值=流出
-      // TODO: 后端提供真实 net_inflow 字段后替换此逻辑
-      const baseMoney = (Math.abs(dr) * 20 + Math.random() * 30) * (dr > 0 ? 1 : -1)
-      const moneyVal = moneyFlowDirection.value === 'out' ? -Math.abs(baseMoney) : Math.abs(baseMoney)
-
-      return {
-        code: s.code || '',
-        name: s.name || '',
-        dayReturn: dr,
-        money: moneyVal,
-        cap: Math.abs(moneyVal).toFixed(2),
-        streak: dr > 0 ? '连涨1天' : (dr < 0 ? '连跌1天' : ''),
-        funds: []
-      } as Record<string, unknown> as SectorInfo
-    })
-
-    // [REF] 按 sortMode 排序
-    mapped.sort((a: any, b: any) => {
-      let va: number, vb: number
-      if (sectorSortMode.value === 'net_inflow') {
-        va = a.money || 0; vb = b.money || 0
-      } else {
-        va = a.dayReturn || 0; vb = b.dayReturn || 0
-      }
-      return sectorSortOrder.value === 'desc' ? vb - va : va - vb
-    })
-
-    sectors.value = mapped
-  } catch (error) {
-    console.error('[Market] 加载行业板块失败:', error)
-    sectors.value = []
-  } finally {
-    sectorsLoading.value = false
-  }
-}
-
-// ========== 场外基金排行（参考 fund-ref MarketTab rankingTable）==========
-const otcFunds = ref<OTCFundItem[]>([])
-const otcLoading = ref(true)
-const otcPage = ref(1)
-const otcTotal = ref(0)
-const otcPages = computed(() => Math.min(5, Math.max(1, Math.ceil(otcTotal.value / 20))))
-
-// [REF] Tab对应参考项目的 activeTab: increase/decrease/hot/actual
-const fundTabs = [
-  { key: 'estimateUp', label: '估值涨幅', sort: 3, order: 'desc' as const },
-  { key: 'estimateDown', label: '估值跌幅', sort: 3, order: 'asc' as const },
-  { key: 'volume', label: '成交热度', sort: 4, order: 'desc' as const },
-  { key: 'actual', label: '实际涨幅', sort: 5, order: 'desc' as const }
-]
-const activeFundTab = ref('estimateUp')
-
-function getFundTag(fundName: string): string {
-  if (fundName.includes('QDII')) return 'QDII'
-  if (fundName.includes('ETF')) return 'ETF'
-  if (fundName.includes('LOF')) return 'LOF'
-  if (fundName.includes('股票型')) return '股票'
-  if (fundName.includes('混合型')) return '混合'
-  if (fundName.includes('债券型')) return '债券'
-  return ''
-}
-
-async function loadOTCFunds() {
-  otcLoading.value = true
-  try {
-    const currentTab = fundTabs.find(t => t.key === activeFundTab.value)
-    const { records, total } = await fetchOTCRankAPI(otcPage.value, 20)
-    otcTotal.value = total
-
-    // [REF] 字段映射对齐 fund-ref: bzdm=代码, jjjc=名称, jzzzl=最新涨幅, gszzl=估算涨幅, gxrq=日期, FType=类型
-    otcFunds.value = records.map((r: any) => ({
-      code: r.code || r.bzdm || '',
-      name: r.name || r.jjjc || '',
-      netValue: parseFloat(r.unitNav || r.dwjz) || 0,
-      dayReturn: parseFloat(r.jzzzl || r.dailyReturn) || 0,
-      estimateReturn: parseFloat(r.gszzl || r.yearReturn) || 0,
-      updateStatus: r.gxrq || r.date ? String(r.gxrq || r.date).replace(/\./g, '-') : ''
-    }))
+    localStorage.setItem(INDEX_STORAGE_KEY, JSON.stringify(indexOrder.value))
   } catch {
-    // 静默失败
-  } finally {
-    otcLoading.value = false
+    // Storage is optional; the default watchlist remains available.
   }
 }
 
-// ========== 流式实时更新 ==========
-let refreshTimer: ReturnType<typeof setInterval> | null = null
-const REFRESH_INTERVAL = 5000
-let lastRefreshTime = ref(Date.now())
-
-/** 静默刷新所有数据（不触发loading状态） */
-async function silentRefreshAll() {
+function loadIndexOrder() {
   try {
-    const results = await Promise.allSettled([
-      // 1. 刷新指数（重新获取价格+分时）
-      (async () => {
-        const codes = DEFAULT_INDEX_CODES.join(',')
-        const url = `https://qt.gtimg.cn/q=${codes}&_t=${Date.now()}`
-        const data = await jsonpFetch(url, DEFAULT_INDEX_CODES.map(c => `v_${c}`))
-        marketIndices.value = DEFAULT_INDEX_CODES.map((code, i) => {
-          const raw = data[`v_${code}`]
-          if (!raw) return marketIndices.value[i] || { name: '', code, price: 0, change: 0, changePercent: 0 }
-          const parts = raw.split('~')
-          return {
-            name: parts[1] || '',
-            code,
-            price: parseFloat(parts[3]) || 0,
-            change: parseFloat(parts[31]) || 0,
-            changePercent: parseFloat(parts[32]) || 0
-          }
-        })
-        // 更新分时走势
-        for (const idx of marketIndices.value) {
-          if (idx.code) loadMinuteTrend(idx.code)
-        }
-      })(),
-
-      // 2. 刷新板块
-      fetchSectorAPI(20).then(data => {
-        let mapped = data.map((s: any) => {
-          const dr = parseFloat(s.dayReturn) || 0
-          const baseMoney = (Math.abs(dr) * 20 + Math.random() * 30) * (dr > 0 ? 1 : -1)
-          const moneyVal = moneyFlowDirection.value === 'out' ? -Math.abs(baseMoney) : Math.abs(baseMoney)
-          return { code: s.code||'', name: s.name||'', dayReturn: dr, money: moneyVal, cap: Math.abs(moneyVal).toFixed(2), streak: '', funds: [] }
-        })
-        mapped.sort((a: any, b: any) => {
-          let va: number, vb: number
-          if (sectorSortMode.value === 'net_inflow') { va=a.money||0; vb=b.money||0 }
-          else { va=a.dayReturn||0; vb=b.dayReturn||0 }
-          return sectorSortOrder.value==='desc' ? vb-va : va-vb
-        })
-        sectors.value = mapped
-      }),
-
-      // 3. 刷新基金排行
-      fetchOTCRankAPI(otcPage.value, 20).then(({ records, total }) => {
-        otcTotal.value = total
-        otcFunds.value = records.map((r: any) => ({
-          code: r.code || '', name: r.name || '',
-          netValue: parseFloat(r.unitNav) || 0,
-          dayReturn: parseFloat(r.dailyReturn) || 0,
-          estimateReturn: parseFloat(r.yearReturn) || 0,
-          updateStatus: r.date ? String(r.date).replace(/\./g, '-') : ''
-        }))
-      })
-    ])
-
-    lastRefreshTime.value = Date.now()
-  } catch (e) {
-    console.warn('[Market] 静默刷新失败:', e)
+    const saved = JSON.parse(localStorage.getItem(INDEX_STORAGE_KEY) || '[]')
+    if (Array.isArray(saved)) {
+      const codes = saved.filter((code): code is string => typeof code === 'string')
+      if (codes.length) indexOrder.value = [...new Set(codes)].slice(0, MAX_INDEX_COUNT)
+    }
+  } catch {
+    indexOrder.value = [...DEFAULT_INDEX_CODES]
   }
 }
 
-function startRealtimeUpdate() {
-  stopRealtimeUpdate()
-  refreshTimer = setInterval(silentRefreshAll, REFRESH_INTERVAL)
-}
-function stopRealtimeUpdate() {
-  if (refreshTimer) { clearInterval(refreshTimer); refreshTimer = null }
+function addIndex(code: string) {
+  if (indexOrder.value.includes(code)) return
+  if (indexOrder.value.length >= MAX_INDEX_COUNT) {
+    showToast('最多显示 6 个指数')
+    return
+  }
+  indexOrder.value.push(code)
+  persistIndexOrder()
 }
 
-// ========== 通用方法 ==========
+function removeIndex(code: string) {
+  if (indexOrder.value.length <= 1) {
+    showToast('至少保留 1 个指数')
+    return
+  }
+  indexOrder.value = indexOrder.value.filter(item => item !== code)
+  persistIndexOrder()
+}
+
+function moveIndexTo(sourceCode: string, targetCode: string) {
+  if (sourceCode === targetCode) return
+  const source = indexOrder.value.indexOf(sourceCode)
+  const target = indexOrder.value.indexOf(targetCode)
+  if (source < 0 || target < 0) return
+  const next = [...indexOrder.value]
+  next.splice(source, 1)
+  next.splice(target, 0, sourceCode)
+  indexOrder.value = next
+  persistIndexOrder()
+}
+
+function startIndexDrag(code: string, event: DragEvent) {
+  draggedIndexCode.value = code
+  event.dataTransfer?.setData('text/plain', code)
+  if (event.dataTransfer) event.dataTransfer.effectAllowed = 'move'
+}
+
+function finishIndexDrag(targetCode: string) {
+  const sourceCode = draggedIndexCode.value
+  if (sourceCode) moveIndexTo(sourceCode, targetCode)
+  draggedIndexCode.value = null
+}
+
+function startIndexPointerDrag(code: string, event: PointerEvent) {
+  if (event.pointerType === 'mouse') return
+  draggedIndexCode.value = code
+  ;(event.currentTarget as HTMLElement).setPointerCapture?.(event.pointerId)
+}
+
+function moveIndexByPointer(event: PointerEvent) {
+  const sourceCode = draggedIndexCode.value
+  if (!sourceCode) return
+  const target = document.elementFromPoint(event.clientX, event.clientY)?.closest<HTMLElement>('[data-index-code]')?.dataset.indexCode
+  if (target) moveIndexTo(sourceCode, target)
+}
+
+function endIndexPointerDrag() {
+  draggedIndexCode.value = null
+}
+
+function restoreDefaultIndices() {
+  indexOrder.value = [...DEFAULT_INDEX_CODES]
+  persistIndexOrder()
+}
+
+let snapshotRequestId = 0
+async function loadSnapshot(silent = false) {
+  const requestId = ++snapshotRequestId
+  if (!silent) snapshotLoading.value = true
+  try {
+    const data = await fetchMarketOverview('gp')
+    if (requestId === snapshotRequestId) overview.value = data
+  } finally {
+    if (requestId === snapshotRequestId) snapshotLoading.value = false
+  }
+}
+
+let featuredRequestId = 0
+async function loadFeaturedSectors(silent = false) {
+  const requestId = ++featuredRequestId
+  if (!silent) featuredSectorsLoading.value = true
+  try {
+    const type: MarketSectorType = sectorFilter.value === 'concept' ? 'concept' : 'industry'
+    const sort: MarketSectorSort = sectorSort.value === 'netInflow' ? 'flow' : 'change'
+    const data = await fetchAllMarketSectors(type, sort, sectorSortOrder.value, 24)
+    if (requestId === featuredRequestId) featuredSectors.value = data
+  } finally {
+    if (requestId === featuredRequestId) featuredSectorsLoading.value = false
+  }
+}
+
+let rankingRequestId = 0
+async function loadRanking(silent = false) {
+  const requestId = ++rankingRequestId
+  if (!silent) rankingLoading.value = true
+  try {
+    const data = await fetchMarketRanking(activeRankTab.value)
+    if (requestId === rankingRequestId) ranking.value = data
+  } finally {
+    if (requestId === rankingRequestId) rankingLoading.value = false
+  }
+}
+
+async function loadMarket(silent = false) {
+  if (!silent) loadError.value = ''
+  const results = await Promise.allSettled([
+    loadSnapshot(silent),
+    loadFeaturedSectors(silent),
+    loadRanking(silent)
+  ])
+  const failed = results.filter((result): result is PromiseRejectedResult => result.status === 'rejected')
+  if (failed.length === results.length) {
+    const error = failed[0].reason
+    loadError.value = error instanceof Error ? error.message : '行情数据加载失败'
+  }
+}
+
 async function onRefresh() {
   isRefreshing.value = true
-  try {
-    await Promise.all([loadIndices(), loadSectors(), loadOTCFunds()])
-    showToast('刷新成功')
-    lastRefreshTime.value = Date.now()
-  } finally {
-    isRefreshing.value = false
-  }
+  await loadMarket()
+  isRefreshing.value = false
+  if (!loadError.value) showToast('行情已更新')
+}
+
+function selectSectorFilter(filter: 'all' | 'industry' | 'concept') {
+  sectorFilter.value = filter
+}
+
+function selectSectorSort(sort: 'changePercent' | 'netInflow', order: 'asc' | 'desc') {
+  sectorSort.value = sort
+  sectorSortOrder.value = order
+}
+
+function isChinaMarketOpen() {
+  const { day, minutes } = getBeijingDayAndMinutes()
+  const weekday = day >= 1 && day <= 5
+  return weekday && ((minutes >= 9 * 60 + 30 && minutes < 11 * 60 + 30) || (minutes >= 13 * 60 && minutes < 15 * 60))
 }
 
 function goToDetail(code: string) {
   router.push(`/detail/${code}`)
 }
 
-function changeOtcPage(page: number) {
-  otcPage.value = page
-  loadOTCFunds()
+function goToSectorDetail(sector: MarketSector) {
+  router.push({ name: 'sectorDetail', params: { code: sector.code }, query: { name: sector.name, type: sectorFilter.value } })
 }
 
-function goToMore(type: 'otc' | 'sector') {
-  router.push({ path: '/market-more', query: { type } })
+let bubbleRequestId = 0
+async function loadBubbleSectors(silent = false) {
+  const requestId = ++bubbleRequestId
+  if (!silent) bubbleSectorsLoading.value = true
+  bubbleSectorsError.value = ''
+  try {
+    const type: MarketSectorType = sectorFilter.value === 'concept' ? 'concept' : 'industry'
+    const data = await fetchAllMarketSectors(type, 'flow', 'desc', 500)
+    if (requestId === bubbleRequestId) bubbleSectors.value = data
+  } catch (error) {
+    if (requestId === bubbleRequestId) {
+      bubbleSectorsError.value = error instanceof Error ? error.message : '板块资金数据加载失败'
+    }
+  } finally {
+    if (requestId === bubbleRequestId && !silent) bubbleSectorsLoading.value = false
+  }
 }
 
-// 监听基金Tab切换
-watch(activeFundTab, () => {
-  otcPage.value = 1
-  loadOTCFunds()
-})
+function openSectorBubble() {
+  activeMarketTool.value = 'bubble'
+  loadBubbleSectors()
+}
 
+function selectBubbleSector(sector: MarketSector) {
+  activeMarketTool.value = 'index'
+  goToSectorDetail(sector)
+}
+
+let trackerRequestId = 0
+async function loadTrackerSectors(silent = false) {
+  const requestId = ++trackerRequestId
+  if (!silent) trackerSectorsLoading.value = true
+  trackerSectorsError.value = ''
+  try {
+    const type: MarketSectorType = sectorFilter.value === 'concept' ? 'concept' : 'industry'
+    const data = await fetchAllMarketSectors(type, 'flow', 'desc', 500)
+    if (requestId === trackerRequestId) trackerSectors.value = data
+  } catch (error) {
+    if (requestId === trackerRequestId) trackerSectorsError.value = error instanceof Error ? error.message : '板块资金数据加载失败'
+  } finally {
+    if (requestId === trackerRequestId && !silent) trackerSectorsLoading.value = false
+  }
+}
+
+function openSectorTracker() {
+  activeMarketTool.value = 'tracker'
+  loadTrackerSectors()
+}
+
+function selectTrackedSector(sector: MarketSector) {
+  activeMarketTool.value = 'index'
+  goToSectorDetail(sector)
+}
+
+async function loadAllSectors() {
+  allSectorsLoading.value = true
+  try {
+    allSectors.value = await fetchAllMarketSectors(allSectorType.value, allSectorSort.value, allSectorOrder.value)
+  } catch (error) {
+    showToast(error instanceof Error ? error.message : '板块表加载失败')
+  } finally {
+    allSectorsLoading.value = false
+  }
+}
+
+async function openAllSectors() {
+  allSectorType.value = sectorFilter.value === 'concept' ? 'concept' : 'industry'
+  allSectorSort.value = sectorSort.value === 'netInflow' ? 'flow' : 'change'
+  allSectorOrder.value = sectorSortOrder.value
+  allSectorsOpen.value = true
+  await loadAllSectors()
+}
+
+function selectAllSectorSort(sort: MarketSectorSort, order: 'asc' | 'desc') {
+  allSectorSort.value = sort
+  allSectorOrder.value = order
+}
+
+let refreshTimer: ReturnType<typeof setInterval> | null = null
+let intradaySectorTimer: ReturnType<typeof setInterval> | null = null
 onMounted(() => {
-  loadIndices()
-  loadSectors()
-  loadOTCFunds()
-  startRealtimeUpdate()
+  loadIndexOrder()
+  loadMarket()
+  refreshTimer = setInterval(() => {
+    if (document.visibilityState === 'visible') loadMarket(true)
+  }, 60_000)
+  intradaySectorTimer = setInterval(() => {
+    if (document.visibilityState !== 'visible' || !isChinaMarketOpen()) return
+    if (activeMarketTool.value === 'bubble') loadBubbleSectors(true)
+    if (activeMarketTool.value === 'tracker') loadTrackerSectors(true)
+  }, INTRADAY_SECTOR_REFRESH_MS)
 })
 
 onUnmounted(() => {
-  stopRealtimeUpdate()
+  if (refreshTimer) clearInterval(refreshTimer)
+  if (intradaySectorTimer) clearInterval(intradaySectorTimer)
+})
+
+watch(activeRankTab, () => loadRanking())
+watch([sectorFilter, sectorSort, sectorSortOrder], () => {
+  sectorsExpanded.value = false
+  loadFeaturedSectors().catch(error => showToast(error instanceof Error ? error.message : '板块加载失败'))
+})
+watch(sectorFilter, () => {
+  if (activeMarketTool.value === 'bubble') loadBubbleSectors()
+  if (activeMarketTool.value === 'tracker') loadTrackerSectors()
+})
+watch([allSectorType, allSectorSort, allSectorOrder], () => {
+  if (allSectorsOpen.value) loadAllSectors()
 })
 </script>
 
 <template>
   <div class="market-page">
-    <!-- 顶部导航 -->
-    <van-nav-bar title="行情">
+    <van-nav-bar title="行情" :border="false">
       <template #right>
-        <van-icon name="setting-o" size="18" />
+        <button class="refresh-action" type="button" :disabled="isRefreshing" aria-label="刷新行情" @click="onRefresh">
+          <van-icon name="replay" :class="{ spinning: isRefreshing }" size="20" />
+        </button>
       </template>
     </van-nav-bar>
 
-    <van-pull-refresh v-model="isRefreshing" @refresh="onRefresh" class="market-content">
-
-      <!-- ===== 1. 大盘指数栏（参考 MarketIndexAccordion） ===== -->
-      <div class="index-bar" v-if="!indicesLoading || marketIndices.length">
-        <div class="index-bar-main">
-          <span class="index-bar-name">{{ marketIndices[0]?.name || '--' }}</span>
-          <span class="index-bar-val">{{ marketIndices[0]?.price.toFixed(2) || '--' }}</span>
-          <span class="index-bar-change" :class="getChangeStatus(marketIndices[0]?.changePercent || 0)">
-            {{ marketIndices[0]?.change >= 0 ? '+' : '' }}{{ marketIndices[0]?.change?.toFixed(2) || '0.00' }}
-            {{ marketIndices[0]?.changePercent >= 0 ? '+' : '' }}{{ marketIndices[0]?.changePercent?.toFixed(2) || '0.00' }}%
-          </span>
-        </div>
-        <van-icon name="arrow-down" size="12" class="index-arrow" />
-      </div>
-
-      <!-- 指数卡片行（3列） -->
-      <div class="index-cards" v-if="!indicesLoading && marketIndices.length">
-        <div class="idx-card" v-for="(idx, i) in marketIndices" :key="idx.code || i">
-          <div class="idx-card-name">{{ idx.name }}</div>
-          <div class="idx-card-value" :style="{ color: getIndexColor(idx) }">
-            {{ idx.price.toFixed(2) }}
+    <van-pull-refresh v-model="isRefreshing" class="market-scroll" @refresh="onRefresh">
+      <main class="market-tab-container">
+        <MarketIndexBoard variant="market" />
+        <section class="market-index-section" aria-labelledby="indices-title">
+          <div class="market-section-header">
+            <h2 id="indices-title" class="market-section-title">主要指数</h2>
+            <div class="market-index-actions">
+              <span class="market-section-meta">最新快照</span>
+              <button type="button" class="market-icon-button" title="管理指数" aria-label="管理指数" @click="indexManagerOpen = true"><van-icon name="setting-o" size="16" /></button>
+            </div>
           </div>
-          <div class="idx-card-change" :style="{ color: getIndexColor(idx) }">
-            {{ idx.change >= 0 ? '+' : '' }}{{ idx.change.toFixed(2) }}
-            {{ idx.changePercent >= 0 ? '+' : '' }}{{ idx.changePercent.toFixed(2) }}%
+          <div v-if="snapshotLoading && !indices.length" class="market-index-grid">
+            <span v-for="item in MAX_INDEX_COUNT" :key="item" class="index-skeleton glass" />
           </div>
-          <!-- 真实分时迷你走势图 -->
-          <svg v-if="trendPaths[idx.code]" class="idx-sparkline" viewBox="0 0 70 26" preserveAspectRatio="none">
-            <polyline
-              :points="trendPaths[idx.code]"
-              fill="none"
-              :stroke="getIndexColor(idx)"
-              stroke-width="1.5"
-              stroke-linecap="round"
-              stroke-linejoin="round"
-              vector-effect="non-scaling-stroke"
-            />
-          </svg>
-          <!-- 无分时时显示占位 -->
-          <div v-else class="idx-sparkline-placeholder"></div>
-        </div>
-      </div>
-
-      <!-- 指数骨架屏 -->
-      <div class="index-cards" v-else-if="indicesLoading">
-        <div class="idx-card skeleton" v-for="i in 3" :key="i">
-          <div class="sk-name"></div>
-          <div class="sk-value"></div>
-          <div class="sk-change"></div>
-        </div>
-      </div>
-
-      <!-- ===== 2. 热门板块（参考 MarketTab sector section） ===== -->
-      <div class="section sector-section">
-        <div class="section-header">
-          <span class="section-title">热门板块</span>
-          <span class="more-btn" @click="goToMore('sector')">全部 &gt;</span>
-        </div>
-
-        <!-- 板块Tab + 排序切换 -->
-        <div class="sector-tabs">
-          <span
-            v-for="tab in sectorTabs.filter(t => t.key !== 'money')"
-            :key="tab.key"
-            class="sector-tab"
-            :class="{ active: sectorTab === tab.key && sectorSortMode === 'change_pct' }"
-            @click="sectorTab = tab.key; sectorSortMode='change_pct'; loadSectors()"
-          >{{ tab.label }}</span>
-
-          <!-- [REF] 按涨幅/资金流入 排序Toggle -->
-          <div class="sort-toggles">
-            <span
-              class="sort-toggle"
-              :class="{ active: sectorSortMode === 'change_pct' }"
-              @click="toggleSectorSort('change_pct')"
-            >
-              按涨幅
-              <span class="sort-arrows">
-                <span :class="{ on: sectorSortMode === 'change_pct' && sectorSortOrder === 'asc' }">&uarr;</span>
-                <span :class="{ on: sectorSortMode === 'change_pct' && sectorSortOrder === 'desc' }">&darr;</span>
-              </span>
-            </span>
-            <span
-              class="sort-toggle"
-              :class="{ active: sectorSortMode === 'net_inflow' }"
-              @click="toggleSectorSort('net_inflow')"
-            >
-              资金流入
-              <span class="sort-arrows">
-                <span :class="{ on: sectorSortMode === 'net_inflow' && sectorSortOrder === 'asc' }">&uarr;</span>
-                <span :class="{ on: sectorSortMode === 'net_inflow' && sectorSortOrder === 'desc' }">&darr;</span>
-              </span>
-            </span>
+          <div v-else-if="visibleIndices.length" class="market-index-grid">
+            <article v-for="item in visibleIndices" :key="item.code" class="market-index-card glass">
+              <div class="index-name-line"><span>{{ item.name }}</span></div>
+              <strong>{{ number(item.price) }}</strong>
+              <span :class="['index-change', valueClass(item.changePercent)]">{{ percent(item.changePercent) }}</span>
+            </article>
           </div>
+        </section>
 
-          <!-- 资金流入/流出下拉 -->
-          <div class="sector-tab-wrap" v-if="sectorSortMode === 'net_inflow'">
-            <span
-              class="sector-tab money-tab"
-              :class="{ active: sectorTab === 'money' }"
-              @click.stop="showMoneyFlowPopup = !showMoneyFlowPopup"
-            >
-              {{ moneyTabLabel }} <van-icon name="arrow-down" size="10" />
-            </span>
-            <transition name="dropdown">
-              <div class="money-flow-dropdown" v-if="showMoneyFlowPopup" @click.stop>
-                <div
-                  v-for="opt in [{value:'in',label:'📈 按资金流入'}, {value:'out',label:'📉 按资金流出'}]"
-                  :key="opt.value"
-                  class="mf-option"
-                  :class="{ active: moneyFlowDirection === opt.value }"
-                  @click="selectMoneyFlow(opt.value)"
-                >
-                  {{ opt.label }}
-                  <van-icon v-if="moneyFlowDirection === opt.value" name="success" size="14" color="#409EFF" />
+        <van-popup v-model:show="indexManagerOpen" class="index-manager-popup" :closeable="true" close-icon="cross" :safe-area-inset-bottom="true">
+          <div class="index-manager-header"><h2>管理指数看板</h2><p>显示最多 6 个指数</p></div>
+          <div class="index-manager-section">
+            <div class="index-manager-label"><span>显示指数</span><button type="button" class="index-restore-button" @click="restoreDefaultIndices">恢复默认</button></div>
+            <div v-for="(code, position) in indexOrder" :key="code" :data-index-code="code" :class="['index-manager-row', { dragging: draggedIndexCode === code }]" @dragover.prevent @drop.prevent="finishIndexDrag(code)">
+              <template v-if="indices.find(index => index.code === code)">
+                <div class="index-manager-name"><strong>{{ indices.find(index => index.code === code)?.name }}</strong><small>{{ code }}</small></div>
+                <div class="index-manager-tools">
+                  <button type="button" class="market-icon-button index-drag-handle" title="拖拽排序" aria-label="拖拽排序" draggable="true" @dragstart="startIndexDrag(code, $event)" @dragend="endIndexPointerDrag" @pointerdown="startIndexPointerDrag(code, $event)" @pointermove="moveIndexByPointer" @pointerup="endIndexPointerDrag" @pointercancel="endIndexPointerDrag"><van-icon name="apps-o" /></button>
+                  <button type="button" class="market-icon-button danger" title="移除" @click="removeIndex(code)"><van-icon name="delete-o" /></button>
                 </div>
-              </div>
-            </transition>
-          </div>
-        </div>
-
-        <!-- [REF] 板块网格（5列）-->
-        <div class="sector-grid" v-if="!sectorsLoading && sectors.length">
-          <div
-            v-for="(sec, idx) in sectors.slice(0, 10)"
-            :key="sec.code || idx"
-            class="sector-cell"
-          >
-            <!-- 上行：名称 + 主数值 -->
-            <div class="cell-top">
-              <span class="cell-name" :title="sec.name">{{ sec.name }}</span>
-              <span
-                v-if="sectorSortMode === 'net_inflow'"
-                class="cell-cap"
-                :class="getSecMoney(sec) >= 0 ? 'money-in' : 'money-out'"
-              >
-                {{ getSecMoney(sec) > 0 ? '+' : '' }}{{ getSecCap(sec) }}亿
-              </span>
-              <span
-                v-else
-                class="cell-cap"
-                :class="getChangeStatus(sec.dayReturn)"
-              >{{ formatPercent(sec.dayReturn) }}</span>
-            </div>
-            <!-- 下行：副信息 -->
-            <div class="cell-bottom">
-              <template v-if="sectorSortMode === 'net_inflow'">
-                涨幅 <span :class="getChangeStatus(sec.dayReturn)">{{ formatPercent(sec.dayReturn) }}</span>
-              </template>
-              <template v-else>
-                资金 <span :class="getSecMoney(sec) >= 0 ? 'money-in' : 'money-out'">
-                  {{ getSecMoney(sec) > 0 ? '+' : '' }}{{ getSecCap(sec) }}亿
-                </span>
               </template>
             </div>
           </div>
-        </div>
-        <van-loading v-else-if="sectorsLoading" class="loading-box" size="24" />
-
-        <!-- 板块空状态 -->
-        <div v-else-if="!sectorsLoading && !sectors.length" class="empty-hint">
-          暂无板块数据
-        </div>
-      </div>
-
-      <!-- ===== 3. 估值涨幅列表（参考 MarketTab rankingTable） ===== -->
-      <div class="section fund-section">
-        <!-- Tab栏 + 实时指示器 -->
-        <div class="fund-tabs-wrap">
-          <div class="fund-tab-list">
-            <span
-              v-for="tab in fundTabs"
-              :key="tab.key"
-              class="fund-tab"
-              :class="{ active: activeFundTab === tab.key }"
-              @click="activeFundTab = tab.key"
-            >{{ tab.label }}</span>
+          <div class="index-manager-section">
+            <div class="index-manager-label"><span>可选指数</span></div>
+            <div class="index-options"><button v-for="item in availableIndices" :key="item.code" type="button" :disabled="indexOrder.length >= MAX_INDEX_COUNT" @click="addIndex(item.code)">{{ item.name }}</button></div>
           </div>
-          <div class="realtime-indicator">
-            <span class="rt-dot"></span>
-            <span>实时</span>
-          </div>
-        </div>
+          <div class="index-manager-footer"><button type="button" @click="indexManagerOpen = false">完成</button></div>
+        </van-popup>
 
-        <!-- 表头 -->
-        <div class="ft-head" v-if="!otcLoading && otcFunds.length > 0">
-          <div class="th-name">基金名称</div>
-          <div class="th-latest">最新涨幅</div>
-          <div class="th-est">估算涨幅</div>
-        </div>
-
-        <!-- [REF] 基金行 - 对齐参考项目布局 -->
-        <div class="ft-body" v-if="!otcLoading">
-          <div
-            v-for="fund in otcFunds"
-            :key="fund.code"
-            class="ft-row"
-            @click.stop="goToDetail(fund.code)"
-          >
-            <!-- 左：名称 + 代码 + 类型标签 -->
-            <div class="ft-info-col">
-              <div class="ft-name-row">
-                <van-icon name="plus" size="13" class="ft-add-icon" />
-                <span class="ft-name" :title="fund.name">{{ fund.name }}</span>
+        <section class="market-section" aria-labelledby="sectors-title">
+          <div class="market-section-header">
+            <div class="market-header-controls">
+              <h2 id="sectors-title" class="market-section-title">热门板块</h2>
+              <div class="toggle-group" role="tablist" aria-label="板块类型">
+                <button type="button" :class="{ active: sectorFilter === 'industry' }" @click="selectSectorFilter('industry')">申万三级行业</button>
+                <button type="button" :class="{ active: sectorFilter === 'concept' }" @click="selectSectorFilter('concept')">东财概念</button>
               </div>
-              <div class="ft-sub-row">
-                <span class="ft-code">#{{ fund.code }}</span>
-                <span v-if="getFundTag(fund.name)" class="ft-tag">{{ getFundTag(fund.name) }}</span>
+              <div class="toggle-group sort-group" aria-label="板块排序">
+                <button type="button" class="sector-sort-rise" :class="{ active: sectorSort === 'changePercent' && sectorSortOrder === 'desc' }" @click="selectSectorSort('changePercent', 'desc')">
+                  涨幅 <van-icon name="arrow-up" />
+                </button>
+                <button type="button" class="sector-sort-fall" :class="{ active: sectorSort === 'changePercent' && sectorSortOrder === 'asc' }" @click="selectSectorSort('changePercent', 'asc')">
+                  跌幅 <van-icon name="arrow-down" />
+                </button>
+                <button type="button" class="sector-sort-rise" :class="{ active: sectorSort === 'netInflow' && sectorSortOrder === 'desc' }" @click="selectSectorSort('netInflow', 'desc')">
+                  流入 <van-icon name="arrow-up" />
+                </button>
+                <button type="button" class="sector-sort-fall" :class="{ active: sectorSort === 'netInflow' && sectorSortOrder === 'asc' }" @click="selectSectorSort('netInflow', 'asc')">流出 <van-icon name="arrow-down" /></button>
               </div>
+              <button type="button" class="sector-live-tracker" @click="openSectorTracker"><van-icon name="chart-trending-o" /> 实时板块资金流向追踪</button>
+              <button type="button" class="sector-bubble-action" aria-label="打开分时气泡图" @click="openSectorBubble"><van-icon name="cluster-o" /> 分时气泡图</button>
             </div>
-            <!-- 中：最新涨幅 + 日期 -->
-            <div class="ft-latest-col">
-              <span class="ft-latest-val" :class="getChangeStatus(fund.dayReturn)">
-                {{ formatPercent(fund.dayReturn) }}
-              </span>
-              <span class="ft-date">{{ fund.updateStatus || '--' }}</span>
-            </div>
-            <!-- 右：估算涨幅（加粗） -->
-            <div class="ft-est-col" :class="getChangeStatus(fund.estimateReturn ?? fund.dayReturn)">
-              {{ formatPercent(fund.estimateReturn ?? fund.dayReturn) }}
-            </div>
+            <button type="button" class="market-section-more" @click="openAllSectors">全部 <van-icon name="arrow" /></button>
           </div>
-        </div>
 
-        <!-- 分页 -->
-        <div class="pagination-row" v-if="!otcLoading && otcPages > 1">
-          <span
-            v-for="p in otcPages"
-            :key="p"
-            class="page-dot"
-            :class="{ active: otcPage === p }"
-            @click="changeOtcPage(p)"
-          >{{ p }}</span>
-        </div>
+          <section v-if="activeMarketTool !== 'index'" class="market-tool-panel">
+            <SectorBubbleChart
+              v-if="activeMarketTool === 'bubble'"
+              :sectors="bubbleSectors"
+              :type="sectorFilter === 'concept' ? 'concept' : 'industry'"
+              :updated-at="bubbleUpdatedAt"
+              :index="bubbleIndex"
+              :loading="bubbleSectorsLoading"
+              :error="bubbleSectorsError"
+              @close="activeMarketTool = 'index'"
+              @select="selectBubbleSector"
+              @type-change="selectSectorFilter"
+            />
+            <SectorFlowTracker
+              v-else
+              :sectors="trackerSectors"
+              :type="sectorFilter === 'concept' ? 'concept' : 'industry'"
+              :updated-at="trackerSectors[0]?.updatedAt || null"
+              @close="activeMarketTool = 'index'"
+              @select="selectTrackedSector"
+              @type-change="selectSectorFilter"
+            />
+            <div v-if="activeMarketTool === 'tracker' && trackerSectorsLoading" class="tracker-loading-overlay">正在读取后端板块缓存...</div>
+            <div v-else-if="activeMarketTool === 'tracker' && trackerSectorsError" class="tracker-loading-overlay error">{{ trackerSectorsError }}</div>
+          </section>
 
-        <van-loading v-else-if="otcLoading" class="loading-box" size="24" />
+          <div v-if="featuredSectorsLoading && !sectors.length" class="market-sector-grid">
+            <span v-for="item in 12" :key="item" class="market-sector-skeleton glass" />
+          </div>
+          <div v-else-if="filteredSectors.length" class="market-sector-grid">
+            <button v-for="sector in filteredSectors" :key="sector.code" type="button" class="market-sector-card glass" @click="goToSectorDetail(sector)">
+              <div class="market-sector-main">
+                <span class="market-sector-name">{{ sector.name }}</span>
+                <strong v-if="sectorSort === 'changePercent'" :class="valueClass(sector.changePercent)">{{ percent(sector.changePercent) }}</strong>
+                <strong v-else :class="valueClass(sector.netInflow)">{{ formatFlow(sector.netInflow) }}</strong>
+              </div>
+              <small class="market-sector-detail">
+                <template v-if="sectorSort === 'changePercent'">资金流入：{{ formatFlow(sector.netInflow) }}</template>
+                <template v-else>涨跌幅：<span :class="valueClass(sector.changePercent)">{{ percent(sector.changePercent) }}</span></template>
+              </small>
+            </button>
+          </div>
+          <div v-else class="market-empty glass">暂无匹配的板块数据</div>
+          <button v-if="sectors.length > 12" type="button" class="market-sector-expand" @click="sectorsExpanded = !sectorsExpanded">
+            {{ sectorsExpanded ? '收起板块' : '展开更多板块' }} <van-icon :name="sectorsExpanded ? 'arrow-up' : 'arrow-down'" />
+          </button>
+          <p v-if="sectorUpdatedAt !== '--'" class="mapping-note">{{ sectorFilter === 'industry' ? '申万三级行业（东方财富实时行情）' : '东方财富概念板块' }} 更新 {{ sectorUpdatedAt }}</p>
+        </section>
 
-        <!-- 空状态 -->
-        <div v-else-if="!otcLoading && !otcFunds.length" class="empty-hint">
-          暂无排行数据
-        </div>
-      </div>
+        <van-popup v-model:show="allSectorsOpen" class="all-sectors-popup" :closeable="true" close-icon="cross" :safe-area-inset-bottom="true">
+          <div class="all-sectors-header"><h2>全部板块</h2></div>
+          <div class="all-sectors-controls">
+            <div class="all-control-row"><span>板块类别</span><div class="toggle-group"><button type="button" :class="{ active: allSectorType === 'industry' }" @click="allSectorType = 'industry'">申万三级行业</button><button type="button" :class="{ active: allSectorType === 'concept' }" @click="allSectorType = 'concept'">东财概念</button></div></div>
+            <div class="all-control-row"><span>排序类别</span><div class="toggle-group"><button type="button" class="sector-sort-rise" :class="{ active: allSectorSort === 'change' && allSectorOrder === 'desc' }" @click="selectAllSectorSort('change', 'desc')">涨幅 <van-icon name="arrow-up" /></button><button type="button" class="sector-sort-fall" :class="{ active: allSectorSort === 'change' && allSectorOrder === 'asc' }" @click="selectAllSectorSort('change', 'asc')">跌幅 <van-icon name="arrow-down" /></button><button type="button" class="sector-sort-rise" :class="{ active: allSectorSort === 'flow' && allSectorOrder === 'desc' }" @click="selectAllSectorSort('flow', 'desc')">流入 <van-icon name="arrow-up" /></button><button type="button" class="sector-sort-fall" :class="{ active: allSectorSort === 'flow' && allSectorOrder === 'asc' }" @click="selectAllSectorSort('flow', 'asc')">流出 <van-icon name="arrow-down" /></button></div></div>
+          </div>
+          <div class="all-sectors-table-wrap">
+            <div class="all-sectors-table-head"><span>板块名称</span><span>涨跌幅</span><span>资金流入</span></div>
+            <div v-if="allSectorsLoading" class="all-sectors-loading">正在加载后端板块表…</div>
+            <div v-else-if="!allSectors.length" class="all-sectors-loading">暂无板块数据</div>
+            <div v-else class="all-sectors-list"><div v-for="sector in allSectors" :key="sector.code" class="all-sectors-row"><span>{{ sector.name }}</span><strong :class="valueClass(sector.changePercent)">{{ percent(sector.changePercent) }}</strong><strong :class="valueClass(sector.netInflow)">{{ formatFlow(sector.netInflow) }}</strong></div></div>
+          </div>
+        </van-popup>
 
-      <div class="bottom-spacer"></div>
+        <section class="market-ranking-section glass" aria-labelledby="ranking-title">
+          <div class="market-ranking-tabs" role="tablist" aria-label="基金排行类型">
+            <button
+              v-for="item in rankTabs"
+              :key="item.key"
+              type="button"
+              :class="{ active: activeRankTab === item.key }"
+              :aria-selected="activeRankTab === item.key"
+              @click="activeRankTab = item.key"
+            >
+              {{ item.label }}
+            </button>
+          </div>
+          <div class="market-ranking-table">
+            <div class="market-ranking-header">
+              <span id="ranking-title">基金名称</span><span>当日涨幅</span><span>近一年涨幅</span>
+            </div>
+            <template v-if="rankingLoading && !ranking.length">
+              <div v-for="item in 8" :key="item" class="market-ranking-row market-ranking-skeleton"><span /><span /><span /></div>
+            </template>
+            <button v-for="item in ranking" :key="item.code" class="market-ranking-row" type="button" @click="goToDetail(item.code)">
+              <span class="fund-name-cell"><strong>{{ item.name }}</strong><small>#{{ item.code }} · {{ rankingDate(item) }}</small></span>
+              <span :class="valueClass(item.dailyReturn)">{{ percent(item.dailyReturn) }}</span>
+              <span :class="['ranking-year-value', valueClass(item.yearReturn)]">{{ percent(item.yearReturn) }}</span>
+            </button>
+            <div v-if="!rankingLoading && !ranking.length" class="market-empty ranking-empty">暂无基金排行数据</div>
+          </div>
+        </section>
+
+        <div v-if="loadError" class="error-state"><span>{{ loadError }}</span><button type="button" @click="loadMarket">重试</button></div>
+      </main>
     </van-pull-refresh>
-
-    <!-- 点击外部关闭弹窗 -->
-    <div class="overlay-mask" v-if="showMoneyFlowPopup" @click="showMoneyFlowPopup = false" />
   </div>
 </template>
 
 <style scoped>
-/* ==================== 页面框架 ==================== */
-.market-page {
-  min-height: 100vh;
-  background: var(--bg-primary);
-}
-.market-content {
-  height: calc(100vh - 46px);
-  overflow-y: auto;
-  -webkit-overflow-scrolling: touch;
-  overscroll-behavior-y: contain;
-}
-.bottom-spacer { height: calc(70px + env(safe-area-inset-bottom, 0px)); }
-.section { margin-bottom: 8px; background: transparent; }
-.section-header {
-  display: flex; justify-content: space-between; align-items: center;
-  padding: 14px 16px 10px;
-}
-.section-title { font-size: 16px; font-weight: 700; color: var(--text-primary); }
-.more-btn { font-size: 13px; color: var(--text-muted); cursor: pointer; }
-.loading-box { padding: 28px 0; text-align: center; }
-.empty-hint {
-  padding: 32px 16px; text-align: center; font-size: 13px; color: var(--text-muted);
-}
-.overlay-mask {
-  position: fixed; top: 0; left: 0; right: 0; bottom: 0; z-index: 998;
-}
-
-/* ==================== 1. 大盘指数（参考 MarketIndexAccordion） ==================== */
-.index-bar {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 10px 16px; background: var(--bg-secondary);
-  border-bottom: 1px solid rgba(255,255,255,0.06);
-}
-.index-bar-main { display: flex; align-items: baseline; gap: 8px; }
-.index-bar-name { font-size: 13px; color: var(--text-secondary); }
-.index-bar-val {
-  font-size: 18px; font-weight: 700; color: var(--text-primary);
-  font-family: -apple-system, 'SF Mono', monospace;
-}
-.index-bar-change {
-  font-size: 12px; font-weight: 500;
-  font-family: -apple-system, 'SF Mono', monospace;
-}
-.index-arrow {
-  flex-shrink: 0; transform: rotate(-90deg);
-  color: var(--text-muted); cursor: pointer;
-}
-
-/* 指数卡片 - 参考 IndexCard */
-.index-cards {
-  display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px;
-  padding: 12px 16px; background: var(--bg-secondary);
-}
-.idx-card {
-  background: var(--card-bg, rgba(255,255,255,0.04));
-  border: 1px solid rgba(255,255,255,0.06);
-  border-radius: 8px; padding: 8px 10px;
-  position: relative; overflow: hidden;
-  display: flex; flex-direction: column; gap: 2px;
-}
-.idx-card-name {
-  font-size: 11px; color: var(--text-secondary);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-.idx-card-value {
-  font-size: 15px; font-weight: 700; line-height: 1.3;
-  font-family: -apple-system, 'SF Mono', monospace;
-}
-.idx-card-change {
-  font-size: 11px; font-weight: 500;
-  font-family: -apple-system, 'SF Mono', monospace;
-}
-
-/* [REF] 真实分时迷你走势图 */
-.idx-sparkline {
-  position: absolute; bottom: 4px; right: 6px;
-  width: 70px; height: 26px; opacity: 0.75;
-}
-.idx-sparkline-placeholder {
-  position: absolute; bottom: 4px; right: 6px;
-  width: 35px; height: 3px; border-radius: 2px;
-  background: var(--text-muted); opacity: 0.15;
-}
-
-/* 骨架屏动画 */
-.idx-card.skeleton { animation: sk-pulse 1.8s ease infinite; }
-.sk-name { height: 11px; width: 50%; background: rgba(255,255,255,0.08); border-radius: 3px; margin-bottom: 6px; }
-.sk-value { height: 17px; width: 65%; background: rgba(255,255,255,0.08); border-radius: 3px; margin-bottom: 4px; }
-.sk-change { height: 11px; width: 80%; background: rgba(255,255,255,0.05); border-radius: 3px; }
-@keyframes sk-pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.5; }
-}
-
-/* ==================== 2. 热门板块（参考 MarketTab） ==================== */
-.sector-section { }
-.sector-tabs {
-  display: flex; align-items: center; gap: 4px;
-  padding: 0 16px 10px; flex-wrap: wrap; position: relative;
-}
-.sector-tab {
-  padding: 5px 12px; border-radius: 14px; font-size: 12px;
-  color: var(--text-secondary); cursor: pointer; white-space: nowrap;
-  display: inline-flex; align-items: center; gap: 2px;
-  transition: all 0.2s; border: none; background: transparent;
-}
-.sector-tab.active {
-  background: var(--bg-tertiary); color: var(--text-primary); font-weight: 600;
-}
-.sector-tab.money-tab.active { background: rgba(64,158,255,0.12); color: #409EFF; }
-
-/* [REF] 排序Toggle（参考 ToggleGroup）*/
-.sort-toggles {
-  display: flex; align-items: center;
-  background: rgba(0,0,0,0.08); border-radius: 6px; padding: 2px;
-  border: 1px solid rgba(255,255,255,0.04);
-}
-.sort-toggle {
-  padding: 4px 10px; border-radius: 4px; font-size: 11px;
-  color: var(--text-muted); cursor: pointer; white-space: nowrap;
-  display: inline-flex; align-items: center; gap: 3px;
-  transition: all 0.15s;
-}
-.sort-toggle.active {
-  background: var(--bg-primary); color: var(--text-primary);
-  box-shadow: 0 1px 3px rgba(0,0,0,0.15);
-}
-.sort-arrows {
-  display: inline-flex; flex-direction: column; line-height: 1;
-  font-size: 8px; transform: scale(0.85);
-}
-.sort-arrows span { opacity: 0.25; }
-.sort-arrows span.on { opacity: 1; }
-
-/* 资金流下拉菜单 */
-.sector-tab-wrap { position: relative; }
-.money-flow-dropdown {
-  position: absolute; top: calc(100% + 6px); right: 0; z-index: 999;
-  min-width: 150px; background: #1e293b; border-radius: 8px;
-  box-shadow: 0 8px 28px rgba(0,0,0,0.45);
-  overflow: hidden; border: 1px solid rgba(255,255,255,0.08);
-}
-.mf-option {
-  display: flex; align-items: center; justify-content: space-between;
-  padding: 11px 14px; cursor: pointer; transition: background 0.15s;
-  font-size: 13px; color: var(--text-secondary);
-}
-.mf-option:hover, .mf-option.active { background: rgba(64,158,255,0.1); color: var(--text-primary); }
-.dropdown-enter-active, .dropdown-leave-active { transition: all 0.2s ease; }
-.dropdown-enter-from, .dropdown-leave-to { opacity: 0; transform: translateY(-6px); }
-
-/* [REF] 板块网格 - 5列（参考 motion.div layout） */
-.sector-grid {
-  display: grid; grid-template-columns: repeat(5, 1fr); gap: 6px;
-  padding: 0 16px 14px;
-}
-.sector-cell {
-  background: var(--bg-secondary); border-radius: 8px;
-  padding: 10px 7px; cursor: pointer; transition: background 0.15s;
-  border: 1px solid rgba(255,255,255,0.03);
-}
-.sector-cell:active { background: var(--bg-tertiary); }
-.cell-top {
-  display: flex; justify-content: space-between; align-items: baseline;
-  margin-bottom: 4px; gap: 3px;
-}
-.cell-name {
-  font-size: 12px; font-weight: 600; color: var(--text-primary);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
-  flex: 1; min-width: 0;
-}
-.cell-cap {
-  font-size: 11px; font-weight: 600; flex-shrink: 0;
-  font-family: -apple-system, 'SF Mono', monospace;
-  white-space: nowrap;
-}
-.cell-money-in { color: #ff7875; }
-.cell-money-out { color: #52c41a; }
-.cell-bottom {
-  font-size: 10px; color: var(--text-muted);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
-}
-
-/* ==================== 3. 基金排行（参考 rankingTable） ==================== */
-.fund-section {
-  background: var(--bg-secondary); border-radius: 12px;
-  margin: 0 12px 12px; overflow: hidden;
-  border: 1px solid rgba(255,255,255,0.04);
-}
-
-.fund-tabs-wrap {
-  padding: 12px 14px 0; display: flex; justify-content: space-between; align-items: center;
-}
-.fund-tab-list {
-  display: flex; gap: 0; flex: 1; overflow-x: auto;
-  scrollbar-width: none; -ms-overflow-style: none;
-}
-.fund-tab-list::-webkit-scrollbar { display: none; }
-.fund-tab {
-  padding: 8px 14px; font-size: 13px; color: var(--text-muted);
-  position: relative; cursor: pointer; transition: color 0.2s; white-space: nowrap;
-  flex-shrink: 0;
-}
-.fund-tab.active { color: #409EFF; font-weight: 600; }
-.fund-tab.active::after {
-  content: ''; position: absolute; left: 14px; right: 14px; bottom: -1px;
-  height: 2px; background: #409EFF; border-radius: 1px;
-}
-
-/* 实时更新指示器 */
-.realtime-indicator {
-  display: flex; align-items: center; gap: 4px;
-  padding-right: 4px; font-size: 11px; color: #52c41a; white-space: nowrap; flex-shrink: 0;
-}
-.rt-dot {
-  width: 6px; height: 6px; border-radius: 50%;
-  background: #52c41a; animation: pulse 1.5s ease infinite;
-}
-@keyframes pulse {
-  0%, 100% { opacity: 1; }
-  50% { opacity: 0.3; }
-}
-
-/* 表头 */
-.ft-head {
-  display: flex; align-items: center;
-  padding: 10px 16px 8px; font-size: 12px; color: var(--text-muted); font-weight: 500;
-}
-.th-name { flex: 1; min-width: 0; }
-.th-latest { width: 78px; text-align: center; }
-.th-est { width: 72px; text-align: right; }
-
-/* 基金行 - 参考 rankingTableColumns */
-.ft-row {
-  display: flex; align-items: center; padding: 11px 16px;
-  border-bottom: 1px solid rgba(255,255,255,0.04); cursor: pointer;
-  transition: background 0.15s;
-}
-.ft-row:last-child { border-bottom: none; }
-.ft-row:active { background: rgba(255,255,255,0.03); }
-
-/* 左列：信息区 */
-.ft-info-col { flex: 1; min-width: 0; margin-right: 8px; }
-.ft-name-row { display: flex; align-items: center; gap: 4px; margin-bottom: 3px; }
-.ft-add-icon {
-  color: var(--text-muted); flex-shrink: 0;
-  opacity: 0.4; transition: opacity 0.15s;
-}
-.ft-row:active .ft-add-icon { opacity: 0.7; }
-.ft-name {
-  font-size: 14px; color: var(--text-primary);
-  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; line-height: 1.3;
-}
-.ft-sub-row { display: flex; align-items: center; gap: 6px; padding-left: 19px; }
-.ft-code {
-  font-size: 11px; color: var(--text-secondary);
-  font-family: -apple-system, 'SF Mono', monospace;
-}
-.ft-tag {
-  font-size: 10px; padding: 1px 4px; background: rgba(255,255,255,0.06);
-  color: var(--text-muted); border-radius: 3px; font-weight: 500;
-}
-
-/* 中列：最新涨幅 */
-.ft-latest-col {
-  width: 78px; display: flex; flex-direction: column;
-  align-items: center; justify-content: center; gap: 2px; flex-shrink: 0;
-}
-.ft-latest-val { font-size: 13px; font-weight: 600; font-family: -apple-system, 'SF Mono', monospace; }
-.ft-date { font-size: 10px; color: var(--text-muted); font-family: -apple-system, 'SF Mono', monospace; }
-
-/* 右列：估算涨幅 */
-.ft-est-col {
-  width: 72px; font-size: 15px; font-weight: 700; text-align: right;
-  font-family: -apple-system, 'SF Mono', monospace; flex-shrink: 0;
-}
-
-/* 颜色 */
-.up { color: #ff4d4f !important; }
-.down { color: #52c41a !important; }
-.flat { color: var(--text-secondary) !important; }
-
-/* 分页 */
-.pagination-row {
-  display: flex; justify-content: center; gap: 12px; padding: 16px 0;
-}
-.page-dot {
-  width: 28px; height: 28px; display: flex; align-items: center;
-  justify-content: center; border-radius: 50%; font-size: 13px;
-  color: var(--text-secondary); cursor: pointer; transition: all 0.2s;
-}
-.page-dot.active { background: #409EFF; color: #fff; font-weight: 600; }
-
-/* ==================== 响应式 ==================== */
-@media (max-width: 420px) {
-  .sector-grid { grid-template-columns: repeat(4, 1fr); }
-  .cell-name { max-width: 46px; font-size: 11px; }
-  .sort-toggles { display: none; }
-}
-@media (max-width: 360px) {
-  .sector-grid { grid-template-columns: repeat(3, 1fr); gap: 4px; }
-  .idx-card { padding: 6px 8px; }
-  .idx-card-value { font-size: 14px; }
-  .ft-name { font-size: 13px; }
-  .fund-tab { padding: 8px 10px; font-size: 12px; }
-}
+.market-page { min-height: 100vh; padding-bottom: 60px; color: var(--text-primary); background: var(--bg-primary); }
+.market-index-section { display: none !important; }
+.market-page :deep(.van-nav-bar) { background: var(--bg-secondary); }.refresh-action { display: grid; width: 36px; height: 36px; place-items: center; border: 0; color: var(--text-primary); background: transparent; cursor: pointer; }.refresh-action:disabled { opacity: .45; }.spinning { animation: spin .8s linear infinite; } @keyframes spin { to { transform: rotate(360deg); } }
+.market-scroll { height: calc(100vh - 46px); overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior-y: contain; }.market-tab-container { display: flex; flex-direction: column; gap: 16px; max-width: 1080px; margin: 0 auto; padding: 14px 12px calc(24px + env(safe-area-inset-bottom, 0px)); }
+.glass { border: 1px solid var(--border-color); background: var(--bg-secondary); box-shadow: 0 8px 24px rgba(0, 0, 0, .05); }.market-section, .market-index-section { display: flex; flex-direction: column; gap: 12px; }.market-section-header { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 0 4px; }.market-header-controls { display: flex; align-items: center; min-width: 0; gap: 8px; }.market-section-title { flex: 0 0 auto; margin: 0; color: var(--text-primary); font-size: 16px; line-height: 22px; font-weight: 600; }.market-section-meta, .mapping-note { color: var(--text-secondary); font-size: 11px; }.market-section-more { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 2px; border: 0; color: var(--text-secondary); background: transparent; font-size: 12px; cursor: pointer; }.market-index-actions { display: inline-flex; align-items: center; gap: 4px; }.market-icon-button { display: inline-grid; width: 28px; height: 28px; place-items: center; padding: 0; border: 0; border-radius: 4px; color: var(--text-secondary); background: transparent; cursor: pointer; }.market-icon-button:active { background: var(--bg-tertiary); }.market-icon-button:disabled { cursor: default; opacity: .35; }.market-icon-button.danger { color: #dc2626; }
+.toggle-group { display: inline-flex; overflow: hidden; padding: 2px; border: 1px solid var(--border-color); border-radius: 6px; background: var(--bg-secondary); box-shadow: inset 0 1px 2px rgba(0, 0, 0, .04); }.toggle-group button { display: inline-flex; align-items: center; gap: 2px; height: 24px; padding: 0 8px; border: 0; border-radius: 4px; color: var(--text-secondary); background: transparent; font-size: 10px; cursor: pointer; }.toggle-group button.active { color: var(--text-primary); background: var(--bg-primary); box-shadow: 0 1px 3px rgba(0, 0, 0, .12); }
+.toggle-group button.sector-sort-rise.active { color: #fff; background: var(--color-up); }.toggle-group button.sector-sort-fall.active { color: #fff; background: var(--color-down); }.sector-live-tracker { display: inline-flex; align-items: center; gap: 4px; padding: 0; border: 0; color: var(--text-secondary); background: transparent; font-size: 11px; white-space: nowrap; cursor: pointer; }.sector-live-tracker:active { color: var(--color-primary); }.sector-bubble-action { display: inline-flex; align-items: center; gap: 4px; height: 26px; padding: 0 7px; border: 1px solid color-mix(in srgb, var(--color-primary) 46%, var(--border-color)); border-radius: 4px; color: var(--color-primary); background: color-mix(in srgb, var(--color-primary) 8%, transparent); font-size: 10px; white-space: nowrap; cursor: pointer; }.sector-bubble-action:active { opacity: .72; }
+.market-index-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }.market-index-card { min-width: 0; min-height: 66px; padding: 8px; border-radius: 8px; }.index-name-line { display: flex; gap: 6px; color: var(--text-secondary); font-size: 10px; }.index-name-line span { overflow: hidden; color: var(--text-primary); font-size: 11px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }.market-index-card strong { display: block; margin-top: 5px; overflow: hidden; font-size: 14px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }.index-change { display: block; margin-top: 2px; overflow: hidden; font-size: 10px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }.index-skeleton { min-height: 66px; border-radius: 8px; }
+.market-sector-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }.market-sector-card { display: flex; min-width: 0; min-height: 78px; padding: 12px; border: 1px solid var(--border-color); border-radius: 8px; color: var(--text-primary); flex-direction: column; gap: 8px; overflow: hidden; text-align: left; cursor: pointer; }.market-sector-card:active { background: var(--bg-tertiary); }.market-sector-main { display: flex; align-items: baseline; justify-content: space-between; gap: 8px; }.market-sector-name { overflow: hidden; color: var(--text-primary); font-size: 14px; font-weight: 600; text-overflow: ellipsis; white-space: nowrap; }.market-sector-main strong { flex: 0 0 auto; font-size: 13px; font-variant-numeric: tabular-nums; }.market-sector-detail { overflow: hidden; color: var(--text-secondary); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }.market-sector-skeleton { min-height: 78px; border-radius: 8px; }.market-sector-expand { display: inline-flex; align-self: center; align-items: center; gap: 3px; min-height: 30px; padding: 0 10px; border: 0; color: var(--color-primary); background: transparent; font-size: 12px; cursor: pointer; }.mapping-note { margin: -4px 4px 0; }.up { color: var(--color-up); }.down { color: var(--color-down); }.flat { color: var(--text-secondary); }
+.market-ranking-section { overflow: hidden; border-radius: 12px; }.market-ranking-tabs { display: flex; gap: 14px; overflow-x: auto; padding: 12px 14px 0; border-bottom: 1px solid var(--border-color); scrollbar-width: none; }.market-ranking-tabs::-webkit-scrollbar { display: none; }.market-ranking-tabs button { position: relative; flex: 0 0 auto; padding: 0 0 11px; border: 0; color: var(--text-secondary); background: transparent; font-size: 13px; font-weight: 500; cursor: pointer; }.market-ranking-tabs button.active { color: var(--text-primary); font-weight: 600; }.market-ranking-tabs button.active::after { position: absolute; right: 0; bottom: -1px; left: 0; height: 2px; border-radius: 2px; background: var(--color-primary); content: ''; }.market-ranking-header, .market-ranking-row { display: grid; grid-template-columns: minmax(0, 2fr) minmax(64px, 1fr) minmax(70px, 1fr); align-items: center; gap: 8px; }.market-ranking-header { padding: 9px 14px; border-bottom: 1px solid var(--border-color); color: var(--text-secondary); font-size: 11px; }.market-ranking-header span:not(:first-child), .market-ranking-row > span:not(:first-child) { text-align: right; }.market-ranking-row { width: 100%; min-height: 60px; padding: 10px 14px; border: 0; border-bottom: 1px solid rgba(127, 127, 127, .12); color: var(--text-primary); background: transparent; text-align: left; cursor: pointer; transition: background .2s ease; }.market-ranking-row:active { background: var(--bg-tertiary); }.fund-name-cell { min-width: 0; }.fund-name-cell strong, .fund-name-cell small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.fund-name-cell strong { font-size: 13px; font-weight: 600; }.fund-name-cell small { margin-top: 4px; color: var(--text-secondary); font-size: 10px; }.market-ranking-row > span:not(:first-child) { font-size: 12px; font-variant-numeric: tabular-nums; }.ranking-year-value { font-weight: 700; }.market-ranking-skeleton { cursor: default; }.market-ranking-skeleton span { height: 12px; background: var(--bg-tertiary); }.market-ranking-skeleton span:first-child { width: 72%; }.market-ranking-skeleton span:not(:first-child) { justify-self: end; width: 48px; }.market-empty { display: grid; min-height: 76px; place-items: center; border-radius: 10px; color: var(--text-secondary); font-size: 12px; }.ranking-empty { border-radius: 0; }.error-state { display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 10px 12px; border-left: 3px solid #dc2626; color: #dc2626; background: rgba(220, 38, 38, .08); font-size: 12px; }.error-state button { border: 0; color: inherit; background: transparent; font: inherit; cursor: pointer; }
+.all-sectors-popup { display: flex; width: min(680px, calc(100vw - 24px)); height: min(86vh, 820px); max-height: 86vh; flex-direction: column; overflow: hidden; border: 1px solid var(--border-color); border-radius: 12px; color: var(--text-primary); background: var(--bg-primary); }.all-sectors-header { display: flex; align-items: center; min-height: 64px; padding: 0 52px 0 16px; border-bottom: 1px solid var(--border-color); }.all-sectors-header h2 { margin: 0; font-size: 17px; font-weight: 650; }.all-sectors-controls { display: grid; gap: 12px; padding: 16px; border-bottom: 1px solid var(--border-color); }.all-control-row { display: flex; align-items: center; gap: 12px; }.all-control-row > span { flex: 0 0 56px; color: var(--text-primary); font-size: 12px; }.all-sectors-table-wrap { display: flex; min-height: 0; flex: 1; flex-direction: column; overflow: hidden; }.all-sectors-table-head, .all-sectors-row { display: grid; grid-template-columns: minmax(0, 1fr) 92px 116px; align-items: center; gap: 8px; }.all-sectors-table-head { min-height: 38px; padding: 0 14px; color: var(--text-secondary); background: var(--bg-tertiary); font-size: 11px; }.all-sectors-table-head span:not(:first-child), .all-sectors-row strong { text-align: right; }.all-sectors-list { overflow-y: auto; }.all-sectors-row { min-height: 37px; padding: 0 14px; border-bottom: 1px solid rgba(127, 127, 127, .12); font-size: 12px; }.all-sectors-row span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.all-sectors-row strong { font-variant-numeric: tabular-nums; }.all-sectors-loading { display: grid; min-height: 120px; place-items: center; color: var(--text-secondary); font-size: 12px; }
+.market-tool-panel { position: relative; overflow: hidden; border: 1px solid rgba(145, 174, 220, .22); border-radius: 8px; background: #101b30; box-shadow: 0 8px 24px rgba(0, 0, 0, .12); }.tracker-loading-overlay { position: absolute; z-index: 4; top: 0; right: 0; bottom: 0; left: 0; display: grid; place-items: center; color: #c3d2e9; background: rgba(10, 19, 36, .72); font-size: 13px; pointer-events: none; }.tracker-loading-overlay.error { color: #ff9a9a; }
+.index-manager-popup { width: min(440px, calc(100vw - 24px)); max-height: min(80vh, 700px); overflow-y: auto; border: 1px solid var(--border-color); border-radius: 8px; color: var(--text-primary); background: var(--bg-primary); }.index-manager-header { padding: 20px 52px 12px 18px; border-bottom: 1px solid var(--border-color); }.index-manager-header h2 { margin: 0; font-size: 18px; line-height: 26px; }.index-manager-header p { margin: 4px 0 0; color: var(--text-secondary); font-size: 12px; }.index-manager-section { padding: 14px 16px 4px; }.index-manager-label { display: flex; align-items: center; justify-content: space-between; min-height: 28px; margin-bottom: 6px; color: var(--text-secondary); font-size: 12px; }.index-restore-button { padding: 0; border: 0; color: var(--color-primary); background: transparent; font-size: 12px; cursor: pointer; }.index-manager-row { display: flex; min-height: 58px; align-items: center; justify-content: space-between; padding: 8px 0; border-bottom: 1px solid rgba(127, 127, 127, .12); }.index-manager-name { display: flex; min-width: 0; flex-direction: column; gap: 2px; }.index-manager-name strong { overflow: hidden; font-size: 14px; text-overflow: ellipsis; white-space: nowrap; }.index-manager-name small { color: var(--text-secondary); font-size: 11px; }.index-manager-tools { display: inline-flex; flex: 0 0 auto; gap: 1px; }.index-options { display: flex; flex-wrap: wrap; gap: 8px; padding-bottom: 10px; }.index-options button { min-height: 30px; padding: 0 10px; border: 1px solid var(--border-color); border-radius: 4px; color: var(--text-primary); background: var(--bg-secondary); font-size: 12px; cursor: pointer; }.index-options button:disabled { opacity: .45; }.index-manager-footer { display: flex; justify-content: flex-end; padding: 12px 16px calc(16px + env(safe-area-inset-bottom, 0px)); border-top: 1px solid var(--border-color); }.index-manager-footer button { min-width: 68px; height: 34px; border: 0; border-radius: 4px; color: #fff; background: var(--color-primary); font-size: 13px; cursor: pointer; }.index-manager-row.dragging { opacity: .55; }.index-drag-handle { cursor: grab; touch-action: none; }.index-drag-handle:active { cursor: grabbing; }
+@media (min-width: 641px) { .market-sector-grid { grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 8px; }.market-sector-card { min-height: 82px; padding: 10px; }.market-sector-name { font-size: 12px; }.market-sector-main strong { font-size: 11px; }.market-sector-detail { font-size: 10px; }.market-sector-card:hover { background: var(--bg-tertiary); }.market-ranking-row:hover { background: rgba(127, 127, 127, .06); } }
+@media (max-width: 700px) { .market-header-controls { flex-wrap: wrap; }.sector-live-tracker { order: 4; margin-left: auto; }.sector-bubble-action { order: 5; } }
+@media (max-width: 480px) { .market-tab-container { padding-right: 10px; padding-left: 10px; }.market-section-header { align-items: flex-start; margin: 0; }.market-header-controls { flex-wrap: wrap; gap: 6px; }.market-section-title { width: 100%; }.sort-group { margin-left: auto; }.market-ranking-tabs { gap: 12px; }.market-ranking-header, .market-ranking-row { grid-template-columns: minmax(0, 1fr) 66px 76px; gap: 6px; padding-right: 10px; padding-left: 10px; }.market-sector-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }.market-sector-card { min-height: 70px; padding: 8px; gap: 5px; }.market-sector-name { font-size: 11px; }.market-sector-main strong { font-size: 10px; }.market-sector-detail { font-size: 9px; } }
 </style>

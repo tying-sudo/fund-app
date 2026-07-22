@@ -49,4 +49,4 @@
 
 ---
 
-> 有功能建议？欢迎在 [GitHub Issues](https://github.com/xiriovo/fund-app/issues) 提出！
+> 有功能建议？欢迎在 [GitHub Issues](https://github.com/tying-sudo/fund-app/issues) 提出！

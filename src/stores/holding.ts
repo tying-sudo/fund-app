@@ -23,14 +23,21 @@ import {
 import { fetchFundEstimateFast, fetchNetValueHistoryFast, fetchRealDayChange } from '@/api/fundFast'
 import { getFundTypes } from '@/api/fund'
 import { persistCache } from '@/api/tiantianApi'
+import { fetchLatestValuationSettlement, rememberValuationSettlement } from '@/api/valuationGrid'
 
 // 新增模块导入
 import {
   calculateHoldingProfit,
+  hasUsableCurrentEstimate,
+  hasUsableEstimateChange,
+  getValuationComparisonState,
   getTodayStr,
   isEstimateDateToday,
+  isRetainedMarketEstimate,
   isTradingHours,
-  isValidRealChangeDate,
+  shouldUseDelayedQdiiPublishedChange,
+  selectLatestRealChange,
+  shouldRetainCurrentIntradayEstimate,
   round,
   PRECISION,
   type CalcContext
@@ -60,8 +67,14 @@ export interface HoldingWithProfit extends HoldingRecord {
   todayChange?: string
   /** 当日估值涨跌幅（始终显示估值，用于实差计算） */
   estimateChange?: string
+  /** 估值对应的日期时间，用于和真实净值按同一交易日比较 */
+  estimateTime?: string
   /** 当日收益金额 */
   todayProfit?: number
+  /** Latest published official profit from a date before today. */
+  previousProfit?: number
+  previousProfitRate?: number
+  previousBaseValue?: number
   /** 是否加载中 */
   loading?: boolean
   /** 当日真实涨跌幅（盘后基金机构公布） */
@@ -104,6 +117,8 @@ export const useHoldingStore = defineStore('holding', () => {
   let writeQueue: WriteOperation[] = []
   let writeTimer: ReturnType<typeof setTimeout> | null = null
   let isWriting = false
+  let holdingsInitializationPromise: Promise<void> | null = null
+  let holdingsInitialized = false
   const pendingSettlementLocks = new Set<string>()
 
   /**
@@ -250,6 +265,8 @@ export const useHoldingStore = defineStore('holding', () => {
     let totalValue = 0
     let totalCost = 0
     let todayProfit = 0
+    let yesterdayProfit = 0
+    let yesterdayBaseValue = 0
 
     holdings.value.forEach((h) => {
       if (h.marketValue !== undefined && h.marketValue > 0) {
@@ -266,17 +283,29 @@ export const useHoldingStore = defineStore('holding', () => {
       if (h.todayProfit !== undefined) {
         todayProfit += h.todayProfit
       }
+      if (h.previousProfit !== undefined && h.previousBaseValue !== undefined && h.previousBaseValue > 0) {
+        yesterdayProfit += h.previousProfit
+        yesterdayBaseValue += h.previousBaseValue
+      }
     })
 
     const totalProfit = totalValue - totalCost
     const totalProfitRate = totalCost > 0 ? round((totalProfit / totalCost) * 100, PRECISION.PERCENT) : 0
+    const todayBaseValue = totalValue - todayProfit
+    const todayProfitRate = todayBaseValue > 0 ? round((todayProfit / todayBaseValue) * 100, PRECISION.PERCENT) : 0
+    const yesterdayProfitRate = yesterdayBaseValue > 0
+      ? round((yesterdayProfit / yesterdayBaseValue) * 100, PRECISION.PERCENT)
+      : 0
 
     return {
       totalValue: round(totalValue, PRECISION.AMOUNT),
       totalCost: round(totalCost, PRECISION.AMOUNT),
       totalProfit: round(totalProfit, PRECISION.AMOUNT),
       totalProfitRate,
-      todayProfit: round(todayProfit, PRECISION.AMOUNT)
+      todayProfit: round(todayProfit, PRECISION.AMOUNT),
+      yesterdayProfit: round(yesterdayProfit, PRECISION.AMOUNT),
+      yesterdayProfitRate,
+      todayProfitRate
     }
   })
 
@@ -299,7 +328,17 @@ export const useHoldingStore = defineStore('holding', () => {
    * [WHY] APP 启动时从本地存储恢复数据
    * [OPT] 立即显示缓存估值（Stale-While-Revalidate），后台静默刷新最新数据
    */
-  async function initHoldings() {
+  function initHoldings(): Promise<void> {
+    if (holdingsInitialized) return Promise.resolve()
+    if (!holdingsInitializationPromise) {
+      holdingsInitializationPromise = initializeHoldings().finally(() => {
+        holdingsInitializationPromise = null
+      })
+    }
+    return holdingsInitializationPromise
+  }
+
+  async function initializeHoldings() {
     const startTime = performance.now()
     
     try {
@@ -338,6 +377,7 @@ export const useHoldingStore = defineStore('holding', () => {
       }
 
       const duration = Math.round(performance.now() - startTime)
+      holdingsInitialized = true
       logger.info('INIT', 'COMPLETE', 
       `初始化完成: ${records.length} 只基金, 耗时 ${duration}ms`, 
       { durationMs: duration, success: true, data: { count: records.length } }
@@ -361,6 +401,7 @@ export const useHoldingStore = defineStore('holding', () => {
       isRefreshing.value = false
       return
     }
+    if (isRefreshing.value) return
 
     updateHoldingDays()
     isRefreshing.value = true
@@ -378,10 +419,24 @@ export const useHoldingStore = defineStore('holding', () => {
         const fundStart = performance.now()
         
         try {
-          const data = await fetchFundEstimateFast(code)
-          
-          // [NEW] 使用新引擎计算并更新
-          updateHoldingWithNewEngine(code, data)
+          const [data, realData] = await Promise.all([
+            fetchFundEstimateFast(code),
+            fetchRealDayChange(code).catch(() => null)
+          ])
+
+          // A single atomic update prevents the previous official NAV from
+          // briefly replacing the same-day estimate while refresh is running.
+          updateHoldingWithNewEngine(
+            code,
+            data,
+            realData?.changeRate,
+            realData?.date,
+            realData?.nav
+          )
+          if (realData) {
+            await confirmPendingAdjustments(code, realData.date)
+          }
+          await hydrateHoldingSettlementIfMissing(code)
           successCount++
           
           const fundDuration = Math.round(performance.now() - fundStart)
@@ -392,20 +447,6 @@ export const useHoldingStore = defineStore('holding', () => {
             fundDuration
           )
           
-          // 异步获取真实涨跌幅（不阻塞主流程）
-          fetchRealDayChange(code).then(realData => {
-            if (realData) {
-              updateHoldingWithNewEngine(
-                code,
-                { ...data, gsz: String(parseFloat(data.gsz) || 0), gszzl: data.gszzl },
-                realData.changeRate,
-                realData.date,
-                realData.nav
-              )
-              // Only settle records for the fund whose official NAV was received.
-              void confirmPendingAdjustments(code, realData.date)
-            }
-          }).catch(() => {})
         } catch (error) {
           failCount++
           
@@ -433,6 +474,45 @@ export const useHoldingStore = defineStore('holding', () => {
     }
   }
 
+  async function hydrateHoldingSettlementIfMissing(code: string) {
+    const holding = holdings.value.find((item) => item.code === code)
+    if (!holding) return
+    // A provider can stamp a new date while returning `--`. That is not an
+    // estimate, so keep hydrating the previous completed estimate/NAV pair.
+    if (isEstimateDateToday(holding.estimateTime || '', getTodayStr()) && hasUsableEstimateChange(holding.estimateChange)) return
+
+    const current = getValuationComparisonState({
+      realChange: holding.realChange,
+      realChangeDate: holding.realChangeDate,
+      estimateChange: holding.estimateChange,
+      estimateTime: holding.estimateTime,
+      fundName: holding.name
+    })
+    if (current.isTrading || current.hasActualDiff) return
+
+    const settlement = await fetchLatestValuationSettlement(code)
+    if (!settlement) return
+
+    const comparison = getValuationComparisonState({
+      realChange: settlement.realChange,
+      realChangeDate: settlement.date,
+      estimateChange: settlement.estimateChange,
+      estimateTime: `${settlement.date} 15:00`,
+      fundName: holding.name
+    })
+    if (!comparison.hasActualDiff) return
+
+    Object.assign(holding, {
+      estimateChange: settlement.estimateChange.toFixed(4),
+      estimateTime: `${settlement.date} 15:00`,
+      realChange: settlement.realChange,
+      realChangeDate: settlement.date,
+      todayChange: '--',
+      isRealChangeToday: false,
+      loading: false
+    })
+  }
+
   /**
    * ★ 核心新方法：使用新计算引擎更新单只持仓
    * [REPLACE] 替代旧的 updateHoldingWithEstimate 方法
@@ -450,13 +530,38 @@ export const useHoldingStore = defineStore('holding', () => {
 
     const holding = holdings.value[index]
     const now = new Date()
+    const latestReal = selectLatestRealChange({
+      incomingChange: realChange,
+      incomingDate: realChangeDate,
+      cachedChange: holding.realChange,
+      cachedDate: holding.realChangeDate
+    })
+    const effectiveRealChange = latestReal.change
+    const effectiveRealDate = latestReal.date
+    const retainCachedIntradayEstimate = shouldRetainCurrentIntradayEstimate({
+      incomingEstimateChange: data.gszzl,
+      incomingEstimateTime: data.gztime,
+      cachedEstimateChange: holding.estimateChange,
+      cachedEstimateTime: holding.estimateTime,
+      now
+    })
+    const estimate = retainCachedIntradayEstimate
+      ? {
+          ...data,
+          gsz: Number.isFinite(Number(data.gsz)) && Number(data.gsz) > 0
+            ? data.gsz
+            : String(holding.currentValue || data.gsz),
+          gszzl: holding.estimateChange || data.gszzl,
+          gztime: holding.estimateTime || data.gztime
+        }
+      : data
     
     // 构建计算上下文
     const context: CalcContext = {
       holding: holding as HoldingRecord,
-      estimate: data,
-      realChange,
-      realChangeDate,
+      estimate,
+      realChange: effectiveRealChange,
+      realChangeDate: effectiveRealDate,
       realNav,
       now
     }
@@ -464,51 +569,120 @@ export const useHoldingStore = defineStore('holding', () => {
     // 使用新引擎计算
     const result = calculateHoldingProfit(context)
     
-    // 判断日期有效性
     const today = getTodayStr(now)
-    const dateCheck = isValidRealChangeDate(realChangeDate, holding.name, now)
-    const isEstimateToday = isEstimateDateToday(data.gztime || '', today)
-    const trading = isTradingHours(now)
+    const isEstimateToday = isEstimateDateToday(estimate.gztime || '', today)
+    const retainedMarketEstimate = isRetainedMarketEstimate(estimate)
     
     // 确定显示的涨跌幅
-    const effectiveRealChange = (realChange !== undefined && realChange !== null) 
-      ? realChange 
-      : holding.realChange
+    // The all-market snapshot contains an already-published NAV. It is useful
+    // for pricing, but must never replace the captured intraday estimate in
+    // the "估值 | 昨" comparison.
+    const incomingIsOfficialSnapshot = estimate.source === 'market_snapshot'
+    const incomingComparison = getValuationComparisonState({
+      realChange: effectiveRealChange,
+      realChangeDate: effectiveRealDate,
+      estimateChange: incomingIsOfficialSnapshot ? null : estimate.gszzl,
+      estimateTime: incomingIsOfficialSnapshot ? null : estimate.gztime,
+      fundName: holding.name,
+      now
+    })
+    const cachedComparison = getValuationComparisonState({
+      realChange: effectiveRealChange,
+      realChangeDate: effectiveRealDate,
+      estimateChange: holding.estimateChange,
+      estimateTime: holding.estimateTime,
+      fundName: holding.name,
+      now
+    })
+    // Preserve the last settled comparison through the next trading day's
+    // pre-open period; providers can report a new timestamp before 9:30.
+    const useCachedCompletedEstimate = cachedComparison.hasActualDiff && (
+      incomingIsOfficialSnapshot ||
+      (!isEstimateToday && !incomingComparison.isTrading && !incomingComparison.hasActualDiff)
+    )
+    const comparison = useCachedCompletedEstimate ? cachedComparison : incomingComparison
+    const trading = comparison.isTrading
+    const displayEstimateChange = useCachedCompletedEstimate ? holding.estimateChange : estimate.gszzl
+    const displayEstimateTime = useCachedCompletedEstimate ? holding.estimateTime : estimate.gztime
     
-    // 仅“今日”官方净值可覆盖主涨跌幅；盘后或休市保留最近净值仅供展示，
-    // 不能把它误标为今天的真实涨跌幅。
-    const isRealChangeToday = dateCheck.isToday
+    const isRealChangeToday = comparison.isCurrentReal
+    const useDelayedQdiiPublishedChange = shouldUseDelayedQdiiPublishedChange({
+      fundName: holding.name,
+      realChange: effectiveRealChange,
+      realChangeDate: effectiveRealDate,
+      now
+    })
+    const officialChange = Number(effectiveRealChange)
+    const officialNav = Number(realNav)
+    const hasCurrentEstimate = hasUsableCurrentEstimate(estimate, today) ||
+      retainedMarketEstimate ||
+      (retainCachedIntradayEstimate && hasUsableEstimateChange(estimate.gszzl))
+    const hasOfficialNavToday = isRealChangeToday && Number.isFinite(officialNav) && officialNav > 0
+    const officialDenominator = 1 + officialChange / 100
+    const fallbackBaseNav = Number(estimate.dwjz)
+    const officialBaseNav = Number.isFinite(officialNav) && officialNav > 0 && officialDenominator > 0
+      ? officialNav / officialDenominator
+      : fallbackBaseNav
+    const isPreviousOfficial = Boolean(effectiveRealDate) && effectiveRealDate! < today
+    const previousBaseValue = isPreviousOfficial && Number.isFinite(officialBaseNav) && officialBaseNav > 0
+      ? round(officialBaseNav * result.effectiveShares, PRECISION.AMOUNT)
+      : holding.previousBaseValue
+    const previousProfit = isPreviousOfficial && previousBaseValue !== undefined && Number.isFinite(officialChange)
+      ? round(previousBaseValue * officialChange / 100, PRECISION.AMOUNT)
+      : holding.previousProfit
+    const previousProfitRate = isPreviousOfficial && Number.isFinite(officialChange)
+      ? officialChange
+      : holding.previousProfitRate
+
+    if (comparison.hasActualDiff && hasUsableEstimateChange(displayEstimateChange) && effectiveRealDate) {
+      rememberValuationSettlement(code, {
+        date: effectiveRealDate,
+        estimateChange: Number(displayEstimateChange),
+        realChange: Number(effectiveRealChange),
+        source: 'local-cache'
+      })
+    }
     
     // 构建今日涨跌幅显示值
     let displayTodayChange: string
-    if (trading) {
+    if (hasOfficialNavToday && effectiveRealChange !== undefined) {
+      displayTodayChange = effectiveRealChange.toFixed(2)
+    } else if (hasCurrentEstimate) {
+      displayTodayChange = estimate.gszzl || '--'
+    } else if (useDelayedQdiiPublishedChange && effectiveRealChange !== undefined) {
+      displayTodayChange = effectiveRealChange.toFixed(2)
+    } else if (trading) {
       // 盘中：优先显示估值
-      displayTodayChange = isEstimateToday ? (data.gszzl || '--') : '--'
+      displayTodayChange = '--'
     } else {
       // 盘后：优先显示真实涨跌幅
-      if (isRealChangeToday && effectiveRealChange !== undefined && effectiveRealChange !== null) {
+      if (comparison.hasActualDiff && effectiveRealChange !== undefined && effectiveRealChange !== null) {
         displayTodayChange = effectiveRealChange.toFixed(2)
       } else {
-        displayTodayChange = isEstimateToday ? (data.gszzl || '--') : '--'
+        displayTodayChange = (isEstimateToday || retainedMarketEstimate) ? (estimate.gszzl || '--') : '--'
       }
     }
 
     // 更新持仓数据
     holdings.value[index] = {
       ...holding,
-      name: data.name || holding.name,
+      name: estimate.name || holding.name,
       currentValue: result.currentValue,
       marketValue: result.marketValue,
       profit: result.profit,
       profitRate: result.profitRate,
       todayChange: displayTodayChange,
-      estimateChange: isEstimateToday ? (data.gszzl || '--') : '--',
-      todayProfit: result.todayProfit,
+      estimateChange: (isEstimateToday || retainedMarketEstimate || comparison.hasActualDiff) ? (displayEstimateChange || '--') : '--',
+      estimateTime: displayEstimateTime,
+      todayProfit: (hasCurrentEstimate || hasOfficialNavToday || useDelayedQdiiPublishedChange) ? result.todayProfit : undefined,
+      previousProfit,
+      previousProfitRate,
+      previousBaseValue,
       loading: false,
       shares: result.effectiveShares,
       serviceFeeDeducted: undefined,
       realChange: effectiveRealChange,
-      realChangeDate: realChangeDate || holding.realChangeDate,
+      realChangeDate: effectiveRealDate,
       isRealChangeToday
     }
 

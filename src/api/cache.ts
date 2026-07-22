@@ -56,9 +56,10 @@ class CacheManager {
 // [WHAT] 导出单例
 export const cache = new CacheManager()
 
-// [WHAT] 缓存TTL常量（秒级刷新优化）
+// [WHAT] 缓存TTL常量。实时估值与后端20秒缓存对齐，避免浏览器
+// 每秒重复命中同一份数据并放大到上游。
 export const CACHE_TTL = {
-  ESTIMATE: 800,        // 实时估值 0.8秒（秒级刷新）
+  ESTIMATE: 15000,      // 实时估值 15秒
   NET_VALUE: 60000,     // 历史净值 1分钟
   FUND_LIST: 3600000,   // 基金列表 1小时
   FUND_DETAIL: 300000,  // 基金详情 5分钟

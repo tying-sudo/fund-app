@@ -7,6 +7,7 @@ import { persistCache } from './tiantianApi'
 import { API_BASE_URL, USE_PROXY } from '@/config/api'
 import type { FundEstimate, NetValueRecord, StockHolding, DataSource, FundEstimateWithSource, MultiSourceEstimate } from '@/types/fund'
 import { getBeijingDateString, getBeijingDayAndMinutes } from '@/utils/tradingDate'
+import { shouldRetainCompletedEstimate, shouldRetainCurrentDayEstimate } from '@/utils/holdingCalculator'
 
 // ========== 股票实时行情接口 ==========
 
@@ -225,16 +226,37 @@ function withConcurrencyControl<T>(fn: () => Promise<T>): Promise<T> {
 
 // ========== 后端API接口 ==========
 
-/**
- * 从后端API获取基金估值
- * [FIX] 已移除远程后端依赖，直接返回 null，使用 JSONP 获取估值
- * [WHY] 远程后端慢或不可用会导致页面一直 loading
- */
-// [FIX] 后端API暂时禁用（远程后端无专用估值接口），直接返回null跳过
-// [WHY] 避免每只基金都触发一次无效请求和"[估值] 后端API失败"日志刷屏
-// [TODO] 如需启用，实现 /api/estimate?code=xxx 接口
-async function fetchBackendEstimate(_code: string): Promise<FundEstimate | null> {
-  return null
+async function fetchBackendEstimateChunk(codes: string[]): Promise<Map<string, FundEstimate>> {
+  const results = new Map<string, FundEstimate>()
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 3000)
+  try {
+    const url = `${API_BASE_URL}/api/fund-estimates?codes=${encodeURIComponent(codes.join(','))}`
+    const response = await fetch(url, { signal: controller.signal })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const payload = await response.json()
+    for (const code of codes) {
+      const item = payload?.data?.[code]
+      if (item?.fundcode === code && item.name) results.set(code, item as FundEstimate)
+    }
+    return results
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+async function fetchBackendEstimates(codes: string[]): Promise<Map<string, FundEstimate>> {
+  const uniqueCodes = [...new Set(codes)]
+  const chunks: string[][] = []
+  for (let index = 0; index < uniqueCodes.length; index += 100) {
+    chunks.push(uniqueCodes.slice(index, index + 100))
+  }
+  const chunkResults = await Promise.all(chunks.map(fetchBackendEstimateChunk))
+  return new Map(chunkResults.flatMap(chunk => [...chunk]))
+}
+
+async function fetchBackendEstimate(code: string): Promise<FundEstimate | null> {
+  return (await fetchBackendEstimates([code])).get(code) || null
 }
 
 // ========== JSONP请求队列 ==========
@@ -322,8 +344,44 @@ export async function fetchFundEstimateFast(code: string): Promise<FundEstimate>
   })
   
     const doFetch = async (): Promise<FundEstimate> => {
-    // [FIX] 跳过后端API（fetchBackendEstimate 已禁用），直接使用 JSONP
-    // [WHY] 后端无专用估值接口，每次都失败并打印 "[估值] 后端API失败" 日志刷屏
+    // 后端统一完成实时/日终/货币基金分流，并提供限流保护。
+    try {
+      const backend = await fetchBackendEstimate(code)
+      if (backend && isValidEstimate(backend)) {
+        if (persisted && shouldRetainCompletedEstimate({
+          incomingSource: backend.source,
+          incomingEstimateTime: backend.gztime,
+          cachedSource: persisted.source,
+          cachedEstimateChange: persisted.gszzl,
+          cachedEstimateTime: persisted.gztime,
+          fundName: persisted.name || backend.name
+        })) {
+          cache.set(cacheKey, persisted, CACHE_TTL.ESTIMATE)
+          return persisted
+        }
+        if (persisted && shouldRetainCurrentDayEstimate({
+          incomingEstimateChange: backend.gszzl,
+          incomingEstimateTime: backend.gztime,
+          cachedEstimateChange: persisted.gszzl,
+          cachedEstimateTime: persisted.gztime
+        })) {
+          cache.set(cacheKey, persisted, CACHE_TTL.ESTIMATE)
+          return persisted
+        }
+        cache.set(cacheKey, backend, CACHE_TTL.ESTIMATE)
+        // A market snapshot is an official NAV fallback, not an intraday
+        // estimate. Do not overwrite the device's last same-day fundgz value:
+        // it is needed after close to compare the published NAV with the
+        // actual intraday estimate.
+        if (backend.source !== 'market_snapshot') {
+          persistCache.set(cacheKey, backend)
+        }
+        return backend
+      }
+    } catch {
+      // 后端不可用时保留浏览器 JSONP 作为灾备。
+    }
+
     // [WHAT] 后端API失败时，尝试JSONP接口
     try {
       const data = await fetchEstimateFromMainApi(code)
@@ -331,6 +389,15 @@ export async function fetchFundEstimateFast(code: string): Promise<FundEstimate>
         // [EDGE] QDII基金估值日期检查：如果估值日期不是今天，说明该市场今日没有开盘
         //       返回一个特殊估值，表示"无今日估值"
         if (!isEstimateToday(data)) {
+          if (persisted && shouldRetainCurrentDayEstimate({
+            incomingEstimateChange: data.gszzl,
+            incomingEstimateTime: data.gztime,
+            cachedEstimateChange: persisted.gszzl,
+            cachedEstimateTime: persisted.gztime
+          })) {
+            cache.set(cacheKey, persisted, CACHE_TTL.ESTIMATE)
+            return persisted
+          }
           console.warn(`[估值] JSONP返回非今日数据: ${data.gztime}`)
           const noEstimate: FundEstimate = {
             fundcode: code,
@@ -417,9 +484,8 @@ const sinaEstimateNetworthInflight = new Map<string, Promise<FundEstimateWithSou
  */
 export async function fetchSinaEstimate(code: string, dsType: 'sina_ds2' | 'sina_ds3'): Promise<FundEstimateWithSource | null> {
   const cacheKey = `sina_${dsType}_${code}`
-  
-  // [FIX] 清除旧缓存，确保获取最新数据
-  cache.delete(cacheKey)
+  const cached = cache.get<FundEstimateWithSource>(cacheKey)
+  if (cached) return cached
   
   // 检查是否已在请求中（去重）
   const inflight = sinaEstimateNetworthInflight.get(cacheKey)
@@ -428,88 +494,15 @@ export async function fetchSinaEstimate(code: string, dsType: 'sina_ds2' | 'sina
   // 创建新请求（通过后端API代理）
   const promise = (async (): Promise<FundEstimateWithSource | null> => {
     try {
-      // [WHAT] 通过后端 /sina 代理访问新浪接口，避免跨域
-      const baseUrl = USE_PROXY ? `${API_BASE_URL}/sina` : ''
-      const url = `${baseUrl}/fundInfo/api/openapi.php/FdFundService.getEstimateNetworthPic?symbol=${code}&_=${Date.now()}`
-      
-      console.log(`[新浪估值${dsType}] 请求:`, url)
-      
       const controller = new AbortController()
-      const timer = setTimeout(() => controller.abort(), 10000)
-      
-      const response = await fetch(url, {
-        signal: controller.signal,
-        headers: { 'Accept': 'application/json' }
-      })
+      const timer = setTimeout(() => controller.abort(), 5000)
+      const response = await fetch(`${API_BASE_URL}/api/fund-estimate-sources?code=${code}`, { signal: controller.signal })
       clearTimeout(timer)
-      
-      if (!response.ok) {
-        console.warn(`[新浪估值${dsType}] HTTP错误 ${response.status}:`, code)
-        return null
-      }
-      
-      const json = await response.json()
-      console.log(`[新浪估值${dsType}] 原始响应:`, json?.result?.status?.code, 'networth长度:', json?.result?.data?.networth?.length)
-      
-      // [WHAT] 后端返回的新浪原始格式:
-      // { result: { status: { code: 0 }, data: { networth: [...] } } }
-      // networth 是时序数组，每项包含:
-      //   growthrate (新浪A涨跌幅小数), pre_nav (新浪A估算净值)
-      //   growthrate2 (新浪B涨跌幅小数), pre_nav2 (新浪B估算净值)
-      //   min_time (时间点 HH:mm:ss), pre_date (日期 YYYY-MM-DD)
-      const networth = json?.result?.data?.networth
-      if (!Array.isArray(networth) || networth.length === 0) {
-        console.warn(`[新浪估值${dsType}] networth为空:`, code)
-        return null
-      }
-      
-      // [WHAT] 找到最后一个有完整数据的点（同时包含 pre_nav 和 pre_nav2）
-      let lastPoint: typeof networth[0] | null = null
-      for (let i = networth.length - 1; i >= 0; i--) {
-        const point = networth[i]
-        if (point.pre_nav !== undefined && point.pre_nav2 !== undefined) {
-          lastPoint = point
-          break
-        }
-      }
-      
-      if (!lastPoint) {
-        console.warn(`[新浪估值${dsType}] 无有效数据点:`, code)
-        return null
-      }
-      
-      // [DATA] 根据 dsType 选择字段（与源项目 app/api/fund.js 一致）
-      const gRateKey = dsType === 'sina_ds2' ? 'growthrate' : 'growthrate2'
-      const navKey = dsType === 'sina_ds2' ? 'pre_nav' : 'pre_nav2'
-      
-      const growthrateStr = String(lastPoint[gRateKey] || '')
-      const preNavStr = String(lastPoint[navKey] || '')
-      const minTime = lastPoint.min_time || ''
-      const preDate = lastPoint.pre_date || ''
-      
-      const growthrate = parseFloat(growthrateStr)
-      const preNav = parseFloat(preNavStr)
-      
-      if (!Number.isFinite(growthrate) || !Number.isFinite(preNav)) {
-        console.warn(`[新浪估值${dsType}] 无效数值:`, code, growthrateStr, preNavStr)
-        return null
-      }
-      
-      // [DATA] growthrate 是小数(如 0.0841)，转为百分比字符串 "8.41"
-      const gszzl = (growthrate * 100).toFixed(2)
-      
-      // [DATA] 时间格式：pre_date + 空格 + min_time
-      const gztime = `${preDate} ${minTime}`.trim()
-      
-      const result: FundEstimateWithSource = {
-        fundcode: code,
-        name: '',
-        dwjz: '',
-        gsz: preNav.toFixed(4),
-        gszzl,
-        gztime,
-        source: dsType
-      }
+      if (!response.ok) return null
+      const payload = await response.json()
+      const item = payload?.data?.sources?.[dsType]
+      if (!item?.gsz || !item?.gszzl) return null
+      const result = item as FundEstimateWithSource
 
       cache.set(cacheKey, result, CACHE_TTL.ESTIMATE)
       return result
@@ -553,7 +546,7 @@ export async function fetchFundEstimateBySource(
       // 新浪失败时降级到天天基金
       console.warn(`[多数据源] ${source} 失败，降级到 fundgz: ${code}`)
       const fallback = await fetchFundEstimateFast(code)
-      return { ...fallback, source }
+      return { ...fallback, source: 'fundgz' }
     }
       
     default:
@@ -723,6 +716,27 @@ async function fetchEstimateFromHoldings(code: string): Promise<FundEstimate | n
  * 获取基金重仓股（用于估值计算）
  */
 async function fetchStockHoldingsForEstimate(code: string): Promise<StockHolding[]> {
+  try {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 5000)
+    const response = await fetch(`${API_BASE_URL}/api/funds/${code}/holdings`, { signal: controller.signal })
+    clearTimeout(timer)
+    if (response.ok) {
+      const payload = await response.json()
+      const holdings: StockHolding[] = (payload?.data?.holdings || []).map((item: any) => ({
+        stockCode: item.stockCode || '',
+        stockName: item.stockName || '',
+        holdingRatio: Number(item.holdingRatio) || 0,
+        holdingAmount: item.holdingMarketValue ? String(item.holdingMarketValue) : '0',
+        changeFromLast: '--',
+        marketPrefix: item.marketPrefix || ''
+      })).filter((item: StockHolding) => item.stockCode && item.stockName && item.holdingRatio > 0)
+      if (holdings.length > 0) return holdings
+    }
+  } catch {
+    // 后端不可用时继续使用 JSONP 灾备。
+  }
+
   return new Promise((resolve) => {
     const callbackName = `jjcc_${Date.now()}_${Math.random().toString(36).slice(2)}`
     const timeout = setTimeout(() => {
@@ -859,10 +873,15 @@ function parseStockHoldingsHtml(html: string): StockHolding[] {
  * 批量获取基金估值（并发优化）
  */
 export async function fetchFundEstimatesBatch(codes: string[]): Promise<Map<string, FundEstimate>> {
-  const results = new Map<string, FundEstimate>()
-  
-  // 并发请求所有基金
-  const promises = codes.map(async code => {
+  const uniqueCodes = [...new Set(codes)]
+  let results = new Map<string, FundEstimate>()
+  try {
+    results = await fetchBackendEstimates(uniqueCodes)
+  } catch {
+    // 后端不可用时仅对缺失项启用逐只灾备。
+  }
+
+  const promises = uniqueCodes.filter(code => !results.has(code)).map(async code => {
     try {
       const data = await fetchFundEstimateFast(code)
       results.set(code, data)
@@ -898,6 +917,33 @@ export async function fetchNetValueHistoryFast(code: string, days = 30): Promise
   // [WHAT] 盘后使用更短的缓存时间（30秒），确保能获取到最新公布的真实净值
     const ttl = getMarketAwareTtl()
 
+  // 优先使用后端统一历史净值服务；服务端提供持久化旧缓存降级，
+  // 可避免浏览器串行加载 pingzhongdata 全局变量。
+  let backendRecords: NetValueRecord[] = []
+  try {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 5000)
+    const response = await fetch(`${API_BASE_URL}/api/funds/${code}/nav-history?limit=${Math.min(days, 500)}`, {
+      signal: controller.signal
+    })
+    clearTimeout(timer)
+    if (response.ok) {
+      const payload = await response.json()
+      backendRecords = (payload?.data?.items || []).map((item: any) => ({
+        date: item.date || '',
+        netValue: Number(item.nav) || 0,
+        totalValue: Number(item.accumulatedNav) || 0,
+        changeRate: Number(item.changePercent) || 0
+      })).filter((item: NetValueRecord) => item.date && item.netValue > 0)
+      if (backendRecords.length >= Math.min(days, 30)) {
+        cache.set(cacheKey, backendRecords, ttl)
+        return backendRecords
+      }
+    }
+  } catch {
+    // 后端不可用时继续使用现有 JSONP 灾备。
+  }
+
   // [WHAT] 排入串行队列，等待前面的脚本加载完再加载自己的
   const result = await new Promise<NetValueRecord[]>((resolve) => {
     scriptQueue = scriptQueue.then(() => {
@@ -905,7 +951,7 @@ export async function fetchNetValueHistoryFast(code: string, days = 30): Promise
         const scriptId = `pingzhongdata_${code}_${Date.now()}`
         const timeout = setTimeout(() => {
           cleanup()
-          resolve([])
+          resolve(backendRecords)
           res()
         }, 10000)
 
@@ -921,7 +967,7 @@ export async function fetchNetValueHistoryFast(code: string, days = 30): Promise
             cleanup()
 
             if (!Array.isArray(trend) || trend.length === 0) {
-              resolve([])
+              resolve(backendRecords)
               res()
               return
             }
@@ -935,20 +981,26 @@ export async function fetchNetValueHistoryFast(code: string, days = 30): Promise
               changeRate: typeof item.equityReturn === 'number' ? item.equityReturn : 0
             }))
 
-                        cache.set(cacheKey, records, ttl)
-            resolve(records)
+            const byDate = new Map(records.map(item => [item.date, item]))
+            backendRecords.forEach(item => byDate.set(item.date, item))
+            const merged = [...byDate.values()]
+              .filter(item => item.date && item.netValue > 0)
+              .sort((left, right) => right.date.localeCompare(left.date))
+              .slice(0, days)
+            cache.set(cacheKey, merged, ttl)
+            resolve(merged)
             res()
           } catch (err) {
             console.error('解析历史净值失败:', code, err)
             cleanup()
-            resolve([])
+            resolve(backendRecords)
             res()
           }
         }
 
         script.onerror = () => {
           cleanup()
-          resolve([])
+          resolve(backendRecords)
           res()
         }
 

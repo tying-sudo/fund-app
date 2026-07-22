@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Optional, List, Tuple
 
 from positions import load_positions, save_positions, parse_fund_key, position_write
-from valuation.core import calculate_valuation
+from valuation.core import beijing_now, calculate_valuation
 from valuation.providers import get_fund_nav_history
 
 # ============================================================
@@ -78,11 +78,11 @@ def _append_signal_history(fund_code: str, signal: dict, market: dict):
         history = _load_history_unlocked()
         records = history.setdefault(fund_code, [])
 
-        today_str = datetime.now().strftime("%Y-%m-%d")
+        today_str = beijing_now().strftime("%Y-%m-%d")
         source = signal.get("_source") or market.get("_source") or "estimation"
         entry = {
             "date": today_str,
-            "time": datetime.now().strftime("%H:%M:%S"),
+            "time": beijing_now().strftime("%H:%M:%S"),
             "source": source,
             "signal_name": signal.get("signal_name"),
             "action": signal.get("action"),
@@ -205,7 +205,7 @@ def _cache_auto_vol_sensitivity(fund_code: str, calibrated: float) -> tuple:
         return value, "manual"
 
     fund["vol_sensitivity_auto"] = calibrated
-    fund["vol_sensitivity_auto_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    fund["vol_sensitivity_auto_at"] = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
     save_positions(data)
     return max(0.5, min(1.5, calibrated)), "auto"
 
@@ -235,7 +235,7 @@ def _get_vol_sensitivity(fund_code: str) -> tuple:
     if cached is not None and cached_at:
         try:
             ts = datetime.strptime(cached_at, "%Y-%m-%d %H:%M:%S")
-            if (datetime.now() - ts).total_seconds() < _VOL_SENS_CACHE_TTL:
+            if (beijing_now() - ts).total_seconds() < _VOL_SENS_CACHE_TTL:
                 return max(0.5, min(1.5, cached)), "auto"
         except (ValueError, TypeError):
             pass
@@ -446,7 +446,7 @@ REGIME_PARAMS = {
 }
 
 # 自动识别结果缓存有效期（秒）
-_REGIME_CACHE_TTL = 3600 * 6  # 6小时
+_REGIME_CACHE_TTL = 60 * 15  # 15分钟，避免自动模式滞后于盘中趋势
 
 def _get_market_regime() -> str:
     """
@@ -482,7 +482,12 @@ def _auto_detect_regime(trend_ctx: dict) -> str:
     long_20d = trend_ctx.get("long_20d")
     trend_label = trend_ctx.get("trend_label", "震荡")
 
-    # v5.17: 只检测熊市（牛市参数=基线，检测无意义）
+    # 牛熊都使用严格的 20 日趋势确认，避免短期波动频繁切换。
+    # 牛市参数保持基线，只恢复模式标识和展示，不放宽风控参数。
+    if (long_20d is not None and long_20d > 15
+            and trend_label in ("连涨", "中期走强")):
+        return "bull"
+
     # 熊市: 20日跌<-10% 且 趋势标签确认（极端弱势才触发）
     if (long_20d is not None and long_20d < -10
             and trend_label in ("连跌", "中期走弱")):
@@ -517,7 +522,7 @@ def _resolve_regime(trend_ctx: dict = None) -> str:
         if cached_regime and cached_at:
             try:
                 ts = datetime.strptime(cached_at, "%Y-%m-%d %H:%M:%S")
-                if (datetime.now() - ts).total_seconds() < _REGIME_CACHE_TTL:
+                if (beijing_now() - ts).total_seconds() < _REGIME_CACHE_TTL:
                     return cached_regime
             except (ValueError, TypeError):
                 pass
@@ -525,7 +530,7 @@ def _resolve_regime(trend_ctx: dict = None) -> str:
         # 自动识别并缓存
         detected = _auto_detect_regime(trend_ctx)
         data["regime_auto_result"] = detected
-        data["regime_auto_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        data["regime_auto_at"] = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
         data["market_regime"] = detected
         save_positions(data)
         return detected
@@ -543,11 +548,11 @@ def set_market_regime(regime: str, auto: bool = True, manual: bool = False) -> d
     """
     设置行情模式（供API调用）。
     参数:
-        regime: "neutral" / "bear"（v5.17: bull已禁用，自动映射为neutral）
+        regime: "bull" / "neutral" / "bear"
         auto: 是否开启自动识别（默认开启）
         manual: 是否为手动指认（手动优先级高于自动）
     """
-    if regime == "bull" or regime not in ("neutral", "bear"):
+    if regime not in ("bull", "neutral", "bear"):
         regime = "neutral"
     data = load_positions()
 
@@ -582,9 +587,7 @@ def get_market_regime_info() -> dict:
     auto_result = data.get("regime_auto_result")
     auto_at = data.get("regime_auto_at")
     manual_regime = data.get("regime_manual")
-    effective = manual_regime if manual_regime in ("neutral", "bear") else (auto_result or regime)
-    if effective == "bull":  # v5.17: bull已禁用
-        effective = "neutral"
+    effective = manual_regime if manual_regime in ("bull", "neutral", "bear") else (auto_result or regime)
     return {
         "regime": effective,
         "auto": auto,

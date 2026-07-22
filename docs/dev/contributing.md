@@ -8,7 +8,7 @@
 
 如果你发现了 Bug 或有功能建议：
 
-1. 在 [Issues](https://github.com/xiriovo/fund-app/issues) 中搜索是否已有相关问题
+1. 在 [Issues](https://github.com/tying-sudo/fund-app/issues) 中搜索是否已有相关问题
 2. 如果没有，创建新的 Issue
 3. 详细描述问题或建议，最好附带截图或复现步骤
 
@@ -90,7 +90,7 @@ git commit -m "fix: 修复 K 线图空数据问题"
 ## 需要帮助？
 
 - 查看 [开发文档](/dev/setup)
-- 在 [Discussions](https://github.com/xiriovo/fund-app/discussions) 提问
+- 在 [Discussions](https://github.com/tying-sudo/fund-app/discussions) 提问
 - 联系维护者
 
 再次感谢你的贡献！🎉

@@ -39,8 +39,10 @@ export function addCalendarDays(dateString: string, days: number): string {
   return value.toISOString().slice(0, 10)
 }
 
-export function getSettlementNavStartDate(tradeDate: string, timeSlot: 'before' | 'after'): string {
-  return timeSlot === 'after' ? addCalendarDays(tradeDate, 1) : tradeDate
+export function getSettlementNavStartDate(tradeDate: string, _timeSlot: 'before' | 'after'): string {
+  // Keep adjustments pending through the trade date. The first official NAV
+  // published for a later trading day performs the actual position update.
+  return addCalendarDays(tradeDate, 1)
 }
 
 export function findSettlementNav(

@@ -19,6 +19,7 @@ from datetime import datetime, timedelta
 from typing import Optional, List
 
 from positions import load_positions, save_positions, parse_fund_key, position_write
+from valuation.core import beijing_now
 
 # ============================================================
 # 常量
@@ -83,7 +84,7 @@ def add_pending_rebuy(fund_code: str, trigger_nav: float, amount: float,
             return None
 
         pending = fund.setdefault("pending_rebuys", [])
-        today = datetime.now().date()
+        today = beijing_now().date()
         today_str = today.strftime("%Y-%m-%d")
 
         # 软上限检查：超过最大并发数则拒绝
@@ -151,7 +152,7 @@ def check_pending_rebuy_trigger(fund_code: str, current_nav: float) -> Optional[
         if not pending:
             return None
 
-        today_str = datetime.now().strftime("%Y-%m-%d")
+        today_str = beijing_now().strftime("%Y-%m-%d")
         triggered = None
         changed = False
 
@@ -192,7 +193,7 @@ def consume_pending_rebuy(fund_code: str, pending_id: str, batch_id: str) -> boo
         for pr in pending:
             if pr.get("id") == pending_id and pr.get("status") == "pending":
                 pr["status"] = "triggered"
-                pr["triggered_at"] = datetime.now().strftime("%Y-%m-%d")
+                pr["triggered_at"] = beijing_now().strftime("%Y-%m-%d")
                 pr["triggered_batch_id"] = batch_id
                 save_positions(data)
                 print(f"[PendingRebuy] {fund_code} {pending_id} → triggered "
@@ -210,7 +211,7 @@ def cleanup_expired_pending_rebuys(fund_code: str = None) -> int:
     with _pending_lock:
         data = load_positions()
         funds = data.get("funds", {})
-        today_str = datetime.now().strftime("%Y-%m-%d")
+        today_str = beijing_now().strftime("%Y-%m-%d")
         count = 0
         codes = [fund_code] if fund_code else list(funds.keys())
         for code in codes:
@@ -240,7 +241,7 @@ def get_pending_rebuys(fund_code: str, include_history: bool = False) -> List[di
     all_pending = fund.get("pending_rebuys", [])
     if include_history:
         return list(all_pending)
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = beijing_now().strftime("%Y-%m-%d")
     return [p for p in all_pending if _is_active(p, today_str)]
 
 

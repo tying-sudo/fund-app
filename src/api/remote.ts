@@ -8,7 +8,10 @@
 // [WHAT] 远程配置文件 URL
 // [HOW] 使用相对于 index.html 的路径，兼容 Web 和 Android Capacitor WebView
 // [WHY] 绝对路径 /config/announcement.json 在 Capacitor WebView 中可能解析失败导致 CORS 错误
+import { API_BASE_URL } from '@/config/api'
+
 const REMOTE_CONFIG_URL = './config/announcement.json'
+const APP_RELEASE_URL = `${API_BASE_URL}/api/app/version`
 
 /**
  * 公告类型
@@ -54,6 +57,39 @@ export interface RemoteConfig {
   links?: {
     github?: string
     feedback?: string
+  }
+}
+
+export interface AppReleaseInfo {
+  version: string
+  versionCode: number
+  minimumVersion: string
+  forceUpdate: boolean
+  title: string
+  releaseNotes: string[]
+  available: boolean
+  apkUrl: string | null
+  apkFileName: string
+  sha256: string | null
+  sizeBytes: number | null
+  publishedAt: string | null
+}
+
+/** 从公开后端实时读取 Android 版本和安装包信息。 */
+export async function fetchAppRelease(): Promise<AppReleaseInfo | null> {
+  try {
+    const response = await fetch(`${APP_RELEASE_URL}?t=${Date.now()}`, {
+      method: 'GET',
+      cache: 'no-store'
+    })
+    if (!response.ok) return null
+
+    const payload = await response.json() as { data?: AppReleaseInfo }
+    if (!payload.data || typeof payload.data.version !== 'string') return null
+    return payload.data
+  } catch (error) {
+    console.warn('获取应用版本失败:', error)
+    return null
   }
 }
 
