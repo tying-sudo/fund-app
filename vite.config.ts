@@ -37,7 +37,7 @@ export default defineConfig({
       },
       // [FIX] 开发环境：后端 API 代理到生产环境(tyingfund.com -> Cloudflare Tunnel -> 10.0.10.20:3000)
       '/api': {
-        target: 'https://tyingfund.com',
+        target: process.env.VITE_API_PROXY_TARGET || 'https://tyingfund.com',
         changeOrigin: true,
         secure: true
       },

@@ -3,7 +3,7 @@ core.py - 估值计算 + state管理 + coverage/confidence
 """
 import json
 import threading
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from math import isfinite
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -31,6 +31,155 @@ _deviation_lock = threading.Lock()
 
 # v5.22: 盘中缓存文件锁（保护 intraday_cache.json 的读写）
 _intraday_cache_lock = threading.Lock()
+
+
+def beijing_now() -> datetime:
+    """Return a naive Beijing local timestamp for legacy grid calculations."""
+    # China has no daylight-saving transition. A fixed offset also works in
+    # minimal Python deployments where the IANA tzdata package is absent.
+    return datetime.now(timezone(timedelta(hours=8))).replace(tzinfo=None)
+
+
+def _market_phase(now: Optional[datetime] = None) -> str:
+    """Return the Beijing market phase used by every valuation source."""
+    current = now or beijing_now()
+    if current.weekday() >= 5:
+        return "non_trading"
+    hhmm = current.hour * 100 + current.minute
+    if hhmm < 915:
+        return "pre_open"
+    if hhmm < 1505:
+        return "non_trading" if _is_market_closed() else "intraday"
+    return "post_close"
+
+
+def _remember_intraday_estimate(fund_code: str, value: float, source: str,
+                                asof_time: Optional[str] = None) -> None:
+    if not isfinite(value):
+        return
+    snapshot = {
+        "date": beijing_now().strftime("%Y-%m-%d"),
+        "est": round(value, 4),
+        "source": source if source != "nav" else "estimation",
+    }
+    if asof_time:
+        snapshot["asof_time"] = asof_time
+    with _intraday_cache_lock:
+        _intraday_estimation_cache[fund_code] = snapshot
+
+
+def flush_intraday_cache() -> None:
+    """Persist the latest complete estimate snapshot atomically."""
+    if not _intraday_estimation_cache:
+        return
+    try:
+        _ensure_data_dir()
+        with _intraday_cache_lock:
+            cache_snapshot = dict(_intraday_estimation_cache)
+            tmp = _INTRADAY_CACHE_FILE.with_suffix(".tmp")
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(cache_snapshot, f, ensure_ascii=False, indent=2)
+            tmp.replace(_INTRADAY_CACHE_FILE)
+    except Exception:
+        pass
+
+
+def _set_nav_result(result: dict, entry: dict, note: str) -> dict:
+    # Official NAV is a settled value, rather than an intraday estimate.  Keep
+    # the same confidence contract across the direct NAV and live-source
+    # fallback paths so the UI never presents a valid settlement as 0%.
+    result["confidence"] = 1.0
+    result["calibrated_confidence"] = 1.0
+    result["estimation_change"] = round(float(entry["change"]), 4)
+    result["_source"] = "nav"
+    result["_nav_date"] = entry["date"]
+    result["_valuation_date"] = entry["date"]
+    result["_frozen"] = False
+    result["notes"].append(note)
+    return result
+
+
+def _finalize_live_estimate(result: dict, fund_code: str, history: list,
+                            live_source: str, live_date: Optional[str] = None) -> dict:
+    """Apply one market-session contract to holdings, ETF and fundgz estimates."""
+    _ensure_intraday_cache_loaded()
+    now = beijing_now()
+    today = now.strftime("%Y-%m-%d")
+    phase = _market_phase(now)
+    today_nav = next(
+        (item for item in history
+         if item.get("date") == today and item.get("change") is not None),
+        None,
+    )
+
+    live_value = result.get("estimation_change")
+    try:
+        live_value = float(live_value)
+    except (TypeError, ValueError):
+        live_value = None
+    live_is_current = live_value is not None and isfinite(live_value) and (
+        not live_date or live_date == today
+    )
+
+    if today_nav is not None:
+        if live_is_current:
+            result["_estimation_change_raw"] = round(live_value, 4)
+            record_deviation(fund_code, today, live_value, float(today_nav["change"]))
+        return _set_nav_result(result, today_nav, f"使用真实净值涨跌 {today}")
+
+    if phase == "intraday" and live_is_current:
+        _remember_intraday_estimate(fund_code, live_value, live_source, result.get("asof_time"))
+        result["_source"] = live_source
+        result["_valuation_date"] = today
+        result["_frozen"] = False
+        return result
+
+    if phase == "post_close":
+        with _intraday_cache_lock:
+            cached = dict(_intraday_estimation_cache.get(fund_code) or {})
+        if cached.get("date") == today and cached.get("est") is not None:
+            result["estimation_change"] = round(float(cached["est"]), 4)
+            result["asof_time"] = cached.get("asof_time") or result.get("asof_time")
+            result["_source"] = cached.get("source") or "estimation"
+            result["_valuation_date"] = today
+            result["_frozen"] = True
+            result["notes"].append(f"冻结收盘估值 {today}")
+            return result
+        if live_is_current:
+            # A service first started after close has no intraday file. Capture
+            # the completed closing quote once, then keep that value immutable.
+            _remember_intraday_estimate(fund_code, live_value, live_source, result.get("asof_time"))
+            result["_source"] = live_source
+            result["_valuation_date"] = today
+            result["_frozen"] = True
+            result["notes"].append(f"记录收盘估值 {today}")
+            return result
+
+    latest_nav = next((item for item in history if item.get("change") is not None), None)
+    if latest_nav is not None:
+        return _set_nav_result(result, latest_nav, f"使用真实净值涨跌 {latest_nav['date']}")
+    return result
+
+
+def calculate_period_change(result: dict, history: list, days: int) -> Optional[float]:
+    """Compound the current valuation and prior NAV days exactly once."""
+    valuation_date = result.get("_valuation_date") or result.get("_nav_date")
+    current_change = result.get("estimation_change")
+    points = []
+    if valuation_date and current_change is not None:
+        points.append({"date": valuation_date, "change": current_change})
+    points.extend(
+        item for item in history
+        if item.get("change") is not None and item.get("date") != valuation_date
+    )
+    changes = [float(item["change"]) for item in points[:days]]
+    if len(changes) < min(days, 5):
+        return None
+    product = 1.0
+    for change in changes:
+        product *= 1 + change / 100
+    return round((product - 1) * 100, 2)
+
 
 def _ensure_intraday_cache_loaded():
     """进程重启后从文件恢复盘中估值缓存（线程安全，只加载一次）。
@@ -113,11 +262,14 @@ def flush_deviations():
         _save_deviations(devs)
         _deviation_buffer.clear()
 
-def get_latest_settlement(fund_code: str) -> dict:
-    """Return the latest completed trading-day estimate and official NAV pair.
 
-    This is intentionally read-only. It lets clients recover a missing
-    non-trading-session display without treating a stale NAV as live data.
+def get_latest_settlement(fund_code: str) -> dict:
+    """Return the newest completed estimate and official NAV pair for a fund.
+
+    The mobile holding stores use this read-only endpoint after close to replace
+    intraday estimates with the published NAV result. It must remain available
+    even when the primary quote source is unavailable, so cached intraday
+    estimates and persisted deviation records are used as recovery paths.
     """
     _ensure_intraday_cache_loaded()
     from .providers import get_fund_nav_history, get_fundgz_estimation
@@ -129,9 +281,6 @@ def get_latest_settlement(fund_code: str) -> dict:
         if isinstance(item, dict) and item.get("date") and item.get("change") is not None
     }
 
-    # Prefer the fund provider's own intraday estimate whenever it has the
-    # same date as an official NAV. The grid's holdings-weighted estimate is
-    # only a fallback and may be stale for funds with changed allocations.
     fundgz = get_fundgz_estimation(fund_code)
     if fundgz:
         try:
@@ -140,8 +289,7 @@ def get_latest_settlement(fund_code: str) -> dict:
             real_change = float(nav_by_date[estimate_date])
         except (KeyError, TypeError, ValueError):
             estimate_change = real_change = None
-        if estimate_change is not None and real_change is not None and \
-                isfinite(estimate_change) and isfinite(real_change):
+        if estimate_change is not None and real_change is not None and isfinite(estimate_change) and isfinite(real_change):
             return {
                 "fund_code": fund_code,
                 "date": estimate_date,
@@ -150,10 +298,6 @@ def get_latest_settlement(fund_code: str) -> dict:
                 "difference": round(real_change - estimate_change, 4),
             }
 
-    # Always prefer one canonical calculation path for every fund: the raw
-    # intraday estimate paired with the fund company's official same-day NAV.
-    # The cached records below are only a recovery path when this calculation
-    # cannot provide a completed pair.
     valuation = calculate_valuation(fund_code)
     raw_estimate = valuation.get("_estimation_change_raw")
     nav_date = valuation.get("_nav_date")
@@ -164,8 +308,7 @@ def get_latest_settlement(fund_code: str) -> dict:
             real_change = float(official_change)
         except (TypeError, ValueError):
             estimate_change = real_change = None
-        if estimate_change is not None and real_change is not None and \
-                isfinite(estimate_change) and isfinite(real_change):
+        if estimate_change is not None and real_change is not None and isfinite(estimate_change) and isfinite(real_change):
             return {
                 "fund_code": fund_code,
                 "date": nav_date,
@@ -181,8 +324,11 @@ def get_latest_settlement(fund_code: str) -> dict:
 
     with _deviation_lock:
         deviations = _load_deviations().get(fund_code, [])
-    candidates.extend({"date": item.get("date"), "est": item.get("est")}
-                      for item in deviations if isinstance(item, dict))
+    candidates.extend(
+        {"date": item.get("date"), "est": item.get("est")}
+        for item in deviations
+        if isinstance(item, dict)
+    )
 
     seen_dates = set()
     for item in sorted(candidates, key=lambda value: str(value.get("date") or ""), reverse=True):
@@ -261,7 +407,7 @@ def _ensure_data_dir():
 def _empty_state() -> dict:
     return {
         "version": 1,
-        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "updated_at": beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
         "sectors": []
     }
 
@@ -277,7 +423,7 @@ def load_state() -> dict:
 
 def save_state(state: dict) -> bool:
     _ensure_data_dir()
-    state["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    state["updated_at"] = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
     state.setdefault("version", 1)
 
     with _state_lock:
@@ -316,7 +462,7 @@ def _calc_staleness_score(holdings_date_str: Optional[str]) -> float:
         return 0.0
     try:
         holdings_date = datetime.strptime(holdings_date_str, "%Y-%m-%d")
-        days_old = (datetime.now() - holdings_date).days
+        days_old = (beijing_now() - holdings_date).days
         if days_old <= 30:
             return 1.0
         elif days_old >= 180:
@@ -334,7 +480,7 @@ def _try_nav_fallback(result: dict, fund_code: str) -> dict:
     if not history:
         return result
 
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = beijing_now().strftime("%Y-%m-%d")
 
     # 优先用今天的净值，其次用最新一条
     entry = next(
@@ -347,9 +493,15 @@ def _try_nav_fallback(result: dict, fund_code: str) -> dict:
         return result
 
     result["estimation_change"] = round(entry["change"], 4)
+    # A published NAV is not an estimate.  It is safe to render it at full
+    # confidence even when the holdings-through calculation was unavailable.
+    result["confidence"] = 1.0
+    result["calibrated_confidence"] = 1.0
     result["_source"] = "nav"
     # 标记净值日期，前端据此显示"X月X日净值"
     result["_nav_date"] = entry["date"]
+    result["_valuation_date"] = entry["date"]
+    result["_frozen"] = False
     if entry["date"] == today_str:
         result["notes"].append(f"使用当日真实净值涨跌")
     else:
@@ -413,58 +565,13 @@ def _try_etf_realtime_fallback(result: dict, fund_code: str) -> dict:
 
     # 附带近几日真实涨跌幅
     history = get_fund_nav_history(fund_code, 5)
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = beijing_now().strftime("%Y-%m-%d")
     result["recent_changes"] = [
         {"date": h["date"], "change": h["change"]}
         for h in history if h["date"] != today_str and h.get("change") is not None
     ][:3]
 
-    # 收盘后仍用真实净值替代
-    if _is_market_closed():
-        # v5.22: ETF路径也从盘中缓存取估值
-        _cached = _intraday_estimation_cache.get(fund_code)
-        _est_raw = (
-            _cached["est"]
-            if _cached and _cached["date"] == today_str and _cached["est"] is not None
-            else pct  # fallback: 用当前ETF实时值
-        )
-        today_nav = next(
-            (h for h in history if h["date"] == today_str and h.get("change") is not None),
-            None
-        )
-        if today_nav:
-            result["estimation_change"] = round(today_nav["change"], 4)
-            result["_source"] = "nav"
-            result["_nav_date"] = today_str
-            result["notes"].append(f"收盘后使用真实净值 {today_str}")
-            # v5.22: ETF路径也记录偏差（0%也是有效值）
-            if _est_raw is not None:
-                result["_estimation_change_raw"] = _est_raw
-                record_deviation(fund_code, today_str, _est_raw, today_nav["change"])
-        # v5.23: 次日补录——缓存日期非今日但NAV历史中有该日净值，补录偏差
-        if _cached and _cached["date"] != today_str and _cached["est"] is not None:
-            _cache_date = _cached["date"]
-            _cache_nav = next(
-                (h for h in history if h["date"] == _cache_date and h.get("change") is not None),
-                None
-            )
-            if _cache_nav:
-                record_deviation(fund_code, _cache_date, _cached["est"], _cache_nav["change"])
-        elif result["recent_changes"]:
-            latest = result["recent_changes"][0]
-            if latest["change"] is not None:
-                result["estimation_change"] = round(latest["change"], 4)
-                result["_source"] = "nav"
-                result["_nav_date"] = latest["date"]
-                result["notes"].append(f"收盘后使用真实净值 {latest['date']}")
-    else:
-        # v5.22: 盘中缓存ETF估值
-        _intraday_estimation_cache[fund_code] = {
-            "date": today_str,
-            "est": pct
-        }
-
-    return result
+    return _finalize_live_estimate(result, fund_code, history, "etf_realtime")
 
 
 def _try_fundgz_fallback(result: dict, fund_code: str) -> dict:
@@ -490,7 +597,7 @@ def _try_fundgz_fallback(result: dict, fund_code: str) -> dict:
     if gztime:
         try:
             gz_date = datetime.strptime(gztime[:10], "%Y-%m-%d")
-            days_old = (datetime.now() - gz_date).days
+            days_old = (beijing_now() - gz_date).days
             if days_old > 3:
                 # 超过3天的估值太旧，不使用
                 return result
@@ -506,51 +613,19 @@ def _try_fundgz_fallback(result: dict, fund_code: str) -> dict:
 
     # 附带近几日真实涨跌幅
     history = get_fund_nav_history(fund_code, 5)
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = beijing_now().strftime("%Y-%m-%d")
     result["recent_changes"] = [
         {"date": h["date"], "change": h["change"]}
         for h in history if h.get("change") is not None
     ][:5]
 
-    # 收盘后优先用真实净值
-    if _is_market_closed():
-        # v5.22: fundgz路径也从盘中缓存取估值
-        _cached = _intraday_estimation_cache.get(fund_code)
-        _est_raw = (
-            _cached["est"]
-            if _cached and _cached["date"] == today_str and _cached["est"] is not None
-            else gszzl  # fallback: 用当前fundgz估值
-        )
-        today_nav = next(
-            (h for h in history if h["date"] == today_str and h.get("change") is not None),
-            None
-        )
-        if today_nav:
-            result["estimation_change"] = round(today_nav["change"], 4)
-            result["_source"] = "nav"
-            result["_nav_date"] = today_str
-            result["notes"].append(f"收盘后使用真实净值 {today_str}")
-            # v5.22: fundgz路径也记录偏差（0%也是有效值）
-            if _est_raw is not None:
-                result["_estimation_change_raw"] = _est_raw
-                record_deviation(fund_code, today_str, _est_raw, today_nav["change"])
-        # v5.23: 次日补录——缓存日期非今日但NAV历史中有该日净值，补录偏差
-        if _cached and _cached["date"] != today_str and _cached["est"] is not None:
-            _cache_date = _cached["date"]
-            _cache_nav = next(
-                (h for h in history if h["date"] == _cache_date and h.get("change") is not None),
-                None
-            )
-            if _cache_nav:
-                record_deviation(fund_code, _cache_date, _cached["est"], _cache_nav["change"])
-    else:
-        # v5.22: 盘中缓存fundgz估值
-        _intraday_estimation_cache[fund_code] = {
-            "date": today_str,
-            "est": gszzl
-        }
-
-    return result
+    return _finalize_live_estimate(
+        result,
+        fund_code,
+        history,
+        "fundgz",
+        live_date=gztime[:10] if gztime else None,
+    )
 
 
 def calculate_valuation(fund_code: str) -> dict:
@@ -684,70 +759,13 @@ def calculate_valuation(fund_code: str) -> dict:
     # 6. 附带近3个交易日真实涨跌幅（已结算数据，不含今天）
     from .providers import get_fund_nav_history
     history = get_fund_nav_history(fund_code, 5)
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = beijing_now().strftime("%Y-%m-%d")
     result["recent_changes"] = [
         {"date": h["date"], "change": h["change"]}
         for h in history if h["date"] != today_str
     ][:3]  # 过滤今天后取前3条
 
-    # 7. 收盘后用真实净值涨跌替代估值
-    #    盘中估值只在交易时段可靠，收盘后新浪行情数据不再反映当日真实涨跌
-    #    （尤其含港股持仓时，A股/港股收盘时间不同导致偏差更大）
-    #    替换条件：当天已收盘（15:05后、或非交易日）且有真实净值数据
-    if _is_market_closed():
-        # v5.22: intraday_cache 已由 batch 入口的 _ensure_intraday_cache_loaded() 统一加载
-        # v5.20: 收盘后优先从盘中缓存取估值（比当前重算的更准确）
-        _cached = _intraday_estimation_cache.get(fund_code)
-        _est_raw = (
-            _cached["est"]
-            if _cached and _cached["date"] == today_str and _cached["est"] is not None
-            else result["estimation_change"]  # fallback: 用当前重算的值
-        )
-
-        # 优先查找今天的真实净值（收盘后基金公司已公布当日净值）
-        today_nav_entry = next(
-            (h for h in history if h["date"] == today_str and h.get("change") is not None),
-            None
-        )
-        if today_nav_entry is not None:
-            result["estimation_change"] = round(today_nav_entry["change"], 4)
-            result["_source"] = "nav"
-            result["_nav_date"] = today_str
-            result["notes"].append(f"使用真实净值涨跌 {today_str}")
-            # v5.22: 记录偏差（仅当盘中有过有效估值时，0%也是有效值）
-            if _est_raw is not None:
-                result["_estimation_change_raw"] = _est_raw
-                record_deviation(fund_code, today_str, _est_raw, today_nav_entry["change"])
-        # v5.23: 次日补录——缓存日期非今日但NAV历史中有该日净值，补录偏差
-        if _cached and _cached["date"] != today_str and _cached["est"] is not None:
-            _cache_date = _cached["date"]
-            _cache_nav = next(
-                (h for h in history if h["date"] == _cache_date and h.get("change") is not None),
-                None
-            )
-            if _cache_nav:
-                record_deviation(fund_code, _cache_date, _cached["est"], _cache_nav["change"])
-        if today_nav_entry is None and result["recent_changes"]:
-            # 今天的净值尚未公布，退回到最近一个交易日的真实净值
-            latest = result["recent_changes"][0]
-            if latest["change"] is not None:
-                result["estimation_change"] = round(latest["change"], 4)
-                result["_source"] = "nav"
-                result["_nav_date"] = latest["date"]
-                result["notes"].append(f"使用真实净值涨跌 {latest['date']}")
-            else:
-                result["_source"] = "estimation"
-        elif today_nav_entry is None:
-            result["_source"] = "estimation"
-    else:
-        result["_source"] = "estimation"
-        # v5.20: 盘中缓存当前估值，供收盘后偏差记录使用
-        # v5.22: 仅写内存缓存，文件持久化由 calculate_valuation_batch 统一完成
-        if result["estimation_change"] is not None:
-            _intraday_estimation_cache[fund_code] = {
-                "date": today_str,
-                "est": result["estimation_change"]
-            }
+    _finalize_live_estimate(result, fund_code, history, "estimation")
 
     # v5.20: 附带校准后的置信度（供前端和 engine 统一使用）
     result["calibrated_confidence"] = calibrate_confidence(fund_code, result["confidence"])
@@ -761,7 +779,7 @@ def _is_market_closed() -> bool:
     盘前/盘中/午休 都返回 False，只有15:05后和非交易日返回 True
     节假日检测：最近一个有净值的交易日距今>3天则视为长假期间
     """
-    now = datetime.now()
+    now = beijing_now()
     weekday = now.weekday()  # 0=周一 ... 6=周日
     if weekday >= 5:
         return True  # 周末
@@ -794,22 +812,13 @@ def calculate_valuation_batch(fund_codes: List[str]) -> List[dict]:
     if not fund_codes:
         return []
 
-    def _calc_period_change(history: list, days: int):
-        changes = [h["change"] for h in history if h.get("change") is not None][:days]
-        if len(changes) < min(days, 5):
-            return None
-        product = 1.0
-        for change in changes:
-            product *= 1 + change / 100
-        return round((product - 1) * 100, 2)
-
     def _calculate_one(code: str) -> dict:
         # calculate_valuation 会先加载一次历史净值；这里读取22日时直接复用
         # provider 的30日缓存，避免原实现对同一基金并发发起三次请求。
         result = calculate_valuation(code)
         history = get_fund_nav_history(code, 22)
-        result["week_change"] = _calc_period_change(history, 5)
-        result["month_change"] = _calc_period_change(history, 20)
+        result["week_change"] = calculate_period_change(result, history, 5)
+        result["month_change"] = calculate_period_change(result, history, 20)
         return result
 
     # v5.22: 在并发计算之前统一加载盘中缓存（进程重启恢复场景）
@@ -859,18 +868,7 @@ def calculate_valuation_batch(fund_codes: List[str]) -> List[dict]:
     # 避免并发逐只写文件导致 load 到不完整数据覆盖历史
     flush_deviations()
 
-    # v5.22: 盘中缓存也在并发结束后统一持久化一次（而非每只基金写一次）
-    if _intraday_estimation_cache:
-        try:
-            _ensure_data_dir()
-            with _intraday_cache_lock:
-                cache_snapshot = dict(_intraday_estimation_cache)
-                tmp = _INTRADAY_CACHE_FILE.with_suffix(".tmp")
-                with open(tmp, "w", encoding="utf-8") as f:
-                    json.dump(cache_snapshot, f, ensure_ascii=False, indent=2)
-                tmp.replace(_INTRADAY_CACHE_FILE)
-        except Exception:
-            pass
+    flush_intraday_cache()
 
     return results
 
@@ -879,7 +877,7 @@ def calculate_valuation_by_state() -> dict:
     _ensure_intraday_cache_loaded()
     state = load_state()
     result = {
-        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "updated_at": beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
         "sectors": []
     }
 

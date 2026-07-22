@@ -14,7 +14,7 @@ hero:
       link: /download
     - theme: alt
       text: GitHub
-      link: https://github.com/xiriovo/fund-app
+      link: https://github.com/tying-sudo/fund-app
 
 features:
   - icon: ⚡
@@ -57,5 +57,5 @@ features:
 
 ## 联系我们
 
-- GitHub Issues: [提交问题](https://github.com/xiriovo/fund-app/issues)
-- 开源协议: [MIT License](https://github.com/xiriovo/fund-app/blob/main/LICENSE)
+- GitHub Issues: [提交问题](https://github.com/tying-sudo/fund-app/issues)
+- 开源协议: [MIT License](https://github.com/tying-sudo/fund-app/blob/main/LICENSE)

@@ -6,18 +6,24 @@
 import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { useFundStore } from '@/stores/fund'
+import { useHoldingStore } from '@/stores/holding'
 import { useThemeStore } from '@/stores/theme'
 import { fetchStockHoldings, detectShareClass } from '@/api/fund'
-import { fetchFundEstimateFast, fetchStockQuotes, fetchRealDayChange } from '@/api/fundFast'
-import { fetchPeriodReturnExt, fetchSimilarFunds, type PeriodReturnExt, type SimilarFund } from '@/api/tiantianApi'
-import type { FundEstimate, StockHolding, FundShareClass } from '@/types/fund'
+import { fetchFundEstimateFast, fetchStockQuotes, fetchRealDayChange, fetchNetValueHistoryFast } from '@/api/fundFast'
+import { fetchGridValuations } from '@/api/gridNative'
+import { fetchLatestValuationSettlement } from '@/api/valuationGrid'
+import { fetchSimilarFunds, type PeriodReturnExt, type SimilarFund } from '@/api/tiantianApi'
+import type { FundEstimate, StockHolding, FundShareClass, HoldingRecord } from '@/types/fund'
 import { getJdFundLink } from '@/utils/format'
+import { getBeijingDateString } from '@/utils/tradingDate'
+import { getValuationComparisonState, hasUsableCurrentEstimate, isFundTradingHours, isRetainedMarketEstimate, shouldUseGridEstimateFallback } from '@/utils/holdingCalculator'
 import { showToast } from 'vant'
-import ProChart from '@/components/OKXChart.vue'
+import FundPerformancePanel from '@/components/FundPerformancePanel.vue'
 
 const route = useRoute()
 const router = useRouter()
 const fundStore = useFundStore()
+const holdingStore = useHoldingStore()
 const themeStore = useThemeStore()
 
 // [WHAT] 基金代码
@@ -31,6 +37,33 @@ const similarFunds = ref<SimilarFund[]>([])
 const isLoading = ref(true)
 const shareClass = ref<FundShareClass>('A')
 
+function derivePeriodReturnsFromHistory(history: Awaited<ReturnType<typeof fetchNetValueHistoryFast>>): PeriodReturnExt[] {
+  const latest = history[0]
+  if (!latest) return []
+  const latestTime = new Date(`${latest.date}T00:00:00+08:00`).getTime()
+  const definitions = [
+    { period: 'Z', label: '近1周', days: 7 },
+    { period: 'Y', label: '近1月', days: 30 },
+    { period: '3Y', label: '近3月', days: 90 },
+    { period: '6Y', label: '近6月', days: 180 },
+    { period: '1N', label: '近1年', days: 365 }
+  ]
+  return definitions.flatMap(item => {
+    const cutoff = latestTime - item.days * 24 * 60 * 60 * 1000
+    const start = history.find(record => new Date(`${record.date}T00:00:00+08:00`).getTime() <= cutoff)
+    if (!start || start.netValue <= 0) return []
+    return [{
+      period: item.period,
+      label: item.label,
+      fundReturn: ((latest.netValue - start.netValue) / start.netValue) * 100,
+      avgReturn: 0,
+      hs300Return: 0,
+      rank: 0,
+      totalCount: 0
+    }]
+  })
+}
+
 // [WHAT] 实时刷新
 let refreshTimer: ReturnType<typeof setInterval> | null = null
 const lastUpdateTime = ref('')
@@ -41,6 +74,38 @@ const low24h = ref(0)
 
 // [WHAT] 真实涨跌幅数据（盘后机构公布）
 const realDayChange = ref<{ nav: number; changeRate: number; date: string } | null>(null)
+
+function retainLatestRealDayChange(next: { nav: number; changeRate: number; date: string } | null) {
+  if (!next) return
+  if (!realDayChange.value || next.date >= realDayChange.value.date) realDayChange.value = next
+}
+
+async function hydrateDetailSettlement(code: string, base: FundEstimate | null) {
+  if (!base) return
+  // A same-day estimate is authoritative until today's official NAV arrives.
+  // Do not let an older settled comparison overwrite it after the close.
+  if (hasUsableCurrentEstimate(base)) return
+  const settlement = await fetchLatestValuationSettlement(code)
+  if (!settlement || fundCode.value !== code) return
+
+  const previousNav = Number(base.dwjz)
+  if (!Number.isFinite(previousNav) || previousNav <= 0) return
+  const officialNav = base.source === 'market_snapshot' && Number(base.gsz) > 0
+    ? Number(base.gsz)
+    : previousNav * (1 + settlement.realChange / 100)
+  const estimatedNav = previousNav * (1 + settlement.estimateChange / 100)
+
+  retainLatestRealDayChange({ nav: officialNav, changeRate: settlement.realChange, date: settlement.date })
+  fundInfo.value = {
+    ...base,
+    gsz: estimatedNav.toFixed(4),
+    gszzl: settlement.estimateChange.toFixed(4),
+    gztime: `${settlement.date} 15:00`,
+    source: 'settlement_cache',
+    realtime: false,
+    stale: true
+  }
+}
 
 onMounted(async () => {
   await loadFundData()
@@ -66,28 +131,15 @@ onUnmounted(() => {
   stopAutoRefresh()
 })
 
-// [WHAT] 1秒刷新
-// [WHY] 收盘后（15:00之后）停止刷新，不再更新当日走势图
+// The backend caches live estimates for 20 seconds. Keep this timer alive so
+// an overseas fund resumes automatically when its underlying market opens.
 function startAutoRefresh() {
   refreshTimer = setInterval(async () => {
-    const now = new Date()
-    const hour = now.getHours()
-    const minute = now.getMinutes()
-    const day = now.getDay()
-    
-    if (day === 0 || day === 6) return
-    if (hour < 9 || hour > 15) return
-    if (hour === 9 && minute < 30) return
-    
-    // [WHY] 收盘后（15:00之后）停止刷新
-    if (hour >= 15 && minute > 0) {
-      console.log('[刷新] 收盘后停止刷新')
-      stopAutoRefresh()
-      return
-    }
+    const isOpen = isFundTradingHours(fundInfo.value?.name)
+    if (!isOpen) return
     
     await refreshEstimate()
-  }, 1000)
+  }, 15000)
 }
 
 function stopAutoRefresh() {
@@ -118,16 +170,47 @@ async function refreshEstimate() {
       }
       
       fundInfo.value = estimate
+      void applyGridDetailEstimate(fundCode.value, estimate)
       const now = new Date()
       lastUpdateTime.value = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`
     }
     
     // [WHAT] 更新真实涨跌幅
     if (realChange) {
-      realDayChange.value = realChange
+      retainLatestRealDayChange(realChange)
     }
+    void hydrateDetailSettlement(fundCode.value, estimate)
   } catch {
     // 静默失败
+  }
+}
+
+async function applyGridDetailEstimate(code: string, base: FundEstimate) {
+  // The grid only repairs a synthetic all-market NAV snapshot. A validated
+  // same-day provider estimate (for example sina_ds2) is more authoritative.
+  if (!shouldUseGridEstimateFallback(base.source) || base.valuationType === 'hybrid_qdii') return
+
+  const gridItems = await fetchGridValuations([code]).catch(() => [])
+  const grid = gridItems[0]
+  const today = getBeijingDateString()
+  const change = Number(grid?.estimation_change)
+
+  // The all-market snapshot can mark a copied previous NAV as today's 0.00%
+  // before the official NAV is published. The grid owns the frozen same-day
+  // estimate during this settlement gap.
+  if (base && grid?._source !== 'nav' && grid?._valuation_date === today && Number.isFinite(change)) {
+    const previousNav = Number(base.dwjz)
+    if (previousNav > 0) {
+      const resolved: FundEstimate = {
+        ...base,
+        name: grid.fund_name || base.name,
+        gsz: (previousNav * (1 + change / 100)).toFixed(4),
+        gszzl: change.toFixed(4),
+        gztime: `${today} ${grid._frozen ? '15:00' : '实时'}`
+      }
+      if (fundCode.value === code) fundInfo.value = resolved
+      return
+    }
   }
 }
 
@@ -143,13 +226,15 @@ async function loadFundData() {
 
     console.log('估值数据:', estimate)
     fundInfo.value = estimate
+    if (estimate) void applyGridDetailEstimate(fundCode.value, estimate)
+    if (estimate) void hydrateDetailSettlement(fundCode.value, estimate)
 
     // [FIX] 真实涨跌幅后台加载，不阻塞页面渲染
     fetchRealDayChange(fundCode.value)
       .then(realChange => {
         if (realChange) {
           console.log('真实涨跌幅:', realChange)
-          realDayChange.value = realChange
+          retainLatestRealDayChange(realChange)
         }
       })
       .catch((err) => {
@@ -207,9 +292,10 @@ async function loadFundData() {
       })
     
     // [WHY] 阶段涨幅后台加载
-    fetchPeriodReturnExt(fundCode.value)
-      .then(returns => {
-        periodReturns.value = returns
+    const periodCode = fundCode.value
+    fetchNetValueHistoryFast(periodCode, 400)
+      .then(history => {
+        if (fundCode.value === periodCode) periodReturns.value = derivePeriodReturnsFromHistory(history)
       })
       .catch(() => {})
     
@@ -226,12 +312,6 @@ async function loadFundData() {
   } finally {
     isLoading.value = false
   }
-}
-
-// [WHAT] 图表统计数据更新（从分时数据计算真正的日内高低点）
-function onChartStatsUpdate(chartStats: { high: number; low: number; open: number; close: number }) {
-  if (chartStats.high > 0) high24h.value = chartStats.high
-  if (chartStats.low > 0) low24h.value = chartStats.low
 }
 
 // [WHAT] 获取股票涨跌幅样式类
@@ -261,7 +341,7 @@ function getChangeFromLastClass(change: string): string {
 
 // [WHAT] 计算涨跌
 const priceChange = computed(() => {
-  if (!fundInfo.value) return 0
+  if (!fundInfo.value || !hasDisplayEstimate.value) return 0
   const gsz = parseFloat(fundInfo.value.gsz) || 0
   const dwjz = parseFloat(fundInfo.value.dwjz) || 0
   return gsz - dwjz
@@ -269,39 +349,67 @@ const priceChange = computed(() => {
 
 // [WHAT] 涨跌幅：收盘后优先使用真实净值涨跌幅
 const priceChangePercent = computed(() => {
-  // [WHY] 收盘后（15:00之后）且有真实涨跌幅数据时，使用真实数据
-  if (realDayChange.value && realDayChange.value.changeRate !== undefined) {
-    const today = new Date().toISOString().slice(0, 10)
-    // [WHY] 只有当真实涨跌幅是今日数据时才使用
-    if (realDayChange.value.date === today) {
-      console.log('[详情页] 使用真实涨跌幅:', realDayChange.value.changeRate)
-      return realDayChange.value.changeRate
-    }
-  }
-  // [WHY] 盘中或无真实数据时，使用估值涨跌幅
-  return parseFloat(fundInfo.value?.gszzl || '0') || 0
+  if (detailComparison.value.isCurrentReal && realDayChange.value) return realDayChange.value.changeRate
+  return hasDisplayEstimate.value ? (parseFloat(fundInfo.value?.gszzl || '0') || 0) : 0
 })
 
 // [WHAT] 显示值：盘中显示估值，收盘后显示真实净值
 const displayValue = computed(() => {
-  // [WHY] 收盘后且有真实涨跌幅数据时，使用接口返回的真实净值
-  if (realDayChange.value && realDayChange.value.nav && realDayChange.value.changeRate !== undefined) {
-    const today = new Date().toISOString().slice(0, 10)
-    // [WHY] 只有当真实涨跌幅是今日数据时才使用
-    if (realDayChange.value.date === today) {
-      // [WHAT] 直接使用接口返回的真实净值，避免计算精度损失
-      console.log('[详情页] 使用真实净值:', realDayChange.value.nav.toFixed(4))
-      return realDayChange.value.nav.toFixed(4)
-    }
-  }
-  // [WHY] 盘中或无真实数据时，使用估值
-  return fundInfo.value?.gsz || '--'
+  if (detailComparison.value.isCurrentReal && realDayChange.value?.nav) return realDayChange.value.nav.toFixed(4)
+  // A previous trading-day snapshot is displayed as the last NAV, not as a
+  // current estimated value.
+  return hasDisplayEstimate.value ? (fundInfo.value?.gsz || '--') : (fundInfo.value?.dwjz || '--')
 })
 
 const isUp = computed(() => priceChangePercent.value >= 0)
+const showHoldingEditor = ref(false)
+const detailHoldingForm = ref({ amount: '', profit: '', shares: '', costPrice: '', buyDate: '' })
 
 function goBack() {
   router.back()
+}
+
+async function editHolding() {
+  await holdingStore.initHoldings()
+  const holding = holdingStore.getHoldingByCode(fundCode.value)
+  if (!holding) {
+    showToast('当前基金暂无持仓记录')
+    return
+  }
+  detailHoldingForm.value = {
+    amount: Number(holding.amount || 0).toFixed(2),
+    profit: Number(holding.profit || 0).toFixed(2),
+    shares: holding.shares ? String(holding.shares) : '',
+    costPrice: holding.costPrice ? String(holding.costPrice) : '',
+    buyDate: holding.buyDate || ''
+  }
+  showHoldingEditor.value = true
+}
+
+async function saveDetailHolding() {
+  const holding = holdingStore.getHoldingByCode(fundCode.value)
+  const amount = Number(detailHoldingForm.value.amount)
+  if (!holding || !Number.isFinite(amount) || amount < 0) {
+    showToast('请输入有效的持仓金额')
+    return
+  }
+  const shares = Number(detailHoldingForm.value.shares)
+  const costPrice = Number(detailHoldingForm.value.costPrice)
+  const nextHolding: HoldingRecord = {
+    ...holding,
+    amount,
+    shares: Number.isFinite(shares) && shares >= 0 ? shares : holding.shares,
+    costPrice: Number.isFinite(costPrice) && costPrice > 0 ? costPrice : undefined,
+    buyDate: detailHoldingForm.value.buyDate || holding.buyDate
+  }
+  try {
+    await holdingStore.addOrUpdateHolding(nextHolding)
+    showHoldingEditor.value = false
+    showToast('持仓已保存')
+  } catch (error) {
+    console.error('[Detail] 保存持仓失败:', error)
+    showToast('保存失败，请重试')
+  }
 }
 
 // [WHAT] 跳转到同类基金详情
@@ -338,30 +446,33 @@ function goToManager() {
 
 // [WHAT] 判断当前是否为交易时段（盘中）
 const isTradingHours = computed(() => {
-  const now = new Date()
-  const day = now.getDay() // 0=周日, 1-5=周一至周五, 6=周六
-  const hours = now.getHours()
-  const minutes = now.getMinutes()
-  const currentTime = hours * 60 + minutes // 转换为分钟数
-  
-  // 周末不交易
-  if (day === 0 || day === 6) return false
-  
-  // 交易时段: 9:30-15:00
-  const marketOpen = 9 * 60 + 30 // 9:30
-  const marketClose = 15 * 60 // 15:00
-  
-  return currentTime >= marketOpen && currentTime < marketClose
+  return isFundTradingHours(fundInfo.value?.name)
 })
 
+const hasCurrentEstimate = computed(() => hasUsableCurrentEstimate(fundInfo.value))
+const detailComparison = computed(() => getValuationComparisonState({
+  realChange: realDayChange.value?.changeRate,
+  realChangeDate: realDayChange.value?.date,
+  estimateChange: fundInfo.value?.gszzl,
+  estimateTime: fundInfo.value?.gztime,
+  fundName: fundInfo.value?.name
+}))
+const hasCompletedEstimate = computed(() => detailComparison.value.hasActualDiff)
+const hasDisplayEstimate = computed(() => hasCurrentEstimate.value || hasCompletedEstimate.value || (
+  isRetainedMarketEstimate(fundInfo.value)
+))
+const hasCurrentOfficialNav = computed(() => {
+  return detailComparison.value.isCurrentReal
+})
 // [WHAT] 状态标签文本
 const statusTag = computed(() => {
-  return isTradingHours.value ? '估值中' : '已更新'
+  if (isTradingHours.value) return '估值中'
+  return hasDisplayEstimate.value || hasCurrentOfficialNav.value ? '已更新' : '净值待公布'
 })
 
 // [WHAT] 状态标签样式类
 const statusTagClass = computed(() => {
-  return isTradingHours.value ? 'tag-trading' : 'tag-updated'
+  return isTradingHours.value ? 'tag-trading' : hasDisplayEstimate.value || hasCurrentOfficialNav.value ? 'tag-updated' : 'tag-pending'
 })
 
 // [WHAT] 基金名称动态字体大小
@@ -376,206 +487,140 @@ const fundNameStyle = computed(() => {
   if (len > 12) fontSize = 12
   return { fontSize: `${fontSize}px` }
 })
+
+type DetailPanel = 'holdings' | 'trend' | 'analysis'
+const activePanel = ref<DetailPanel>('trend')
+const periodReturnsExpanded = ref(true)
+
+const primaryStats = computed(() => [
+  {
+    label: hasCurrentEstimate.value ? '最新净值' : hasCompletedEstimate.value ? '昨日净值' : '最近净值',
+    value: hasCurrentOfficialNav.value && realDayChange.value?.nav
+      ? realDayChange.value.nav.toFixed(4)
+      : (fundInfo.value?.dwjz || '--'),
+    tone: ''
+  },
+  {
+    label: realDayChange.value?.date === getBeijingDateString() ? '最新涨幅' : hasCompletedEstimate.value ? '昨日涨幅' : '涨跌幅',
+    value: `${priceChangePercent.value > 0 ? '+' : ''}${priceChangePercent.value.toFixed(2)}%`,
+    tone: priceChangePercent.value > 0 ? 'up' : priceChangePercent.value < 0 ? 'down' : ''
+  },
+  { label: hasCurrentEstimate.value ? '估算净值' : hasCompletedEstimate.value ? '昨日估值' : '当日估值', value: hasDisplayEstimate.value ? (fundInfo.value?.gsz || '--') : '--', tone: '' },
+  {
+    label: hasCurrentEstimate.value ? '估算涨幅' : hasCompletedEstimate.value ? '昨日估算涨幅' : '当日涨幅',
+    value: hasDisplayEstimate.value && fundInfo.value?.gszzl ? `${Number(fundInfo.value.gszzl) > 0 ? '+' : ''}${Number(fundInfo.value.gszzl).toFixed(2)}%` : '--',
+    tone: hasDisplayEstimate.value && Number(fundInfo.value?.gszzl) > 0 ? 'up' : hasDisplayEstimate.value && Number(fundInfo.value?.gszzl) < 0 ? 'down' : ''
+  }
+])
+
+const visiblePeriods = computed(() => periodReturns.value.slice(0, 5))
 </script>
 
 <template>
-  <div class="pro-detail-page">
-    <!-- 顶部导航栏 -->
-    <div class="pro-header">
-      <div class="header-left" @click="goBack">
-        <van-icon name="arrow-left" size="20" />
+  <div class="fund-detail-page">
+    <header class="fund-detail-header">
+      <button class="detail-icon-button" aria-label="返回" @click="goBack"><van-icon name="arrow-left" size="20" /></button>
+      <h1>基金详情</h1>
+      <div class="detail-header-actions">
+        <button class="detail-icon-button" :aria-label="themeStore.actualTheme === 'dark' ? '切换亮色主题' : '切换暗色主题'" @click="themeStore.toggleTheme"><van-icon :name="themeStore.actualTheme === 'dark' ? 'bulb-o' : 'fire-o'" size="19" /></button>
+        <button class="detail-icon-button" :aria-label="fundStore.isFundInWatchlist(fundCode) ? '取消自选' : '添加自选'" @click="toggleWatchlist"><van-icon :name="fundStore.isFundInWatchlist(fundCode) ? 'star' : 'star-o'" size="20" /></button>
       </div>
-                                                <div class="header-center">
-        <div class="pair-name-row">
-          <span class="pair-name" :style="fundNameStyle">{{ fundInfo?.name || '基金' }}</span>
-          <span :class="['status-tag', statusTagClass]">{{ statusTag }}</span>
+    </header>
+
+    <main v-if="!isLoading" class="fund-detail-content">
+      <section class="fund-identity">
+        <div class="identity-main">
+          <span class="fund-name" :style="fundNameStyle">{{ fundInfo?.name || '基金' }}</span>
+          <button type="button" class="identity-edit-holding" aria-label="编辑持仓" @click="editHolding"><van-icon name="edit" size="13" /><span>编辑持仓</span></button>
+          <span :class="['detail-status', statusTagClass]">{{ statusTag }}</span>
         </div>
-                <a class="pair-code fund-code-link" :href="getJdFundLink(fundCode)">{{ fundCode }}</a>
-      </div>
-      <div class="header-right">
-        <!-- 主题切换按钮 -->
-        <van-icon 
-          :name="themeStore.actualTheme === 'dark' ? 'bulb-o' : 'fire-o'" 
-          size="20"
-          class="theme-toggle"
-          @click="themeStore.toggleTheme"
+        <div class="identity-meta">
+          <a :href="getJdFundLink(fundCode)" class="fund-code-link">#{{ fundCode }}</a>
+          <span class="identity-dot">·</span>
+          <span>{{ shareClass }}类份额</span>
+          <span class="identity-dot">·</span>
+          <span>{{ fundInfo?.gztime || lastUpdateTime || '等待估值更新' }}</span>
+        </div>
+      </section>
+
+      <section class="detail-stat-grid" aria-label="基金行情">
+        <div v-for="item in primaryStats" :key="item.label" class="detail-stat">
+          <span>{{ item.label }}</span>
+          <strong :class="item.tone">{{ item.value }}</strong>
+        </div>
+      </section>
+
+      <section v-if="visiblePeriods.length" class="detail-period-section" aria-label="阶段涨幅">
+        <button type="button" class="period-collapse" :aria-expanded="periodReturnsExpanded" @click="periodReturnsExpanded = !periodReturnsExpanded">
+          <span>{{ periodReturnsExpanded ? '收起' : '展开阶段涨幅' }}</span>
+          <van-icon :name="periodReturnsExpanded ? 'arrow-up' : 'arrow-down'" />
+        </button>
+        <div v-show="periodReturnsExpanded" class="detail-period-grid">
+          <div v-for="item in visiblePeriods" :key="item.period" class="detail-period">
+            <span>{{ item.label }}</span>
+            <strong :class="item.fundReturn >= 0 ? 'up' : 'down'">{{ item.fundReturn >= 0 ? '+' : '' }}{{ item.fundReturn.toFixed(2) }}%</strong>
+          </div>
+        </div>
+      </section>
+
+      <nav class="detail-tabs" aria-label="基金详情视图">
+        <button :class="{ active: activePanel === 'holdings' }" @click="activePanel = 'holdings'">前10重仓</button>
+        <button :class="{ active: activePanel === 'trend' }" @click="activePanel = 'trend'">业绩走势</button>
+        <button :class="{ active: activePanel === 'analysis' }" @click="activePanel = 'analysis'">基金分析</button>
+      </nav>
+
+      <section v-if="activePanel === 'trend'" class="detail-panel detail-trend-panel">
+        <FundPerformancePanel
+          :fund-code="fundCode"
+          :realtime-value="displayValue !== '--' ? parseFloat(displayValue) : 0"
+          :realtime-change="priceChangePercent"
         />
-        <!-- 收藏按钮 -->
-        <van-icon 
-          :name="fundStore.isFundInWatchlist(fundCode) ? 'star' : 'star-o'" 
-          size="20"
-          :color="fundStore.isFundInWatchlist(fundCode) ? 'var(--color-primary)' : 'var(--text-secondary)'"
-          @click="toggleWatchlist"
-        />
-      </div>
-    </div>
+      </section>
 
-    <!-- 加载状态 -->
-    <div v-if="isLoading" class="page-loading">
-      <van-loading vertical color="#0ecb81">
-        加载中...
-      </van-loading>
-    </div>
+      <section v-else-if="activePanel === 'analysis'" class="detail-panel detail-analysis-panel" aria-label="基金分析">
+        <h2>基金分析</h2>
+        <p>功能开发中</p>
+      </section>
 
-    <template v-else>
-      <!-- 价格信息面板 -->
-      <div class="price-panel">
-                <!-- 主价格 -->
-        <div class="main-price" :class="isUp ? 'up' : 'down'">
-          <span class="price-value">{{ displayValue }}</span>
-          <span class="price-unit">最新净值</span>
+      <section v-else class="detail-panel">
+        <div v-if="stockHoldings.length" class="detail-holdings-table">
+          <div class="detail-holding-row detail-holding-heading"><span>股票</span><span>涨跌幅</span><span>占比</span><span>季变</span></div>
+          <div v-for="(stock, index) in stockHoldings.slice(0, 10)" :key="stock.stockCode" class="detail-holding-row">
+            <div><b>{{ index + 1 }}. {{ stock.stockName }}</b><small>{{ stock.stockCode }} <i v-if="stock.sector" class="holding-sector">{{ stock.sector }}</i></small></div>
+            <span :class="getStockChangeClass(stock)">{{ stock.dayChange !== undefined ? formatStockChange(stock.dayChange) : '--' }}</span>
+            <span>{{ stock.holdingRatio.toFixed(2) }}%</span>
+            <span :class="stock.quarterChange !== null && stock.quarterChange !== undefined ? (stock.quarterChange > 0 ? 'up' : stock.quarterChange < 0 ? 'down' : '') : ''">{{ stock.quarterChange !== null && stock.quarterChange !== undefined ? `${stock.quarterChange > 0 ? '+' : ''}${stock.quarterChange.toFixed(2)}%` : '--' }}</span>
+          </div>
         </div>
-        
-        <!-- 涨跌信息 -->
-        <div class="price-change" :class="isUp ? 'up' : 'down'">
-          <span>{{ isUp ? '+' : '' }}{{ priceChange.toFixed(4) }}</span>
-          <span>({{ isUp ? '+' : '' }}{{ priceChangePercent.toFixed(2) }}%)</span>
-        </div>
+        <div v-else class="detail-empty">暂无重仓股数据</div>
+      </section>
 
-                <!-- 24小时数据栏 -->
-        <div class="stats-bar">
-          <div class="stat-item">
-            <span class="stat-label">昨收净值</span>
-            <span class="stat-value">{{ fundInfo?.dwjz || '--' }}</span>
-          </div>
-          <div class="stat-item">
-            <span class="stat-label">今日最高</span>
-            <span class="stat-value up">{{ high24h > 0 ? high24h.toFixed(4) : '--' }}</span>
-          </div>
-          <div class="stat-item">
-            <span class="stat-label">今日最低</span>
-            <span class="stat-value down">{{ low24h > 0 ? low24h.toFixed(4) : '--' }}</span>
-          </div>
-        </div>
-      </div>
+    </main>
 
-                        <!-- 专业图表 -->
-      <ProChart
-        :fund-code="fundCode"
-        :realtime-value="displayValue !== '--' ? parseFloat(displayValue) : 0"
-        :realtime-change="priceChangePercent"
-        :last-close="fundInfo?.dwjz ? parseFloat(fundInfo.dwjz) : 0"
-        @stats-update="onChartStatsUpdate"
-      />
+    <van-popup
+      v-model:show="showHoldingEditor"
+      position="bottom"
+      round
+      teleport="body"
+      :style="{ maxWidth: '672px' }"
+    >
+      <form class="detail-holding-editor" @submit.prevent="saveDetailHolding">
+        <header>
+          <strong>编辑持仓</strong>
+          <button type="button" aria-label="关闭编辑持仓" @click="showHoldingEditor = false"><van-icon name="cross" size="18" /></button>
+        </header>
+        <div class="detail-holding-editor-body">
+          <van-field v-model="detailHoldingForm.amount" label="持仓金额" type="number" inputmode="decimal" />
+          <van-field v-model="detailHoldingForm.profit" label="持有收益" type="number" inputmode="decimal" readonly />
+          <van-field v-model="detailHoldingForm.shares" label="持有份额" type="number" inputmode="decimal" />
+          <van-field v-model="detailHoldingForm.costPrice" label="成本单价" type="number" inputmode="decimal" />
+          <van-field v-model="detailHoldingForm.buyDate" label="买入日期" type="date" />
+        </div>
+        <footer><van-button native-type="submit" type="primary" block>保存</van-button></footer>
+      </form>
+    </van-popup>
 
-            <!-- 重仓股票 -->
-      <div class="holdings-section">
-        <div class="section-header">
-          <span class="section-title">重仓股票</span>
-          <span class="section-tip">TOP10</span>
-        </div>
-        
-                                                                <div v-if="stockHoldings.length > 0" class="holdings-list">
-          <div class="holdings-table-header">
-            <span class="col-index">#</span>
-            <span class="col-name">股票名称</span>
-            <span class="col-change">涨跌幅</span>
-            <span class="col-ratio">占比</span>
-            <span class="col-change-from-last">较上期</span>
-          </div>
-          <div
-            v-for="(stock, index) in stockHoldings.slice(0, 10)"
-            :key="stock.stockCode"
-            class="holdings-row"
-          >
-            <span class="index-cell">{{ index + 1 }}</span>
-            <div class="stock-cell">
-              <span class="stock-name">{{ stock.stockName }}</span>
-              <span class="stock-code">{{ stock.stockCode }}</span>
-            </div>
-            <span class="change-cell" :class="getStockChangeClass(stock)">
-              {{ stock.dayChange !== undefined ? formatStockChange(stock.dayChange) : '--' }}
-            </span>
-            <span class="ratio-cell">{{ stock.holdingRatio.toFixed(2) }}%</span>
-            <span class="change-from-last-cell" :class="getChangeFromLastClass(stock.changeFromLast)">
-              {{ stock.changeFromLast || '--' }}
-            </span>
-          </div>
-        </div>
-        <div v-else class="empty-holdings">
-          暂无重仓股数据
-        </div>
-      </div>
-
-      <!-- 阶段涨幅排名 -->
-      <div v-if="periodReturns.length > 0" class="period-section">
-        <div class="section-header">
-          <span class="section-title">阶段涨幅</span>
-          <span class="section-tip">同类排名</span>
-        </div>
-        <div class="period-grid">
-          <div 
-            v-for="item in periodReturns.slice(0, 6)" 
-            :key="item.period"
-            class="period-item"
-          >
-            <div class="period-label">{{ item.label }}</div>
-            <div class="period-return" :class="item.fundReturn >= 0 ? 'up' : 'down'">
-              {{ item.fundReturn >= 0 ? '+' : '' }}{{ item.fundReturn.toFixed(2) }}%
-            </div>
-            <div class="period-rank" v-if="item.rank > 0">
-              <span class="rank-num">{{ item.rank }}</span>
-              <span class="rank-total">/{{ item.totalCount }}</span>
-            </div>
-          </div>
-        </div>
-      </div>
-
-      <!-- 同类基金对比 -->
-      <div v-if="similarFunds.length > 0" class="similar-section">
-        <div class="section-header">
-          <span class="section-title">同类基金</span>
-          <span class="section-tip">年涨幅TOP5</span>
-        </div>
-        <div class="similar-list">
-          <div 
-            v-for="fund in similarFunds" 
-            :key="fund.code"
-            class="similar-item"
-            @click="goToSimilarFund(fund.code)"
-          >
-            <div class="similar-info">
-              <div class="similar-name">{{ fund.name }}</div>
-              <div class="similar-code">{{ fund.code }}</div>
-            </div>
-            <div class="similar-return" :class="fund.yearReturn >= 0 ? 'up' : 'down'">
-              {{ fund.yearReturn >= 0 ? '+' : '' }}{{ fund.yearReturn.toFixed(2) }}%
-            </div>
-            <van-icon name="arrow" class="similar-arrow" />
-          </div>
-        </div>
-      </div>
-
-      <!-- 基金信息 -->
-      <div class="info-section">
-        <div class="section-header">
-          <span class="section-title">基金信息</span>
-        </div>
-        <div class="info-grid">
-                    <div class="info-item">
-            <span class="info-label">基金代码</span>
-            <a class="info-value fund-code-link" :href="getJdFundLink(fundCode)">{{ fundCode }}</a>
-          </div>
-          <div class="info-item">
-            <span class="info-label">基金类型</span>
-            <span class="info-value">{{ shareClass }}类份额</span>
-          </div>
-          <div class="info-item">
-            <span class="info-label">估值时间</span>
-            <span class="info-value">{{ fundInfo?.gztime || '--' }}</span>
-          </div>
-        </div>
-        
-        <!-- 基金经理入口 -->
-        <div class="manager-entry" @click="goToManager">
-          <div class="entry-left">
-            <van-icon name="manager-o" size="20" />
-            <span>基金经理</span>
-          </div>
-          <van-icon name="arrow" size="16" color="var(--text-muted)" />
-        </div>
-      </div>
-    </template>
+    <div v-if="isLoading" class="detail-loading"><van-loading vertical color="var(--color-primary)">加载中...</van-loading></div>
   </div>
 </template>
 
@@ -676,6 +721,11 @@ const fundNameStyle = computed(() => {
 
 .tag-trading {
   background: #2196f3;
+  color: #fff;
+}
+
+.tag-pending {
+  background: #64748b;
   color: #fff;
 }
 
@@ -1133,5 +1183,331 @@ const fundNameStyle = computed(() => {
   .info-section:last-child {
     margin-bottom: calc(12px + env(safe-area-inset-bottom));
   }
+}
+
+/* Reference-style detail hierarchy. The existing data and chart components
+   remain intact; this layer only controls the page composition. */
+.fund-detail-page {
+  min-height: 100vh;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  padding-bottom: max(20px, env(safe-area-inset-bottom));
+}
+
+.fund-detail-header {
+  position: sticky;
+  top: 0;
+  z-index: 20;
+  display: grid;
+  grid-template-columns: 44px 1fr auto;
+  align-items: center;
+  min-height: 64px;
+  padding: max(10px, env(safe-area-inset-top)) 16px 10px;
+  background: color-mix(in srgb, var(--bg-primary) 94%, transparent);
+  border-bottom: 1px solid var(--border-color);
+  backdrop-filter: blur(12px);
+}
+
+.fund-detail-header h1 {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 650;
+  text-align: center;
+}
+
+.detail-header-actions {
+  display: flex;
+  gap: 4px;
+}
+
+.detail-icon-button {
+  display: inline-grid;
+  width: 36px;
+  height: 36px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+
+.detail-icon-button:active {
+  background: var(--bg-hover);
+}
+
+.fund-detail-content {
+  width: min(100%, 672px);
+  margin: 0 auto;
+  padding: 20px 16px 0;
+}
+
+.fund-identity {
+  margin-bottom: 18px;
+}
+
+.identity-main,
+.identity-meta {
+  display: flex;
+  align-items: center;
+}
+
+.identity-main {
+  gap: 8px;
+  min-width: 0;
+}
+
+.identity-edit-holding { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 3px; min-height: 24px; padding: 0 6px; border: 1px solid var(--border-color); border-radius: 4px; color: var(--color-primary); background: transparent; font-size: 11px; cursor: pointer; }
+.identity-edit-holding:active { background: var(--bg-hover); }
+
+.fund-name {
+  min-width: 0;
+  overflow: hidden;
+  color: var(--text-primary);
+  font-weight: 700;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detail-status {
+  flex: 0 0 auto;
+  padding: 3px 7px;
+  border-radius: 5px;
+  font-size: 11px;
+  line-height: 1;
+}
+
+.identity-meta {
+  gap: 6px;
+  margin-top: 7px;
+  overflow: hidden;
+  color: var(--text-secondary);
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.identity-dot { opacity: .5; }
+
+.detail-stat-grid,
+.detail-period-grid {
+  display: grid;
+  gap: 12px;
+}
+
+.detail-stat-grid {
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin-bottom: 16px;
+}
+
+.detail-stat,
+.detail-period {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.detail-stat span,
+.detail-period span,
+.detail-info-grid span,
+.trend-summary span {
+  color: var(--text-secondary);
+  font-size: 12px;
+}
+
+.detail-stat strong,
+.detail-period strong,
+.trend-summary strong,
+.detail-holding-row > span,
+.detail-info-grid b,
+.detail-info-grid a {
+  overflow: hidden;
+  font-family: -apple-system, 'SF Mono', 'Roboto Mono', monospace;
+  font-size: 15px;
+  font-variant-numeric: tabular-nums;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detail-stat strong { color: var(--text-primary); }
+.detail-stat strong.up,
+.detail-period strong.up,
+.trend-summary strong.up,
+.detail-holding-row > span.up,
+.detail-similar-list strong.up { color: var(--color-up); }
+.detail-stat strong.down,
+.detail-period strong.down,
+.trend-summary strong.down,
+.detail-holding-row > span.down,
+.detail-similar-list strong.down { color: var(--color-down); }
+
+.detail-period-grid {
+  grid-template-columns: repeat(5, minmax(0, 1fr));
+  padding: 12px 0 18px;
+}
+
+.detail-period-section {
+  border-top: 1px solid var(--border-color);
+}
+
+.period-collapse {
+  display: flex;
+  min-height: 32px;
+  margin: 0 auto;
+  align-items: center;
+  gap: 5px;
+  padding: 0 12px;
+  border: 0;
+  color: var(--text-secondary);
+  background: transparent;
+  font-size: 11px;
+  cursor: pointer;
+}
+
+.period-collapse :deep(.van-icon) {
+  font-size: 11px;
+}
+
+.detail-tabs {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 3px;
+  padding: 3px;
+  border-radius: 8px;
+  background: var(--bg-tertiary);
+}
+
+.detail-tabs button {
+  min-height: 30px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.detail-tabs button.active {
+  background: color-mix(in srgb, var(--color-primary) 18%, var(--bg-secondary));
+  color: var(--color-primary);
+}
+
+.detail-panel {
+  margin-top: 18px;
+  border: 1px solid var(--border-color);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  overflow: hidden;
+}
+
+.detail-trend-panel { padding: 14px 16px 10px; }
+
+.detail-analysis-panel h2 {
+  margin: 0;
+  color: var(--text-primary);
+  font-size: 15px;
+  font-weight: 650;
+}
+
+.detail-analysis-panel {
+  min-height: 220px;
+  padding: 22px 16px;
+}
+
+.detail-analysis-panel p {
+  margin: 10px 0 0;
+  color: var(--text-secondary);
+  font-size: 13px;
+}
+
+.detail-holding-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 58px 58px 54px;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-color);
+}
+
+.detail-holding-row:last-child { border-bottom: 0; }
+.detail-holding-heading { color: var(--text-secondary); font-size: 10.2px; }
+.detail-holding-heading > span { font-family: inherit; font-size: inherit; }
+.detail-holding-row > div { min-width: 0; }
+.detail-holding-row > span { font-size: 12.75px; }
+.detail-holding-row b,
+.detail-holding-row small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.detail-holding-row b { color: var(--text-primary); font-size: 11.9px; }
+.detail-holding-row small { margin-top: 3px; color: var(--text-secondary); font-size: 9.35px; }
+.holding-sector { display: inline-block; margin-left: 5px; padding: 1px 4px; border: 1px solid var(--border-color); border-radius: 3px; color: var(--color-primary); font-style: normal; }
+.detail-empty { padding: 52px 16px; color: var(--text-secondary); font-size: 11.9px; text-align: center; }
+
+.detail-info-grid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 18px 14px;
+  padding: 18px 16px;
+}
+
+.detail-info-grid > div { display: flex; min-width: 0; flex-direction: column; gap: 6px; }
+.detail-info-grid b,
+.detail-info-grid a { color: var(--text-primary); font-size: 14px; font-weight: 500; }
+.detail-manager-link,
+.detail-similar-list button {
+  display: flex;
+  width: 100%;
+  align-items: center;
+  justify-content: space-between;
+  border: 0;
+  border-top: 1px solid var(--border-color);
+  background: transparent;
+  color: var(--text-primary);
+  cursor: pointer;
+}
+.detail-manager-link { padding: 15px 16px; font-size: 14px; }
+.detail-similar-list button { gap: 12px; padding: 13px 16px; font-size: 13px; text-align: left; }
+.detail-similar-list button span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.detail-loading { display: grid; min-height: calc(100vh - 64px); place-items: center; }
+
+.detail-holding-editor { display: flex; min-height: 360px; max-height: 76dvh; flex-direction: column; background: var(--bg-secondary); }
+.detail-holding-editor header { display: flex; align-items: center; justify-content: space-between; padding: 16px; border-bottom: 1px solid var(--border-color); color: var(--text-primary); }
+.detail-holding-editor header strong { font-size: 16px; }
+.detail-holding-editor header button { display: grid; width: 32px; height: 32px; place-items: center; padding: 0; border: 0; border-radius: 6px; color: var(--text-secondary); background: transparent; }
+.detail-holding-editor header button:active { background: var(--bg-hover); }
+.detail-holding-editor-body { flex: 1; overflow-y: auto; }
+.detail-holding-editor footer { padding: 12px 16px calc(12px + env(safe-area-inset-bottom)); border-top: 1px solid var(--border-color); }
+
+@media (min-width: 641px) {
+  .fund-detail-page {
+    width: min(100% - 40px, 704px);
+    min-height: auto;
+    margin: 24px auto;
+    border: 1px solid var(--border-color);
+    border-radius: 14px;
+    box-shadow: 0 20px 60px rgba(0, 0, 0, .22);
+    overflow: hidden;
+  }
+
+  .fund-detail-header { border-bottom-color: var(--border-color); }
+  .fund-detail-content { padding: 24px 24px 0; }
+  .detail-panel { margin-bottom: 24px; }
+}
+
+@media (max-width: 430px) {
+  .fund-detail-content { padding: 16px 12px 0; }
+  .detail-stat-grid { gap: 8px; }
+  .detail-stat strong, .detail-period strong { font-size: 13px; }
+  .detail-period-grid { gap: 6px; }
+  .detail-period span { font-size: 11px; }
+}
+
+@media (max-width: 340px) {
+  .detail-stat-grid { gap: 5px; }
+  .detail-stat strong { font-size: 11px; }
+  .detail-period strong { font-size: 11px; }
+  .detail-period-grid { gap: 3px; }
+  .detail-period span { font-size: 10px; }
 }
 </style>

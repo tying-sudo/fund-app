@@ -11,6 +11,8 @@ from datetime import datetime, timedelta
 from functools import wraps
 from pathlib import Path
 
+from valuation.core import beijing_now
+
 DATA_DIR = Path(__file__).parent / "data"
 POS_FILE = DATA_DIR / "positions.json"
 POS_BACKUP_FILE = DATA_DIR / "positions.backup.json"
@@ -116,7 +118,7 @@ def _empty_positions() -> dict:
     return {
         "funds": {},
         "cash_reserve_ratio": 0.30,
-        "updated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "updated_at": beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
     }
 
 
@@ -273,7 +275,7 @@ def save_positions(data: dict, *, allow_empty: bool = False) -> bool:
                 f"拒绝将 {current_count} 个持仓意外覆盖为空；如需清空必须显式确认"
             )
 
-        data["updated_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        data["updated_at"] = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
         raw = (json.dumps(data, ensure_ascii=False, indent=2) + "\n").encode("utf-8")
         # 写入前再次自检，避免任何不可解析内容落盘。
         _validate_positions(json.loads(raw.decode("utf-8")), "待写入持仓")
@@ -337,7 +339,7 @@ def add_batch(fund_code: str, amount: float, nav: float = None, note: str = "",
     if buy_date and _is_valid_date(buy_date):
         date_str = buy_date
     else:
-        date_str = datetime.now().strftime("%Y-%m-%d")
+        date_str = beijing_now().strftime("%Y-%m-%d")
 
     _nav = nav if nav and nav > 0 else 0.0
     shares = round(amount / _nav, 2) if _nav > 0 else 0.0
@@ -546,7 +548,7 @@ def sell_batch(fund_code: str, batch_id: str, sell_shares: float,
     if sell_date and _is_valid_date(sell_date):
         sd = datetime.strptime(sell_date, "%Y-%m-%d").date()
     else:
-        sd = datetime.now().date()
+        sd = beijing_now().date()
 
     buy_date = datetime.strptime(batch["buy_date"], "%Y-%m-%d").date()
     hold_days = (sd - buy_date).days
@@ -868,7 +870,7 @@ def sell_fifo(fund_code: str, total_sell_shares: float,
     if sell_date and _is_valid_date(sell_date):
         sd = datetime.strptime(sell_date, "%Y-%m-%d").date()
     else:
-        sd = datetime.now().date()
+        sd = beijing_now().date()
 
     remaining = total_sell_shares
     batch_details = []
@@ -1006,7 +1008,7 @@ def get_fund_position(fund_code: str) -> dict:
             "in_cooldown": False,
         }
 
-    today = datetime.now().date()
+    today = beijing_now().date()
     holding_batches = [b for b in fund.get("batches", []) if b["status"] == "holding"]
 
     total_amount = round(sum(b["amount"] for b in holding_batches), 2)
@@ -1088,7 +1090,7 @@ def add_group(name: str) -> dict:
     """新增分组，返回新分组对象"""
     data = load_positions()
     groups = data.setdefault("groups", [])
-    gid = f"g{datetime.now().strftime('%Y%m%d%H%M%S')}"
+    gid = f"g{beijing_now().strftime('%Y%m%d%H%M%S')}"
     group = {"id": gid, "name": name, "fund_codes": []}
     groups.append(group)
     save_positions(data)

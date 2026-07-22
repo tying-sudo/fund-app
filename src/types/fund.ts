@@ -18,6 +18,36 @@ export interface FundEstimate {
   gszzl: string
   /** 估值时间（格式：2024-01-01 15:00） */
   gztime: string
+  /** 后端实际采用的数据源 */
+  source?: string
+  /** 是否为盘中实时估值 */
+  realtime?: boolean
+  /** 数据是否已超过正常交易日窗口 */
+  stale?: boolean
+  /** The final estimate is retained after close until the next market session. */
+  frozen?: boolean
+  /** Underlying market used for QDII session selection. */
+  market?: 'cn' | 'hk' | 'us' | 'overseas'
+  /** Trading date in the underlying market. */
+  marketDate?: string
+  /** The snapshot only carries the previous published NAV. */
+  pending?: boolean
+  /** 基金类型（后端快照补充） */
+  fundType?: string
+  /** 是否为货币基金 */
+  isMoneyMarket?: boolean
+  /** 货币基金每万份收益 */
+  perTenThousandIncome?: number | null
+  /** 货币基金七日年化收益率 */
+  sevenDayAnnualized?: number | null
+  /** WealthAgent 风格的估值分类 */
+  valuationType?: string
+  /** 本次实际采用的估值方法 */
+  valuationMethod?: string
+  /** 数据/方法置信度，范围 0-1 */
+  confidence?: number
+  /** 置信度与降级原因 */
+  confidenceNote?: string
 }
 
 /**
@@ -187,6 +217,10 @@ export interface StockHolding {
   marketPrefix?: string
   /** 当日涨跌幅（%） */
   dayChange?: number
+  /** 较上一报告期的持仓占比变化（百分点） */
+  quarterChange?: number | null
+  /** 行业板块标签 */
+  sector?: string | null
 }
 
 /**
@@ -254,6 +288,12 @@ export interface HoldingSummary {
   totalProfitRate: number
   /** 当日总收益 */
   todayProfit: number
+  /** Latest published prior-session total profit. */
+  yesterdayProfit: number
+  /** Weighted return for the latest published prior session. */
+  yesterdayProfitRate: number
+  /** Aggregate current-session return. */
+  todayProfitRate: number
 }
 
 /**

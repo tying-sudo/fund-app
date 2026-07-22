@@ -13,7 +13,7 @@
 ## 克隆项目
 
 ```bash
-git clone https://github.com/xiriovo/fund-app.git
+git clone https://github.com/tying-sudo/fund-app.git
 cd fund-app
 ```
 

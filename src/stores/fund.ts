@@ -24,6 +24,8 @@ import {
   saveWatchlistOrder
 } from '@/utils/storage'
 import { useSettingsStore } from './settings'
+import { getTodayStr, getValuationComparisonState, hasUsableEstimateChange, isEstimateDateToday, isRetainedMarketEstimate, selectLatestRealChange, shouldRetainCurrentIntradayEstimate } from '@/utils/holdingCalculator'
+import { fetchLatestValuationSettlement, rememberValuationSettlement } from '@/api/valuationGrid'
 
 export const useFundStore = defineStore('fund', () => {
   // ========== State ==========
@@ -163,6 +165,10 @@ export const useFundStore = defineStore('fund', () => {
           }
         }
       })
+
+      // Non-trading fallback only: recover a completed pair from the grid API
+      // when the public estimate feed no longer returns yesterday's value.
+      await Promise.all(codes.map(code => hydrateSettlementIfMissing(code)))
       
       lastRefreshTime.value = new Date().toLocaleTimeString('zh-CN', {
         hour: '2-digit',
@@ -171,6 +177,42 @@ export const useFundStore = defineStore('fund', () => {
     } finally {
       isRefreshing.value = false
     }
+  }
+
+  async function hydrateSettlementIfMissing(code: string) {
+    const item = watchlist.value.find((fund) => fund.code === code)
+    if (!item) return
+    if (isEstimateDateToday(item.estimateTime || '', getTodayStr()) && hasUsableEstimateChange(item.estimateChange)) return
+
+    const current = getValuationComparisonState({
+      realChange: item.realChange,
+      realChangeDate: item.realChangeDate,
+      estimateChange: item.estimateChange,
+      estimateTime: item.estimateTime,
+      fundName: item.name
+    })
+    if (current.isTrading || current.hasActualDiff) return
+
+    const settlement = await fetchLatestValuationSettlement(code)
+    if (!settlement) return
+
+    const comparison = getValuationComparisonState({
+      realChange: settlement.realChange,
+      realChangeDate: settlement.date,
+      estimateChange: settlement.estimateChange,
+      estimateTime: `${settlement.date} 15:00`,
+      fundName: item.name
+    })
+    if (!comparison.hasActualDiff) return
+
+    Object.assign(item, {
+      estimateChange: settlement.estimateChange.toFixed(4),
+      estimateTime: `${settlement.date} 15:00`,
+      realChange: settlement.realChange,
+      realChangeDate: settlement.date,
+      isRealChangeToday: false,
+      loading: false
+    })
   }
 
   /**
@@ -218,6 +260,7 @@ export const useFundStore = defineStore('fund', () => {
           updateFundDataWithSource(code, data, ds, realChange ?? undefined)
         }
       }
+      await hydrateSettlementIfMissing(code)
       console.log(`[Store] ${code} 刷新完成, 数据源: ${ds}`)
     } catch (err) {
       console.error(`[Store] ${code} 刷新失败:`, err)
@@ -247,42 +290,102 @@ export const useFundStore = defineStore('fund', () => {
       const existingType = watchlist.value[index].type || ''
       const existingRealChange = watchlist.value[index].realChange
       const existingRealChangeDate = watchlist.value[index].realChangeDate
+      const existingEstimateChange = watchlist.value[index].estimateChange
+      const existingEstimateTime = watchlist.value[index].estimateTime
       
       // [WHAT] 处理真实涨跌幅数据
       let realChange: number | undefined
       let realChangeDate: string | undefined
-      let isRealChangeToday = false
       
       if (realChangeResult && realChangeResult.changeRate !== undefined) {
         realChange = realChangeResult.changeRate
         realChangeDate = realChangeResult.date
         
-        // [WHAT] 判断真实涨跌幅是否为今日数据
-        const today = new Date().toISOString().slice(0, 10)
-        isRealChangeToday = realChangeResult.date === today
       } else {
         // 保留旧值
         realChange = existingRealChange
         realChangeDate = existingRealChangeDate
-        isRealChangeToday = watchlist.value[index].isRealChangeToday || false
+      }
+
+      const latestReal = selectLatestRealChange({
+        incomingChange: realChange,
+        incomingDate: realChangeDate,
+        cachedChange: existingRealChange,
+        cachedDate: existingRealChangeDate
+      })
+      realChange = latestReal.change
+      realChangeDate = latestReal.date
+
+      const retainCachedIntradayEstimate = shouldRetainCurrentIntradayEstimate({
+        incomingEstimateChange: data.gszzl,
+        incomingEstimateTime: data.gztime,
+        cachedEstimateChange: existingEstimateChange,
+        cachedEstimateTime: existingEstimateTime
+      })
+      const incomingIsOfficialSnapshot = data.source === 'market_snapshot'
+      // The all-market snapshot is a published NAV result, not an estimate.
+      // Keeping it out of the estimate fields prevents a false
+      // "estimate = yesterday = actual" comparison on the watchlist.
+      const estimateChangeValue = retainCachedIntradayEstimate
+        ? existingEstimateChange
+        : incomingIsOfficialSnapshot ? undefined : data.gszzl
+      const estimateTimeValue = retainCachedIntradayEstimate
+        ? existingEstimateTime
+        : incomingIsOfficialSnapshot ? undefined : data.gztime
+
+      const incomingComparison = getValuationComparisonState({
+        realChange,
+        realChangeDate,
+        estimateChange: incomingIsOfficialSnapshot ? null : estimateChangeValue,
+        estimateTime: incomingIsOfficialSnapshot ? null : estimateTimeValue,
+        fundName: data.name
+      })
+      const cachedComparison = getValuationComparisonState({
+        realChange,
+        realChangeDate,
+        estimateChange: existingEstimateChange,
+        estimateTime: existingEstimateTime,
+        fundName: data.name
+      })
+      // Some providers begin stamping data with the new calendar day before
+      // 9:30. Keep the last completed trading-day pair until the market opens.
+      const hasIncomingCurrentEstimate = isEstimateDateToday(estimateTimeValue || '')
+      const useCachedCompletedEstimate = cachedComparison.hasActualDiff && (
+        incomingIsOfficialSnapshot ||
+        (!hasIncomingCurrentEstimate && !incomingComparison.isTrading && !incomingComparison.hasActualDiff)
+      )
+      const comparison = useCachedCompletedEstimate ? cachedComparison : incomingComparison
+      const displayEstimateChange = useCachedCompletedEstimate ? existingEstimateChange : estimateChangeValue
+      const displayEstimateTime = useCachedCompletedEstimate ? existingEstimateTime : estimateTimeValue
+
+      if (comparison.hasActualDiff && hasUsableEstimateChange(displayEstimateChange) && realChangeDate) {
+        rememberValuationSettlement(code, {
+          date: realChangeDate,
+          estimateChange: Number(displayEstimateChange),
+          realChange: Number(realChange),
+          source: 'local-cache'
+        })
       }
       
             // [WHAT] 检查估值日期是否为今天
       // [WHY] QDII基金在港股非交易日时，天天基金仍返回上一交易日的估值数据
       //       如果估值日期不是今天，说明该市场今日没有开盘，估值应该显示为"--"
-      const today = new Date().toISOString().slice(0, 10)
+      const today = getTodayStr()
       // [FIX] gztime 格式可能是 "2026/07/07 23:45" 或 "2026-07-07 23:45"
       //       需要提取日期部分并统一格式进行比较
       const isEstimateToday = (() => {
-        if (!data.gztime) return false
-        const datePart = data.gztime.split(' ')[0] // 提取日期部分
+        if (!estimateTimeValue) return false
+        const datePart = estimateTimeValue.split(' ')[0] // 提取日期部分
         const normalizedDate = datePart.replace(/\//g, '-') // 统一日期分隔符为 "-"
         return normalizedDate === today
       })()
+      const retainedMarketEstimate = !incomingIsOfficialSnapshot && isRetainedMarketEstimate(data)
       
       // [WHAT] 如果估值日期不是今天，将估值设为"--"表示无今日估值
-      const estimateValue = isEstimateToday ? data.gsz : '--'
-      const estimateChange = isEstimateToday ? data.gszzl : '--'
+      const estimateValue = (isEstimateToday || retainedMarketEstimate)
+        ? (Number.isFinite(Number(data.gsz)) && Number(data.gsz) > 0 ? data.gsz : watchlist.value[index].estimateValue)
+        : '--'
+      const estimateChange = (isEstimateToday || retainedMarketEstimate || comparison.hasActualDiff) ? (displayEstimateChange || '--') : '--'
       
       watchlist.value[index] = {
         code: data.fundcode,
@@ -290,12 +393,12 @@ export const useFundStore = defineStore('fund', () => {
         type: existingType,
         estimateValue,
         estimateChange,
-        estimateTime: data.gztime,
+        estimateTime: displayEstimateTime,
         lastValue: data.dwjz,
         loading: false,
         realChange,
         realChangeDate,
-        isRealChangeToday
+        isRealChangeToday: comparison.isCurrentReal
       }
     }
   }
@@ -319,7 +422,7 @@ export const useFundStore = defineStore('fund', () => {
       type: fundType,
       // [EDGE] 设置默认估值数据，避免空白
       estimateValue: '--',
-      estimateChange: '0',
+      estimateChange: '--',
       lastValue: '--',
       loading: true
     })

@@ -8,7 +8,6 @@ import { showToast } from 'vant'
 
 const route = useRoute()
 const router = useRouter()
-
 // [WHY] 处理 Android 返回键，防止直接退出应用
 // [WHAT] 在主页时需要双击才能退出
 let lastBackTime = 0
@@ -27,7 +26,7 @@ onMounted(() => {
   
   plugins.App.addListener('backButton', () => {
     // [WHY] 如果不在主页，正常返回上一页
-    const mainPages = ['home', 'market', 'holding', 'analysis', 'valuationGrid']
+    const mainPages = ['home', 'market', 'holding', 'analysis', 'realtimeValuation', 'lowFrequencyGrid']
     const isMainPage = mainPages.includes(route.name as string)
     
     if (!isMainPage && window.history.length > 1) {
@@ -59,7 +58,7 @@ onUnmounted(() => {
 const activeTab = ref('holding')
 
 // [WHAT] 需要隐藏底部导航的页面
-const hiddenTabbarPages = ['search', 'detail', 'trades']
+const hiddenTabbarPages = ['search', 'detail', 'trades', 'sectorDetail']
 const showTabbar = computed(() => !hiddenTabbarPages.includes(route.name as string))
 
 // [WHY] 路由变化时同步更新 tab 状态
@@ -71,7 +70,8 @@ watch(
       market: 'market',
       holding: 'holding',
       analysis: 'analysis',
-      valuationGrid: 'valuationGrid'
+      realtimeValuation: 'realtimeValuation',
+      lowFrequencyGrid: 'lowFrequencyGrid'
     }
     if (name && tabMap[name as string]) {
       activeTab.value = tabMap[name as string]
@@ -87,7 +87,8 @@ function onTabChange(name: string | number) {
     market: '/market',
       holding: '/',
       analysis: '/analysis',
-      valuationGrid: '/valuation-grid'
+      realtimeValuation: '/realtime-valuation',
+      lowFrequencyGrid: '/low-frequency-grid'
   }
   if (routeMap[name as string]) {
     router.push(routeMap[name as string])
@@ -100,8 +101,8 @@ function onTabChange(name: string | number) {
     <!-- 路由视图 -->
     <!-- [FIX] 启用 keep-alive 缓存主页面，避免频繁切换时重新加载 -->
     <router-view v-slot="{ Component }">
-      <keep-alive include="Holding,Home,Market,Analysis">
-        <component :is="Component" />
+      <keep-alive include="Holding,Home,Market,Analysis,ValuationGrid">
+        <component :is="Component" :key="String(route.name)" />
       </keep-alive>
     </router-view>
 
@@ -114,8 +115,9 @@ function onTabChange(name: string | number) {
       <van-tabbar-item name="holding" icon="balance-list-o">持仓</van-tabbar-item>
       <van-tabbar-item name="home" icon="home-o">自选</van-tabbar-item>
       <van-tabbar-item name="market" icon="chart-trending-o">行情</van-tabbar-item>
+      <van-tabbar-item name="realtimeValuation" icon="chart-trending-o">估值</van-tabbar-item>
+      <van-tabbar-item name="lowFrequencyGrid" icon="apps-o">网格</van-tabbar-item>
       <van-tabbar-item name="analysis" icon="bar-chart-o">分析</van-tabbar-item>
-      <van-tabbar-item name="valuationGrid" icon="apps-o">估值网格</van-tabbar-item>
     </van-tabbar>
   </div>
 </template>
@@ -125,7 +127,12 @@ function onTabChange(name: string | number) {
   min-height: 100vh;
   /* [WHY] 使用主题变量 */
   background: var(--bg-primary);
-  padding-bottom: 50px;
+  padding-bottom: calc(50px + env(safe-area-inset-bottom, 0px));
   transition: background-color 0.3s;
 }
+
+:deep(.van-tabbar) {
+  z-index: 1000;
+}
+
 </style>

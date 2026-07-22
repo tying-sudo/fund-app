@@ -2,6 +2,7 @@
 // [WHAT] 主要页面：持仓（默认）、行情、自选、分析、搜索、详情、交易记录
 
 import { createRouter, createWebHistory } from 'vue-router'
+import Market from '@/views/Market.vue'
 
 const router = createRouter({
   history: createWebHistory(),
@@ -15,10 +16,12 @@ const router = createRouter({
       component: () => import('@/views/Holding.vue'),
       meta: { title: '持仓' }
     },
-        {
+    {
       path: '/market',
       name: 'market',
-      component: () => import('@/views/Market.vue'),
+      // Keep the main tab in the entry bundle so navigation never leaves the
+      // previous detail page visible while its async chunk is being fetched.
+      component: Market,
       meta: { title: '行情' }
     },
     {
@@ -26,6 +29,12 @@ const router = createRouter({
       name: 'marketMore',
       component: () => import('@/views/MarketMore.vue'),
       meta: { title: '行情详情' }
+    },
+    {
+      path: '/sector/:code',
+      name: 'sectorDetail',
+      component: () => import('@/views/SectorDetail.vue'),
+      meta: { title: '板块详情' }
     },
     {
       path: '/home',
@@ -40,10 +49,22 @@ const router = createRouter({
       meta: { title: '分析' }
     },
     {
-      path: '/valuation-grid',
-      name: 'valuationGrid',
+      path: '/realtime-valuation',
+      name: 'realtimeValuation',
       component: () => import('@/views/ValuationGrid.vue'),
-      meta: { title: '估值网格' }
+      props: { mode: 'valuation' },
+      meta: { title: '实时估值' }
+    },
+    {
+      path: '/low-frequency-grid',
+      name: 'lowFrequencyGrid',
+      component: () => import('@/views/ValuationGrid.vue'),
+      props: { mode: 'strategy' },
+      meta: { title: '低频网格' }
+    },
+    {
+      path: '/valuation-grid',
+      redirect: '/realtime-valuation'
     },
     {
       path: '/search',

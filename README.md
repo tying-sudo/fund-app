@@ -1,102 +1,98 @@
 # 基金宝
 
-一款开源的基金实时估值查看工具，专为 Android 平台打造。
+基金实时估值、持仓收益、市场行情与低频估值网格的一体化应用，支持 Web 和 Android。
 
+[![Release](https://img.shields.io/github/v/release/tying-sudo/fund-app)](https://github.com/tying-sudo/fund-app/releases)
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 ![Vue](https://img.shields.io/badge/Vue-3.x-brightgreen.svg)
 ![Capacitor](https://img.shields.io/badge/Capacitor-7.x-blue.svg)
 
-## 功能特点
+- 在线访问：[www.tyingfund.com](https://www.tyingfund.com)
+- Android 下载：[GitHub Releases](https://github.com/tying-sudo/fund-app/releases)
+- 当前版本：`1.0.58 (59)`
 
-- **实时估值** - 秒级刷新基金实时估值数据
-- **自选管理** - 添加、删除、排序自选基金
-- **持仓管理** - 记录持仓，自动计算收益
-- **走势曲线** - 专业的分时/走势图表展示
-- **基金对比** - 多基金走势对比分析
-- **回测模拟** - 定投/一次性买入回测
-- **基金筛选** - 多维度筛选优质基金
-- **基金经理** - 查看基金经理业绩排行
-- **智能提醒** - 涨跌幅/净值预警提醒
-- **收益报告** - 生成可分享的收益图片
-- **投资日历** - 记录投资计划和事件
-- **深色模式** - 支持浅色/深色主题切换
+## 主要功能
 
-## 截图预览
+- **基金估值与走势**：展示盘中估值、官方净值、历史走势和阶段收益，区分实时、结算与缓存数据。
+- **自选与持仓**：管理自选基金、持仓成本、份额和收益，支持图片识别导入与持仓数据保护。
+- **市场行情**：提供境内、港股、美股及全球指数看板，以及行业、概念板块资金和趋势视图。
+- **低频估值网格**：集成估值网格策略、信号排序、交易导入和回测相关能力。
+- **Android 更新**：Capacitor 客户端支持远程版本检查和 APK 更新。
+- **服务端能力**：包含基金数据聚合、缓存、OCR、行情持久化、数据库迁移及部署脚本。
 
-<!-- TODO: 添加应用截图 -->
+## 技术架构
+
+| 模块 | 技术 |
+| --- | --- |
+| 前端 | Vue 3、TypeScript、Vite、Vant、Pinia |
+| 图表 | Canvas API、lightweight-charts、D3 Force |
+| 后端 | Node.js、Express |
+| Android | Capacitor 7 |
+| 网格服务 | Python、FastAPI |
+| 数据持久化 | Supabase/PostgreSQL、服务端缓存 |
 
 ## 快速开始
 
-### 下载安装
-
-前往 [Releases](https://github.com/xiriovo/fund-app/releases) 下载最新版 APK 安装。
-
-### 本地开发
+### 前端
 
 ```bash
-# 克隆项目
-git clone https://github.com/xiriovo/fund-app.git
+git clone https://github.com/tying-sudo/fund-app.git
 cd fund-app
-
-# 安装依赖
-npm install
-
-# 启动开发服务器
+npm ci
 npm run dev
+```
 
-# 构建生产版本
+生产构建：
+
+```bash
 npm run build
 ```
 
-### Android APK 构建
+### 后端
 
 ```bash
-# 同步 Capacitor
+cd server
+npm ci
+npm start
+```
+
+服务端密钥和连接信息必须通过环境变量提供，不要写入源码、前端资源或 APK。
+
+### Android
+
+Android 构建需要 JDK 21 和已配置的 Android SDK：
+
+```bash
 npm run cap:sync
-
-# 使用 Android Studio 打开
-npx cap open android
-
-# 或命令行构建（需要 JDK 21）
 cd android
 ./gradlew assembleDebug
 ```
 
-APK 输出位置：`android/app/build/outputs/apk/debug/app-debug.apk`
+APK 输出位置为 `android/app/build/outputs/apk/debug/app-debug.apk`。
 
-## 技术栈
+## 测试
 
-- **前端框架**：Vue 3 + TypeScript
-- **构建工具**：Vite
-- **UI 组件**：Vant 4
-- **状态管理**：Pinia
-- **图表绘制**：Canvas API + lightweight-charts
-- **移动打包**：Capacitor
+```bash
+npm run test:holding
+npm run test:grid-trade-import
+npm run test:grid-strategy-order
+npm run build
 
-## 数据来源
+cd server
+npm test
+```
 
-本项目数据来源于公开的基金信息接口，仅供学习和个人使用。
+## 数据说明
 
-## 免责声明
+本项目聚合公开的基金、指数和板块信息，并使用官方快照、实时估值及本地缓存处理不同交易时段。数据可能延迟或中断，仅供学习和个人研究，不构成投资建议；基金净值以基金公司最终公告为准。
 
-- 本工具仅供学习交流使用，不构成任何投资建议
-- 基金估值数据仅供参考，以基金公司公布的净值为准
-- 投资有风险，入市需谨慎
+## 来源与致谢
 
-## 开源协议
+- 应用早期结构和文档源自 [`xiriovo/fund-app`](https://github.com/xiriovo/fund-app)；该历史地址在 2026-07-22 核验时已不可公开访问，本仓库在其基础上持续维护。
+- 低频估值网格模块基于 [`shangjinma-source/valuation_grid`](https://github.com/shangjinma-source/valuation_grid)，本仓库在 `vendor/valuation_grid` 中保留集成代码，并对界面、持仓保护、交易导入和部署流程进行了适配。
 
-本项目基于 [MIT License](./LICENSE) 开源。
+感谢上述项目及所有贡献者。本仓库的二次开发内容依据 [MIT License](./LICENSE) 发布；引用上游代码时同时遵守对应源仓库的许可要求。
 
-## 贡献指南
+## 贡献
 
-欢迎提交 Issue 和 Pull Request！
-
-1. Fork 本仓库
-2. 创建特性分支 (`git checkout -b feature/amazing-feature`)
-3. 提交更改 (`git commit -m 'Add amazing feature'`)
-4. 推送到分支 (`git push origin feature/amazing-feature`)
-5. 创建 Pull Request
-
-## 致谢
-
-感谢所有为本项目做出贡献的开发者！
+欢迎通过当前仓库的 [Issues](https://github.com/tying-sudo/fund-app/issues) 和 Pull Requests 提交问题或改进。

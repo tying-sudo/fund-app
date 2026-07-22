@@ -6,8 +6,8 @@
 import type { WatchlistItem, DataSource } from '@/types/fund'
 import { DATA_SOURCE_CONFIG } from '@/types/fund'
 import { formatNetValue, formatPercent, getChangeStatus, getJdFundLink } from '@/utils/format'
-import { computed, ref, watch, onMounted } from 'vue'
-import { fetchNetValueHistoryFast } from '@/api/fundFast'
+import { computed, ref, watch } from 'vue'
+import { getValuationComparisonState } from '@/utils/holdingCalculator'
 
 const props = defineProps<{
   fund: WatchlistItem
@@ -40,14 +40,17 @@ watch(() => props.fund.estimateValue, (newVal, oldVal) => {
 
 // [WHAT] 根据涨跌状态返回对应的 CSS 类名
 const changeClass = computed(() => {
-  if (!props.fund.estimateChange || props.fund.estimateChange === '--') return ''
-  return getChangeStatus(props.fund.estimateChange)
+  const rawValue = props.fund.estimateChange
+  const value = Number(rawValue)
+  if (rawValue === null || rawValue === undefined || rawValue === '' || rawValue === '--' || !Number.isFinite(value)) return ''
+  return getChangeStatus(value)
 })
 
 const displayChange = computed(() => {
-  // [EDGE] 估值为"--"时直接显示"--"，不格式化
-  if (props.fund.estimateChange === '--') return '--'
-  return formatPercent(props.fund.estimateChange || 0)
+  const rawValue = props.fund.estimateChange
+  const value = Number(rawValue)
+  if (rawValue === null || rawValue === undefined || rawValue === '' || rawValue === '--' || !Number.isFinite(value)) return '--'
+  return formatPercent(value)
 })
 
 const displayValue = computed(() => {
@@ -57,10 +60,18 @@ const displayValue = computed(() => {
   return formatNetValue(val)
 })
 
+const comparisonState = computed(() => getValuationComparisonState({
+  realChange: props.fund.realChange,
+  realChangeDate: props.fund.realChangeDate,
+  estimateChange: props.fund.estimateChange,
+  estimateTime: props.fund.estimateTime,
+  fundName: props.fund.name
+}))
+
 // [WHAT] 主显示区净值：盘后机构公布真实涨跌幅后，切换为真实净值
 // [WHY] 与持仓页逻辑对齐：真实数据优先，估值作为兜底
 const displayNetValue = computed(() => {
-  if (props.fund.isRealChangeToday && props.fund.realChange !== undefined && props.fund.realChange !== null) {
+  if (comparisonState.value.isCurrentReal && props.fund.realChange !== undefined && props.fund.realChange !== null) {
     const lastValue = parseFloat(props.fund.lastValue || '0')
     if (lastValue > 0) {
       const realValue = lastValue * (1 + props.fund.realChange / 100)
@@ -72,7 +83,7 @@ const displayNetValue = computed(() => {
 
 // [WHAT] 主显示区涨跌幅：盘后切换为真实涨跌幅
 const displayMainChange = computed(() => {
-  if (props.fund.isRealChangeToday && props.fund.realChange !== undefined && props.fund.realChange !== null) {
+  if (comparisonState.value.isCurrentReal && props.fund.realChange !== undefined && props.fund.realChange !== null) {
     return formatPercent(props.fund.realChange)
   }
   return displayChange.value
@@ -80,7 +91,7 @@ const displayMainChange = computed(() => {
 
 // [WHAT] 主显示区涨跌颜色类
 const mainChangeClass = computed(() => {
-  if (props.fund.isRealChangeToday && props.fund.realChange !== undefined && props.fund.realChange !== null) {
+  if (comparisonState.value.isCurrentReal && props.fund.realChange !== undefined && props.fund.realChange !== null) {
     return getChangeStatus(props.fund.realChange)
   }
   return changeClass.value
@@ -137,12 +148,14 @@ const isTradingHours = computed(() => {
 // - true（机构已公布）：显示"已更新"
 // - false（机构未公布）：显示"待更新"
 const statusTag = computed(() => {
-  return props.fund.isRealChangeToday ? '已更新' : '待更新'
+  if (comparisonState.value.isTrading) return '估值中'
+  return comparisonState.value.isCurrentReal ? '已更新' : '待更新'
 })
 
 // [WHAT] 状态标签样式类
 const statusTagClass = computed(() => {
-  return props.fund.isRealChangeToday ? 'tag-updated' : 'tag-trading'
+  if (comparisonState.value.isTrading) return 'tag-trading'
+  return comparisonState.value.isCurrentReal ? 'tag-updated' : 'tag-pending'
 })
 
 // [WHAT] 基金名称动态字体大小
@@ -157,57 +170,19 @@ const fundNameStyle = computed(() => {
   return { fontSize: `${fontSize}px` }
 })
 
-// [WHAT] 均差缓存
-const averageDiff = ref<number | null>(null)
-
-// [WHAT] 计算近期均差（从历史净值数据计算）
-const calculateAverageDiff = async () => {
-  try {
-    // 获取最近5天的历史净值
-    const history = await fetchNetValueHistoryFast(props.fund.code, 5)
-    if (history.length < 2) return
-    
-    // 计算近期涨跌幅的平均值
-    const changes = history.map(h => h.changeRate).filter(c => !isNaN(c))
-    if (changes.length === 0) return
-    
-    const avg = changes.reduce((sum, c) => sum + c, 0) / changes.length
-    averageDiff.value = Math.round(avg * 100) / 100
-  } catch {
-    // 忽略错误
-  }
-}
-
-// [WHAT] 始终计算均差（用于机构未公布真实涨跌幅时显示）
-onMounted(() => {
-  calculateAverageDiff()
-})
-
-// [WHAT] 实差/均差计算
-// 根据机构是否公布今日真实涨跌幅来判断：
-// - true（机构已公布）：实差 = 真实涨跌幅 - 估值涨跌幅
-// - false（机构未公布）：均差 = 今日估值涨跌幅 - 近期真实涨跌幅的平均值
+// Compare official and estimated changes only when they refer to the same completed trading day.
 const diffChange = computed(() => {
-  const estimate = props.fund.estimateChange
-  const real = props.fund.realChange
-  
-  // 机构已公布今日真实涨跌幅，计算实差
-  if (props.fund.isRealChangeToday) {
-    if (estimate === undefined || estimate === null || real === undefined || real === null) {
-      return null
-    }
-    return Number(real) - Number(estimate)
-  }
-  
-  // 机构未公布，计算均差 = 今日估值 - 近期真实涨跌幅的平均值
-  if (averageDiff.value !== null && estimate !== undefined && estimate !== null) {
-    return Number(estimate) - averageDiff.value
-  }
-  
-  return null
+  const estimateRaw = props.fund.estimateChange
+  const realRaw = props.fund.realChange
+  const estimate = Number(estimateRaw)
+  const real = Number(realRaw)
+  if (estimateRaw === null || estimateRaw === undefined || estimateRaw === '' || estimateRaw === '--'
+    || realRaw === null || realRaw === undefined
+    || !comparisonState.value.hasActualDiff || !Number.isFinite(estimate) || !Number.isFinite(real)) return null
+  return real - estimate
 })
 
-// [WHAT] 实差/均差显示文本
+// [WHAT] 实差显示文本
 const displayDiff = computed(() => {
   if (diffChange.value === null) return null
   const val = diffChange.value
@@ -215,12 +190,9 @@ const displayDiff = computed(() => {
   return `${sign}${val.toFixed(2)}%`
 })
 
-// [WHAT] 实差/均差标签
-// 根据机构是否公布今日真实涨跌幅来判断：
-// - true（机构已公布）：显示"实差"
-// - false（机构未公布）：显示"均差"
+// [WHAT] 实差标签
 const diffLabel = computed(() => {
-  return props.fund.isRealChangeToday ? '实差' : '均差'
+  return '实差'
 })
 
 // [WHAT] 实差 CSS 类名
@@ -237,12 +209,19 @@ const displayRealChange = computed(() => {
   return formatPercent(props.fund.realChange)
 })
 
+// Keep the watchlist row visible whenever either side of the completed
+// comparison is available, matching the holdings list behavior.
+const hasDiffData = computed(() => {
+  const estimate = props.fund.estimateChange
+  return (estimate !== undefined && estimate !== null && estimate !== '--') || displayRealChange.value !== null
+})
+
 // [WHAT] 真实涨跌幅标签
 // 根据机构是否公布今日真实涨跌幅来判断：
 // - true（机构已公布）：显示"真实"
 // - false（机构未公布）：显示"昨"
 const realChangeLabel = computed(() => {
-  return props.fund.isRealChangeToday ? '真实' : '昨'
+  return comparisonState.value.realChangeLabel || '净值'
 })
 
 const realChangeClass = computed(() => {
@@ -315,8 +294,8 @@ const hasSourceComparison = computed(() => {
           <span v-if="fund.type" class="fund-type"> · {{ fund.type }}</span>
           <span :class="['fund-tag', statusTagClass]">{{ statusTag }}</span>
         </div>
-                                <!-- 估值、真实涨跌幅、实差/均差 -->
-        <div class="fund-diff-info" v-if="displayRealChange">
+                                <!-- 估值、昨日或真实涨跌幅、实差 -->
+        <div class="fund-diff-info" v-if="hasDiffData">
           <span class="diff-label">估值</span>
           <span :class="['diff-value', changeClass]">{{ displayChange }}</span>
           <span class="diff-separator">|</span>
@@ -324,7 +303,7 @@ const hasSourceComparison = computed(() => {
           <span :class="['diff-value', realChangeClass]">{{ displayRealChange }}</span>
           <span class="diff-separator">|</span>
           <span class="diff-label">{{ diffLabel }}</span>
-          <span :class="['diff-value', diffClass]">{{ displayDiff }}</span>
+          <span :class="['diff-value', diffClass]">{{ displayDiff || '待计算' }}</span>
         </div>
       </div>
 
@@ -402,13 +381,18 @@ const hasSourceComparison = computed(() => {
 }
 
 .tag-trading {
-  background: rgba(255, 125, 0, 0.1);
-  color: #ff7d00;
+  background: #2196f3;
+  color: #fff;
 }
 
 .tag-updated {
-  background: rgba(255, 152, 0, 0.15);
-  color: #ff9800;
+  background: #ff9800;
+  color: #fff;
+}
+
+.tag-pending {
+  background: #ffcdd2;
+  color: #c62828;
 }
 
 /* 数据源切换标签（新增） */
@@ -487,6 +471,18 @@ const hasSourceComparison = computed(() => {
 
 .diff-value {
   font-weight: 500;
+}
+
+.fund-diff-info .up {
+  color: var(--color-up);
+}
+
+.fund-diff-info .down {
+  color: var(--color-down);
+}
+
+.fund-diff-info .flat {
+  color: var(--text-secondary);
 }
 
 .diff-separator {

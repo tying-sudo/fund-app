@@ -18,18 +18,11 @@ import uvicorn
 from valuation.core import (
     load_state, save_state, validate_state,
     calculate_valuation, calculate_valuation_batch, calculate_valuation_by_state,
-    get_latest_settlement,
+    beijing_now, get_latest_settlement
 )
 from valuation.providers import (
     get_fund_name, set_etf_link_target, get_etf_link_target, clear_etf_link_target,
     refresh_stale_holdings
-)
-from data_sources import (
-    DataSourceError,
-    get_akshare_fund_nav_history,
-    get_data_source_status,
-    get_eastmoney_fund_estimate,
-    get_eastmoney_fund_nav_history,
 )
 from positions import (
     add_batch, sell_batch, delete_batch, update_fund_config,
@@ -50,7 +43,7 @@ from grid import (
     auto_calibrate_vol_sensitivity,
     backfill_signal_outcomes, calc_signal_win_rate,
     set_market_regime, get_market_regime_info,
-    get_fitness_scores, get_fund_fitness, save_fitness_scores
+    get_fitness_scores, get_fund_fitness
 )
 
 # ============================================================
@@ -59,7 +52,7 @@ from grid import (
 
 def _refresh_holdings_when_idle():
     """交易时段优先保障实时估值，持仓全量刷新延后到收盘后。"""
-    now = datetime.now()
+    now = beijing_now()
     hhmm = now.hour * 100 + now.minute
     if now.weekday() < 5 and 850 <= hhmm < 1520:
         refresh_at = now.replace(hour=15, minute=20, second=0, microsecond=0)
@@ -103,15 +96,6 @@ async def position_data_error_handler(_request, exc: PositionDataError):
         content={"detail": str(exc), "error": "position_data_unavailable"},
     )
 
-
-@app.exception_handler(DataSourceError)
-async def data_source_error_handler(_request, exc: DataSourceError):
-    """Upstream data failures remain explicit and never crash the API worker."""
-    return JSONResponse(
-        status_code=502,
-        content={"detail": str(exc), "error": "market_data_unavailable"},
-    )
-
 # CORS
 app.add_middleware(
     CORSMiddleware,
@@ -136,6 +120,7 @@ class SectorItem(BaseModel):
 class StateModel(BaseModel):
     version: Optional[int] = 1
     updated_at: Optional[str] = None
+    strategy_order: Optional[List[str]] = None
     sectors: List[SectorItem]
 
 class BatchRequest(BaseModel):
@@ -183,38 +168,11 @@ def get_nav_history(fund_code: str, days: int = 15):
     data = get_fund_nav_history(fund_code, days)
     return {"fund_code": fund_code, "days": len(data), "history": data}
 
+
 @app.get("/v1/fund/{fund_code}/settlement")
-def get_latest_fund_settlement(fund_code: str):
-    """Latest completed trading-day estimate/NAV pair for UI recovery."""
+def get_fund_settlement(fund_code: str):
+    """Return the newest official NAV and same-day estimate pair."""
     return get_latest_settlement(fund_code)
-
-
-# ============================================================
-# 可选数据源 API（AKShare / 东方财富）
-# ============================================================
-
-@app.get("/v1/data-sources/status")
-def get_market_data_source_status():
-    """返回可选数据源的依赖可用性，不触发外部行情请求。"""
-    return get_data_source_status()
-
-
-@app.get("/v1/data/eastmoney/fund/{fund_code}/nav-history")
-def get_eastmoney_nav_history(fund_code: str, limit: int = 30):
-    """通过东方财富读取开放式基金历史净值。"""
-    return get_eastmoney_fund_nav_history(fund_code, limit)
-
-
-@app.get("/v1/data/eastmoney/fund/{fund_code}/estimate")
-def get_eastmoney_estimate(fund_code: str):
-    """通过东方财富读取盘中估值（没有估值时字段为 null）。"""
-    return get_eastmoney_fund_estimate(fund_code)
-
-
-@app.get("/v1/data/akshare/fund/{fund_code}/nav-history")
-def get_akshare_nav_history(fund_code: str, limit: int = 30):
-    """通过 AKShare 读取开放式基金历史净值。"""
-    return get_akshare_fund_nav_history(fund_code, limit)
 
 # ============================================================
 # ETF联接基金映射 API
@@ -306,6 +264,7 @@ def export_images(mode: str = "valuation"):
 # ============================================================
 
 @app.get("/health")
+@app.get("/v1/health")
 def health():
     return {"status": "ok"}
 
@@ -343,6 +302,18 @@ class FeeScheduleRequest(BaseModel):
     schedule: List[FeeScheduleItem]
 
 
+def _strategy_snapshot(fund_code: str) -> dict:
+    """Return the post-mutation strategy state without making a trade fail."""
+    snapshot = {"position": get_fund_position(fund_code)}
+    try:
+        snapshot["signal"] = generate_signal(fund_code)
+    except Exception as exc:
+        # The write already succeeded. Keep the response useful and let the
+        # next normal strategy refresh retry signal generation.
+        snapshot["signal_error"] = str(exc)
+    return snapshot
+
+
 @app.get("/v1/positions")
 def get_positions():
     """获取全部持仓"""
@@ -367,7 +338,7 @@ def buy_fund(fund_code: str, req: BuyRequest):
                       req.buy_date, req.is_supplement,
                       is_rebuy=bool(req.is_rebuy),
                       pending_rebuy_id=req.pending_rebuy_id)
-    return {"success": True, "batch": batch, "fund_key": fund_key}
+    return {"success": True, "batch": batch, "fund_key": fund_key, **_strategy_snapshot(fund_key)}
 
 
 class WatchFundRequest(BaseModel):
@@ -381,7 +352,7 @@ def watch_fund(fund_code: str, req: WatchFundRequest):
     """添加空仓观察基金（不创建batch，仅创建fund entry，用于空仓待建仓）"""
     fund_key = make_fund_key(fund_code, req.owner or "")
     result = add_watch_fund(fund_key, req.max_position, req.note or "")
-    return {"success": True, **result}
+    return {"success": True, **result, "fund_key": fund_key, **_strategy_snapshot(fund_key)}
 
 
 @app.post("/v1/position/{fund_code}/sell")
@@ -392,7 +363,7 @@ def sell_fund(fund_code: str, req: SellRequest):
     try:
         result = sell_batch(fund_code, req.batch_id, req.sell_shares,
                             req.sell_nav, req.sell_date)
-        return {"success": True, **result}
+        return {"success": True, **result, "fund_key": fund_code, **_strategy_snapshot(fund_code)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -401,7 +372,7 @@ def sell_fund(fund_code: str, req: SellRequest):
 def delete_fund_batch(fund_code: str, batch_id: str):
     """删除错误录入的批次"""
     if delete_batch(fund_code, batch_id):
-        return {"success": True, "message": f"已删除 {batch_id}"}
+        return {"success": True, "message": f"已删除 {batch_id}", "fund_key": fund_code, **_strategy_snapshot(fund_code)}
     else:
         raise HTTPException(status_code=404, detail=f"批次 {batch_id} 不存在")
 
@@ -435,7 +406,7 @@ def rename_fund_key_api(fund_code: str, req: RenameFundKeyRequest):
 def update_config(fund_code: str, req: FundConfigRequest):
     """更新基金配置"""
     if update_fund_config(fund_code, req.max_position, req.fund_name):
-        return {"success": True}
+        return {"success": True, "fund_key": fund_code, **_strategy_snapshot(fund_code)}
     else:
         raise HTTPException(status_code=500, detail="更新失败")
 
@@ -445,7 +416,7 @@ def update_fee_schedule_api(fund_code: str, req: FeeScheduleRequest):
     """更新基金卖出费率表"""
     schedule = [{"days": s.days, "rate": s.rate} for s in req.schedule]
     if update_fee_schedule(fund_code, schedule):
-        return {"success": True, "schedule": schedule}
+        return {"success": True, "schedule": schedule, "fund_key": fund_code, **_strategy_snapshot(fund_code)}
     else:
         raise HTTPException(status_code=500, detail="更新失败")
 
@@ -469,7 +440,7 @@ def sell_fund_fifo(fund_code: str, req: SellFifoRequest):
     try:
         result = sell_fifo(fund_code, req.total_sell_shares,
                            req.sell_nav, req.sell_date)
-        return {"success": True, **result}
+        return {"success": True, **result, "fund_key": fund_code, **_strategy_snapshot(fund_code)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -480,7 +451,7 @@ def update_sell_nav_api(fund_code: str, req: UpdateSellNavRequest):
         raise HTTPException(status_code=400, detail="净值必须大于0")
     try:
         result = update_sell_nav(fund_code, req.sell_record_id, req.sell_nav)
-        return {"success": True, "record": result}
+        return {"success": True, "record": result, "fund_key": fund_code, **_strategy_snapshot(fund_code)}
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -498,7 +469,7 @@ def update_buy_nav_api(fund_code: str, req: UpdateBuyNavRequest):
         raise HTTPException(status_code=400, detail="净值必须大于0")
     try:
         batch = confirm_buy_nav(fund_code, req.batch_id, req.nav)
-        return {"success": True, "batch": batch}
+        return {"success": True, "batch": batch, "fund_key": fund_code, **_strategy_snapshot(fund_code)}
     except ValueError as e:
         raise HTTPException(status_code=404, detail=str(e))
 
@@ -506,7 +477,7 @@ def update_buy_nav_api(fund_code: str, req: UpdateBuyNavRequest):
 def delete_sell_record_api(fund_code: str, sell_record_id: str):
     """删除卖出记录"""
     if delete_sell_record(fund_code, sell_record_id):
-        return {"success": True, "message": f"已删除卖出记录 {sell_record_id}"}
+        return {"success": True, "message": f"已删除卖出记录 {sell_record_id}", "fund_key": fund_code, **_strategy_snapshot(fund_code)}
     else:
         raise HTTPException(status_code=404, detail=f"卖出记录 {sell_record_id} 不存在")
 
@@ -640,11 +611,11 @@ def delete_group_api(group_id: str):
 
 
 # ============================================================
-# 行情模式管理 API（v5.17: 仅支持 neutral/bear，bull已禁用）
+# 行情模式管理 API
 # ============================================================
 
 class RegimeRequest(BaseModel):
-    regime: str = "neutral"  # "neutral" | "bear"
+    regime: str = "neutral"  # "bull" | "neutral" | "bear"
     auto: bool = True
     manual_override: bool = False
 
@@ -657,7 +628,7 @@ def get_regime():
 
 @app.post("/v1/market-regime")
 def set_regime(req: RegimeRequest):
-    """设置行情模式（neutral/bear）。manual_override=True: 手动指定; False: 恢复自动"""
+    """设置行情模式。manual_override=True: 手动指定; False: 恢复自动"""
     result = set_market_regime(req.regime, req.auto, req.manual_override)
     return {"success": True, **result}
 
@@ -679,20 +650,6 @@ def get_single_fitness(fund_code: str):
     if info:
         return {"fund_code": fund_code, **info}
     return {"fund_code": fund_code, "score": None, "grade": None}
-
-
-class FitnessScoresRequest(BaseModel):
-    scores: dict
-
-
-@app.put("/v1/fund-fitness")
-def import_fitness_scores(req: FitnessScoresRequest):
-    """Import generated scores without modifying state, holdings, or trades."""
-    try:
-        count = save_fitness_scores(req.scores)
-    except ValueError as exc:
-        raise HTTPException(status_code=400, detail=str(exc))
-    return {"success": True, "count": count}
 
 
 # ============================================================
@@ -724,10 +681,7 @@ def cleanup_pending_rebuys_api():
 
 @app.get("/")
 async def serve_index():
-    return FileResponse(
-        os.path.join(os.path.dirname(__file__), "demo.html"),
-        headers={"Cache-Control": "no-store, max-age=0"},
-    )
+    return FileResponse(os.path.join(os.path.dirname(__file__), "demo.html"))
 
 
 @app.get("/favicon.ico")

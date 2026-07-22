@@ -5,6 +5,7 @@ grid/engine.py - 低频网格策略：信号引擎
 """
 
 import json
+from math import isfinite
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from typing import Optional
@@ -12,7 +13,7 @@ from typing import Optional
 from positions import (
     get_fund_position, get_sell_fee_rate, load_positions, parse_fund_key
 )
-from valuation.core import calculate_valuation, load_state
+from valuation.core import beijing_now, calculate_valuation, flush_intraday_cache, load_state
 from valuation.providers import get_fund_nav_history
 
 from .config import (
@@ -139,14 +140,15 @@ def _build_market_analysis(fund_code: str, val: dict, nav_history: list,
     source = val.get("_source", "estimation")
 
     day_changes = []
-    if source == "estimation":
+    valuation_date = val.get("_valuation_date") or val.get("_nav_date") or beijing_now().strftime("%Y-%m-%d")
+    if source != "nav":
         day_changes.append({
-            "date": datetime.now().strftime("%Y-%m-%d"),
+            "date": valuation_date,
             "change": round(today_change, 2),
-            "source": "estimation",
+            "source": source,
         })
         for h in nav_history[:19]:
-            if h.get("change") is not None:
+            if h.get("change") is not None and h.get("date") != valuation_date:
                 day_changes.append({"date": h.get("date", ""), "change": round(h["change"], 2), "source": "nav"})
     else:
         for h in nav_history[:20]:
@@ -156,6 +158,9 @@ def _build_market_analysis(fund_code: str, val: dict, nav_history: list,
     tc = trend_ctx or {}
     dt = dynamic_thresholds or {}
 
+    effective_regime = regime or "neutral"
+    effective_regime_params = _get_regime_params(effective_regime)
+    entry_scale = effective_regime_params.get("first_build_ratio", 0.70) / 0.70
     strategy_params = {
         "dip_buy_threshold": dt.get("dip_threshold", DEFAULT_DIP_THRESHOLD),
         "take_profit_trigger": dt.get("tp_trigger", DEFAULT_TAKE_PROFIT_TRIGGER),
@@ -175,8 +180,12 @@ def _build_market_analysis(fund_code: str, val: dict, nav_history: list,
         "trend_weak_cumulative": dt.get("trend_weak_cumulative", DEFAULT_TREND_WEAK_CUMULATIVE),
         "disaster_loss_threshold": dt.get("disaster_loss_threshold", DEFAULT_DISASTER_LOSS),
         "vol_based": dt.get("_vol_based", False),
-    }
-
+        # Report the actual mode inputs used by this fund's signal calculation.
+        "market_regime": effective_regime,
+        "regime_first_build_ratio": effective_regime_params.get("first_build_ratio", 0.70),
+        "regime_entry_scale": round(entry_scale, 4),
+        "regime_rebuy_discount": effective_regime_params.get("rebuy_discount", 0.015),
+}
     # v5.2: 计算当前市值和盈亏（供前端展示，与支付宝对齐）
     market_value = round(current_nav * pos.get("total_shares", 0), 2) if current_nav and pos else None
     total_cost = pos.get("total_cost", pos.get("total_amount", 0)) if pos else 0
@@ -223,6 +232,14 @@ def _build_market_analysis(fund_code: str, val: dict, nav_history: list,
     }
 
 
+def _calc_regime_entry_amount(max_position: float, base_ratio: float,
+                              size_multiplier: float, regime_params: dict) -> float:
+    """Apply the active market regime to every empty-position entry signal."""
+    neutral_first_build_ratio = 0.70
+    regime_scale = float(regime_params.get("first_build_ratio", neutral_first_build_ratio)) / neutral_first_build_ratio
+    return round(max_position * base_ratio * size_multiplier * regime_scale, 2)
+
+
 # ============================================================
 # 综合趋势分析（v5.2: 增加 volume_proxy 成交量代理）
 # ============================================================
@@ -251,7 +268,7 @@ def _analyze_trend(today_change: float, hist_changes: list,
         # 使盘中 mid_10d 与收盘后语义一致。
         # v5.19 fix: 收盘后调用方已从 nav_history 中过滤掉今日记录，
         # 此时 navs[0] 也是昨日净值，与盘中行为一致，两种模式统一。
-        today_str = datetime.now().strftime("%Y-%m-%d")
+        today_str = beijing_now().strftime("%Y-%m-%d")
         _latest_is_today = (nav_history[0].get("date") == today_str) if nav_history else False
         if navs and not _latest_is_today:
             nav0_adj = navs[0] * (1 + today_change / 100)
@@ -351,7 +368,7 @@ def _analyze_trend(today_change: float, hist_changes: list,
     # 盘中估值与真实净值通常有 0.1~0.5% 的误差,
     # 在边界值附近可能导致趋势标签翻转 → 信号不一致
     # 容差仅影响趋势标签判定, 不影响具体数值 (short_3d/mid_10d 等原值不变)
-    _hyst = 0.3 if source == "estimation" else 0.0
+    _hyst = 0.3 if source != "nav" else 0.0
 
     trend_label = "震荡"
     if consecutive_down >= 3:
@@ -392,7 +409,30 @@ def generate_signal(fund_code: str) -> dict:
     real_code, owner = parse_fund_key(fund_code)
 
     val = calculate_valuation(real_code)
-    today_change = val.get("estimation_change") or 0.0
+    raw_today_change = val.get("estimation_change")
+    try:
+        today_change = float(raw_today_change)
+    except (TypeError, ValueError):
+        today_change = None
+    if today_change is None or not isfinite(today_change):
+        signal = _make_signal(
+            fund_code,
+            signal_name="估值不可用",
+            action="hold",
+            priority=8,
+            reason="当日估值不可用，已暂停生成交易信号",
+            alert=True,
+            alert_msg="数据未就绪，请勿按此信号交易",
+        )
+        signal["_source"] = "unavailable"
+        signal["market_analysis"] = {
+            "today_change": None,
+            "today_source": "unavailable",
+            "day_changes": [],
+            "confidence": 0.0,
+            "decision_note": "估值主链路未返回有效数据",
+        }
+        return signal
     recent = val.get("recent_changes", [])
     pos = get_fund_position(fund_code)
     nav_history = get_fund_nav_history(real_code, 21)  # v5.20 fix: 多取1条，收盘后过滤今日仍剩20条供 long_20d 计算
@@ -414,7 +454,7 @@ def generate_signal(fund_code: str) -> dict:
     #        最终造成盘中信号和收盘信号不一致 (如0.03%差异翻转信号)
     # 额外处理: _nav_date 可能不是今天 (收盘后净值未公布时回退到最近交易日),
     #           此时也需要从 hist_changes 中过滤掉该日, 避免 today_change 与之重复
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = beijing_now().strftime("%Y-%m-%d")
     _nav_date = val.get("_nav_date", today_str)  # today_change 对应的实际日期
     _nav_date_set = set()
     if source == "nav":
@@ -484,7 +524,8 @@ def generate_signal(fund_code: str) -> dict:
         )
         if _holding_for_check:
             _nav_for_check = _estimate_current_nav(
-                _holding_for_check[0]["nav"], today_change, nav_history
+                _holding_for_check[0]["nav"], today_change, nav_history,
+                source=source, valuation_date=val.get("_valuation_date") or val.get("_nav_date"),
             )
         elif nav_history and nav_history[0].get("nav"):
             _nav_for_check = nav_history[0]["nav"] * (1 + today_change / 100)
@@ -550,7 +591,8 @@ def generate_signal(fund_code: str) -> dict:
         batches_sorted = sorted(batches, key=lambda b: b["buy_date"])
 
         current_nav = _estimate_current_nav(
-            batches_sorted[0]["nav"], today_change, nav_history
+            batches_sorted[0]["nav"], today_change, nav_history,
+            source=source, valuation_date=val.get("_valuation_date") or val.get("_nav_date"),
         )
         total_profit_pct = _calc_total_profit_pct(batches_sorted, current_nav)
 
@@ -564,7 +606,7 @@ def generate_signal(fund_code: str) -> dict:
         # === 同日卖出抑制：检测今天是否已执行过卖出操作 ===
         # 若今天已卖出，抑制新的卖出信号，避免重复建议
         # （止损信号L2/L3除外——风险优先级高于重复抑制）
-        today_str = datetime.now().strftime("%Y-%m-%d")
+        today_str = beijing_now().strftime("%Y-%m-%d")
         _sold_today = (pos.get("cooldown_sell_date") == today_str)
 
         best_signal = None
@@ -574,7 +616,7 @@ def generate_signal(fund_code: str) -> dict:
 
         for batch in batches_sorted:
             buy_date = datetime.strptime(batch["buy_date"], "%Y-%m-%d").date()
-            hold_days = (datetime.now().date() - buy_date).days
+            hold_days = (beijing_now().date() - buy_date).days
             fee_rate = get_sell_fee_rate(fund_code, hold_days)
             profit_pct = _calc_batch_profit_pct(batch, current_nav)
 
@@ -726,7 +768,7 @@ def generate_signal(fund_code: str) -> dict:
                 _nz_bonus = min(12.0, total_profit_pct * 2.0)
                 # 持仓时间修正: 最老批次持仓<15天时减半奖励（与v5.7时间门槛对齐）
                 _oldest_bd = datetime.strptime(batches_sorted[0]["buy_date"], "%Y-%m-%d").date()
-                _oldest_hd = (datetime.now().date() - _oldest_bd).days
+                _oldest_hd = (beijing_now().date() - _oldest_bd).days
                 if _oldest_hd < 15:
                     _nz_bonus *= 0.5
 
@@ -751,7 +793,7 @@ def generate_signal(fund_code: str) -> dict:
                 est_fee = round(est_gross * fee_rate / 100, 2)
                 est_net_profit = round(est_gross * (1 - fee_rate / 100) - batch["amount"] * sell_pct / 100, 2)
 
-                is_low_conf = source == "estimation" and confidence < 0.5
+                is_low_conf = source != "nav" and confidence < 0.5
                 # 同日卖出抑制：今天已卖过则降级为 hold，避免重复建议
                 is_suppressed = _sold_today
                 sig = _make_signal(
@@ -805,7 +847,7 @@ def generate_signal(fund_code: str) -> dict:
                 has_trend_confirm = False  # 缩量下跌，可能是假信号
 
             if profit_pct > min_profit_buffer and has_trend_confirm:
-                is_low_conf = source == "estimation" and confidence < 0.5
+                is_low_conf = source != "nav" and confidence < 0.5
                 # 同日卖出抑制
                 is_suppressed = _sold_today
                 # v5.5 优化: 趋势转弱减仓比例整体降低——留更多仓位等反弹
@@ -857,7 +899,7 @@ def generate_signal(fund_code: str) -> dict:
         if total_profit_pct < 0 and not best_signal:
             oldest = batches_sorted[0]
             oldest_bd = datetime.strptime(oldest["buy_date"], "%Y-%m-%d").date()
-            oldest_hd = (datetime.now().date() - oldest_bd).days
+            oldest_hd = (beijing_now().date() - oldest_bd).days
             supp_count = pos.get("supplement_count", 0)
             dyn_max_supp = _calc_dynamic_supplement_max(pos)
             dyn_max_supp = min(dyn_max_supp, regime_params["supplement_max_count"])  # v5.13: 行情模式覆盖
@@ -1140,6 +1182,7 @@ def generate_signal(fund_code: str) -> dict:
                             "discount": _rebuy_discount,
                             "window_days": 20,  # 20天内有效
                             "pending_rebuy_id": _pr_id,  # v5.X: 关联到挂单
+                            "source_signal": best_signal.get("signal_name", ""),
                             "reason": (f"v5.11延迟回补: 趋势{_rebuy_trend}, "
                                       f"净值回落{_rebuy_discount:.0%}至{_trigger_nav:.4f}时"
                                       f"回补{_rebuy_ratio:.0%}={_rebuy_amount:.0f}元(20天内有效)"),
@@ -1253,7 +1296,7 @@ def generate_signal(fund_code: str) -> dict:
     # --- 大跌抄底 ---
     if today_change <= dip_threshold and not in_cooldown and can_buy_empty:
         max_pos = pos["max_position"]
-        buy_amount = round(max_pos * 0.80 * size_mul, 2)  # v5.13: 大跌抄底从70%→80%，加大抄底力度
+        buy_amount = _calc_regime_entry_amount(max_pos, 0.80, size_mul, regime_params)
 
         # v5.2: 缩量大跌可能是假突破，减少建仓规模
         volume_proxy = trend_ctx.get("volume_proxy")
@@ -1284,7 +1327,7 @@ def generate_signal(fund_code: str) -> dict:
 
         if (mid_10d is not None and mid_10d <= TREND_BUILD_TRIGGER_10D
                 and today_change >= -0.5):
-            buy_amount = round(max_pos * 0.55 * size_mul, 2)  # v5.5 优化: 低位建仓从40%→55%
+            buy_amount = _calc_regime_entry_amount(max_pos, 0.55, size_mul, regime_params)
             build_signal = _make_signal(
                 fund_code, signal_name="低位建仓", action="buy", priority=6,
                 amount=buy_amount,
@@ -1293,7 +1336,7 @@ def generate_signal(fund_code: str) -> dict:
             print(f"  → 分支: 低位建仓, mid_10d={mid_10d}, today_chg={today_change}, amount={buy_amount}")
         elif (short_5d is not None and short_5d <= TREND_BUILD_TRIGGER_5D
                 and today_change > 0):
-            buy_amount = round(max_pos * 0.45 * size_mul, 2)  # v5.5 优化: 反弹建仓从30%→45%
+            buy_amount = _calc_regime_entry_amount(max_pos, 0.45, size_mul, regime_params)
             build_signal = _make_signal(
                 fund_code, signal_name="反弹建仓", action="buy", priority=6,
                 amount=buy_amount,
@@ -1303,7 +1346,7 @@ def generate_signal(fund_code: str) -> dict:
         elif (consecutive_down >= 3 and today_change < 0
                 and len(hist_changes) >= 1
                 and abs(today_change) < abs(hist_changes[0]) * 0.6):
-            buy_amount = round(max_pos * 0.35 * size_mul, 2)  # v5.5 优化: 跌势放缓建仓从25%→35%
+            buy_amount = _calc_regime_entry_amount(max_pos, 0.35, size_mul, regime_params)
             build_signal = _make_signal(
                 fund_code, signal_name="跌势放缓建仓", action="buy", priority=7,
                 amount=buy_amount,
@@ -1325,7 +1368,7 @@ def generate_signal(fund_code: str) -> dict:
                 and abs(short_3d) > vol_for_mild
                 and vol_state != "extreme_vol"):
             max_pos = pos["max_position"]
-            buy_amount = round(max_pos * 0.45 * size_mul, 2)
+            buy_amount = _calc_regime_entry_amount(max_pos, 0.45, size_mul, regime_params)
             sig = _make_signal(
                 fund_code, signal_name="温和回调建仓", action="buy", priority=7,
                 amount=buy_amount,
@@ -1344,7 +1387,7 @@ def generate_signal(fund_code: str) -> dict:
             and recent[0]["change"] < 0
             and not in_cooldown and can_buy_empty):
         max_pos = pos["max_position"]
-        buy_amount = round(max_pos * 0.45 * size_mul, 2)  # v5.5 优化: 连跌低吸从30%→45%
+        buy_amount = _calc_regime_entry_amount(max_pos, 0.45, size_mul, regime_params)
         sig = _make_signal(
             fund_code, signal_name="连跌低吸", action="buy", priority=7,
             amount=buy_amount,
@@ -1370,7 +1413,7 @@ def generate_signal(fund_code: str) -> dict:
             cd_note = f"(5日累跌{short_5d_cd}%+连跌{consecutive_down_cd}天, 延迟建仓)"
         if trend_ok:
             max_pos = pos["max_position"]
-            buy_amount = round(max_pos * 0.50 * size_mul, 2)  # v5.5 优化: 冷却期后建仓从30%→50%
+            buy_amount = _calc_regime_entry_amount(max_pos, 0.50, size_mul, regime_params)
             sig = _make_signal(
                 fund_code, signal_name="冷却期后建仓", action="buy", priority=7,
                 amount=buy_amount,
@@ -1651,8 +1694,9 @@ def generate_all_signals() -> dict:
         holding = [b for b in fund.get("batches", []) if b.get("status") == "holding"]
         total_invested += sum(b.get("amount", 0) for b in holding)
 
+    flush_intraday_cache()
     return {
-        "generated_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+        "generated_at": beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
         "signals": signals,
         "portfolio_budget": {
             "max_invest": round(total_max_invest, 2),

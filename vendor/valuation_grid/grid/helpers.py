@@ -12,7 +12,7 @@ from positions import (
     get_sell_fee_rate, load_positions, save_positions, parse_fund_key,
     position_write,
 )
-from valuation.core import _is_market_closed
+from valuation.core import beijing_now
 
 from .config import (
     _get_vol_sensitivity, DEFAULT_VOL_SENSITIVITY,
@@ -524,7 +524,7 @@ def _is_supplement_forbidden(trend_ctx: dict, confidence: float,
     if batches_sorted:
         oldest = batches_sorted[0]
         oldest_buy_date = datetime.strptime(oldest["buy_date"], "%Y-%m-%d").date()
-        oldest_hold_days = (datetime.now().date() - oldest_buy_date).days
+        oldest_hold_days = (beijing_now().date() - oldest_buy_date).days
         if oldest_hold_days < 20:  # 在20天豁免期内
             short_5d = trend_ctx.get("short_5d")
             if consecutive_down >= 4 and short_5d is not None and short_5d <= -7:  # v5.8 重构P3: 3/5→4/7
@@ -542,7 +542,7 @@ def _check_supplement_rate_limit(pos: dict, current_nav: float,
         return False, "", 1.0
 
     trade_dates = [h["date"] for h in nav_history if h.get("date")]
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    today_str = beijing_now().strftime("%Y-%m-%d")
 
     total_profit_pct = pos.get("_total_profit_pct")
     use_all_buys = total_profit_pct is not None and total_profit_pct < -3.0
@@ -620,7 +620,7 @@ def _is_in_cooldown(pos: dict, nav_history: list) -> bool:
 
     if sell_date:
         trade_dates = [h["date"] for h in nav_history if h.get("date")]
-        today_str = datetime.now().strftime("%Y-%m-%d")
+        today_str = beijing_now().strftime("%Y-%m-%d")
         gap = _count_trade_days_between(sell_date, today_str, trade_dates)
         return gap < cooldown_td
 
@@ -628,7 +628,7 @@ def _is_in_cooldown(pos: dict, nav_history: list) -> bool:
     if cd_str:
         try:
             cd_date = datetime.strptime(cd_str, "%Y-%m-%d").date()
-            return datetime.now().date() <= cd_date
+            return beijing_now().date() <= cd_date
         except (ValueError, TypeError):
             pass
     return False
@@ -669,27 +669,24 @@ def _calc_size_multiplier(risk_mul: float, confidence: float,
 # ============================================================
 
 def _estimate_current_nav(batch_nav: float, today_change: float,
-                          nav_history: list) -> float:
+                          nav_history: list, source: str = "estimation",
+                          valuation_date: str = None) -> float:
     """
-    收盘后净值估算逻辑：
-    - 最新记录==今天 → 直接用今天净值
-    - 最新记录≠今天 → 返回最新收盘净值（此时 today_change 已被 core.py 替换为
-      该日真实涨跌，latest_nav 已包含该变动，不可重复计算）
-    - 盘中 → 用昨日净值 × (1 + today_change/100)
+    - 真实净值来源：直接使用对应日期的已公布净值。
+    - 实时或盘后冻结估值：用最新已公布净值乘以当日估值涨跌。
     """
-    today_str = datetime.now().strftime("%Y-%m-%d")
+    if source == "nav" and nav_history:
+        matching = next(
+            (item for item in nav_history
+             if item.get("date") == valuation_date and item.get("nav") is not None),
+            None,
+        )
+        if matching:
+            return matching["nav"]
+        if nav_history[0].get("nav") is not None:
+            return nav_history[0]["nav"]
 
-    if _is_market_closed() and nav_history:
-        latest = nav_history[0]
-        latest_nav = latest.get("nav")
-        if latest_nav is not None:
-            # 如果最新记录就是今天的，直接用
-            if latest.get("date") == today_str:
-                return latest_nav
-            # 否则返回最新收盘净值（不乘 today_change，避免重复计算）
-            return latest_nav
-
-    # 盘中：用昨日净值 × (1 + today_change)
+    # 盘中和盘后冻结值都基于最新已公布净值计算。
     if nav_history and nav_history[0].get("nav") is not None:
         yesterday_nav = nav_history[0]["nav"]
         return yesterday_nav * (1 + today_change / 100)
@@ -771,7 +768,7 @@ def _update_batch_peak_nav(fund_code: str, batch_id: str, current_nav: float):
             old_peak = b.get("peak_nav", b.get("nav", 0))
             if current_nav > old_peak:
                 b["peak_nav"] = round(current_nav, 4)
-                b["peak_date"] = datetime.now().strftime("%Y-%m-%d")
+                b["peak_date"] = beijing_now().strftime("%Y-%m-%d")
                 save_positions(data)
             break
 
@@ -804,7 +801,7 @@ def _build_fifo_sell_plan(batches_sorted: list, sell_signals: list,
 
         bid = batch["id"]
         buy_date = datetime.strptime(batch["buy_date"], "%Y-%m-%d").date()
-        hold_days = (datetime.now().date() - buy_date).days
+        hold_days = (beijing_now().date() - buy_date).days
         fee_rate = get_sell_fee_rate(fund_code, hold_days)
 
         if bid in target_sells:

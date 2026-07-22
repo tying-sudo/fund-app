@@ -9,15 +9,20 @@ import { ref, onMounted, onUnmounted, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { useHoldingStore } from '@/stores/holding'
 import { useFundStore } from '@/stores/fund'
-import { searchFund, fetchFundEstimate, detectShareClass, fetchFundFeeInfo, calculateBuyFee } from '@/api/fund'
-import { fetchNetValueHistoryFast, fetchRealDayChange } from '@/api/fundFast'
+import { useSettingsStore } from '@/stores/settings'
+import { searchFund, fetchFundEstimate, fetchFundList, detectShareClass, fetchFundFeeInfo, calculateBuyFee } from '@/api/fund'
+import { fetchRealDayChange } from '@/api/fundFast'
+import { API_BASE_URL } from '@/config/api'
 import { showConfirmDialog, showToast, showLoadingToast, closeToast, showDialog } from 'vant'
 import { formatMoney, formatPercent, getChangeStatus, getJdFundLink } from '@/utils/format'
+import MarketIndexBoard from '@/components/MarketIndexBoard.vue'
 import type { FundInfo, HoldingRecord, FundShareClass, FundFeeInfo, PendingAdjustment } from '@/types/fund'
 
 import { createWorker } from 'tesseract.js'
-import { getTodayStr, isTradingHours as isBeijingTradingHours, PRECISION, round } from '@/utils/holdingCalculator'
+import { getTodayStr, getValuationComparisonState, isEstimateDateToday, isTradingHours as isBeijingTradingHours, PRECISION, round } from '@/utils/holdingCalculator'
 import { getSettlementNavStartDate } from '@/utils/tradingDate'
+import { deriveHoldingImportBasis } from '@/utils/holdingImport'
+import { parseLocalHoldingText, resolveLocalFund } from '@/utils/localHoldingOcr'
 
 // 集成风控系统和日志模块
 import { getRiskController } from '@/utils/riskControl'
@@ -26,6 +31,47 @@ import type { RiskCheckResult } from '@/utils/riskControl'
 const router = useRouter()
 const holdingStore = useHoldingStore()
 const fundStore = useFundStore()
+const settingsStore = useSettingsStore()
+const marketIndexBoard = ref<{ refresh: () => Promise<void> } | null>(null)
+let autoRefreshTimer: ReturnType<typeof setTimeout> | null = null
+let autoRefreshActive = false
+
+function scheduleAutoRefresh() {
+  if (autoRefreshTimer) clearTimeout(autoRefreshTimer)
+  autoRefreshTimer = null
+  if (!autoRefreshActive || !settingsStore.autoRefresh) return
+
+  const intervalSeconds = isBeijingTradingHours()
+    ? settingsStore.tradingInterval
+    : settingsStore.afterHoursInterval
+  autoRefreshTimer = setTimeout(async () => {
+    try {
+      if (!document.hidden && !holdingStore.isRefreshing) {
+        await holdingStore.refreshEstimates()
+      }
+    } finally {
+      if (autoRefreshActive) scheduleAutoRefresh()
+    }
+  }, Math.max(1, intervalSeconds) * 1000)
+}
+
+function startAutoRefresh() {
+  autoRefreshActive = true
+  scheduleAutoRefresh()
+}
+
+function stopAutoRefresh() {
+  autoRefreshActive = false
+  if (autoRefreshTimer) clearTimeout(autoRefreshTimer)
+  autoRefreshTimer = null
+}
+
+watch(
+  () => [settingsStore.autoRefresh, settingsStore.tradingInterval, settingsStore.afterHoursInterval],
+  () => {
+    if (autoRefreshActive) scheduleAutoRefresh()
+  }
+)
 
 // ========== 类型筛选 ==========
 // [WHAT] 可选的基金类型列表
@@ -216,8 +262,8 @@ function openTradeDialog(code: string, name: string) {
 /**
  * 计算交易确认日和收益起始日的核心逻辑
  * 
- * 普通场外基金：15:00 前按当日净值，15:00 后按下一开放日净值。
- * 最终份额与确认时间以基金公司公布的官方净值为准。
+ * 加减仓统一保留为待确认记录，直到交易日之后的首个官方净值公布。
+ * 周末和节假日由净值历史中的下一条真实交易日记录自然顺延。
  * 
  * @returns { confirmDate: 官方净值结算的最早日期 }
  */
@@ -409,78 +455,20 @@ const isSearching = ref(false)
 const selectedFund = ref<FundInfo | null>(null)
 const currentNetValue = ref(0) // 当前基金净值
 
-// [WHAT] 均差缓存（key: 基金代码, value: 均差值）
-const averageDiffCache = ref<Map<string, number>>(new Map())
-
-// [WHAT] 计算近期均差（从历史净值数据计算）
-const calculateAverageDiff = async (code: string): Promise<number | null> => {
-  try {
-    // 获取最近5天的历史净值
-    const history = await fetchNetValueHistoryFast(code, 5)
-    if (history.length < 2) return null
-    
-    // 计算近期涨跌幅的平均值
-    const changes = history.map(h => h.changeRate).filter(c => !isNaN(c))
-    if (changes.length === 0) return null
-    
-    const avg = changes.reduce((sum, c) => sum + c, 0) / changes.length
-    return Math.round(avg * 100) / 100
-  } catch {
-    return null
-  }
-}
-
-// [OPT] 批量计算所有持仓的均差 - 并行化！
-// [FIX] 原来用 for 循环串行执行，50只基金需要 25秒+
-// [NOW] 使用 Promise.all 并行执行，50只基金只需 ~500ms
-const calculateAllAverageDiffs = async () => {
-  const holdingsList = holdingStore.holdings
-  // [OPT] 过滤出需要计算的基金（无缓存），并行发起请求
-  const uncachedHoldings = holdingsList.filter(h => h.code && !averageDiffCache.value.has(h.code))
-  
-  await Promise.all(
-    uncachedHoldings.map(async (holding) => {
-      const avgDiff = await calculateAverageDiff(holding.code)
-      if (avgDiff !== null) {
-        averageDiffCache.value.set(holding.code, avgDiff)
-      }
-    })
-  )
-}
-
-/** 手动立即刷新 */
-const isManualRefreshing = ref(false)
 /** 仅用于 van-pull-refresh 下拉动画（与自动刷新解耦） */
 const isPullRefreshing = ref(false)
-async function onManualRefresh() {
-  if (isManualRefreshing.value) return
-  
-  isManualRefreshing.value = true
-  try {
-    await holdingStore.refreshEstimates()
-    showToast('刷新完成')
-  } finally {
-    isManualRefreshing.value = false
-  }
-}
 
 // [WHAT] 页面挂载时初始化数据
-// [OPT] 并行执行：initHoldings + 均差计算（原来串行，等待前者完成后才开始后者）
 onMounted(async () => {
-  // [OPT] 不 await initHoldings，让它后台运行
-  holdingStore.initHoldings()
-  
-  // [OPT] 三个任务并行执行
-  await Promise.allSettled([
-    calculateAllAverageDiffs(),
-    // [NOTE] initHoldings 内部会调用 refreshEstimates()，不需要额外等待
-  ])
+  await holdingStore.initHoldings()
+  startAutoRefresh()
   // [WHAT] 点击外部关闭下拉菜单
   document.addEventListener('click', closeAllDropdowns)
 })
 
 // [WHAT] 页面卸载时移除事件监听
 onUnmounted(() => {
+  stopAutoRefresh()
   document.removeEventListener('click', closeAllDropdowns)
 })
 
@@ -493,7 +481,19 @@ const summaryTodayClass = computed(() => {
   return getChangeStatus(holdingStore.summary.todayProfit)
 })
 
+const summaryYesterdayClass = computed(() => {
+  return getChangeStatus(holdingStore.summary.yesterdayProfit)
+})
+
 const isTradingHours = computed(() => isBeijingTradingHours())
+
+const getComparisonState = (holding: any) => getValuationComparisonState({
+  realChange: holding.realChange,
+  realChangeDate: holding.realChangeDate,
+  estimateChange: holding.estimateChange,
+  estimateTime: holding.estimateTime,
+  fundName: holding.name
+})
 
 /** 获取某基金的待确认调仓标签列表 */
 function getPendingTags(holding: any): { label: string; type: 'add' | 'reduce' }[] {
@@ -513,14 +513,11 @@ const getStatusTag = (holding: any) => {
     return '加载中'
   }
   // 盘中一律显示"估值中"（不管 realChange 是否有值，因为那是历史缓存）
-  if (isTradingHours.value) {
+  const comparison = getComparisonState(holding)
+  if (comparison.isTrading) {
     return '估值中'
   }
-  // 盘后：有今日真实涨跌幅显示"已更新"，没有则显示"待更新"
-  if (holding.realChange !== undefined && holding.realChange !== null && holding.isRealChangeToday) {
-    return '已更新'
-  }
-  return '待更新'
+  return comparison.isCurrentReal ? '已更新' : '待更新'
 }
 
 // [WHAT] 状态标签样式类
@@ -528,60 +525,33 @@ const getStatusTagClass = (holding: any) => {
   if (holding.loading) {
     return 'tag-loading'
   }
-  if (isTradingHours.value) {
+  const comparison = getComparisonState(holding)
+  if (comparison.isTrading) {
     return 'tag-trading'
   }
-  if (holding.realChange !== undefined && holding.realChange !== null && holding.isRealChangeToday) {
-    return 'tag-updated'
-  }
-  return 'tag-pending'
+  return comparison.isCurrentReal ? 'tag-updated' : 'tag-pending'
 }
 
 // [WHAT] 基金名称动态字体大小
 const getFundNameStyle = (name: string) => {
   const len = (name || '加载中...').length
-  // 基金名称使用更紧凑的字号；较长名称会以横幅形式完整展示。
-  let fontSize = 11
-  if (len > 14) fontSize = 10
-  if (len > 22) fontSize = 9
+  // Keep the holding list aligned with the watchlist card typography.
+  let fontSize = 14
+  if (len > 10) fontSize = 13
+  if (len > 14) fontSize = 12
+  if (len > 18) fontSize = 11
   return { fontSize: `${fontSize}px` }
 }
 
-const shouldScrollFundName = (name: string) => (name || '').length > 14
-
-// [WHAT] 实差/均差计算
-// 根据 isRealChangeToday 判断：
-// - true（机构已公布今日真实涨跌幅）：实差 = 真实涨跌幅 - 估值涨跌幅
-// - false（机构未公布）：均差 = 今日估值涨跌幅 - 近期真实涨跌幅的平均值
+// 实差仅在同一交易日的估值和已公布净值均可用时计算。
 const getDiffChange = (holding: any) => {
-  // [WHAT] 使用 estimateChange（始终是估值），而不是 todayChange（盘后可能是真实值）
-  const estimate = holding.estimateChange || holding.todayChange
-  const real = holding.realChange
-  
-  // [FIX] 如果估值是"--"（表示无今日估值），返回null不显示差值
-  if (estimate === '--') return null
-  
-  // 如果机构已公布今日真实涨跌幅，计算实差
-  if (holding.isRealChangeToday) {
-    if (estimate === undefined || estimate === null || real === undefined || real === null) {
-      return null
-    }
-    const estimateNum = typeof estimate === 'string' ? parseFloat(estimate) : estimate
-    return real - estimateNum
-  }
-  
-  // 机构未公布，计算均差 = 今日估值 - 近期真实涨跌幅的平均值
-  if (holding.code && averageDiffCache.value.has(holding.code)) {
-    const avgRealChange = averageDiffCache.value.get(holding.code)
-    if (estimate === undefined || estimate === null) return null
-    const estimateNum = typeof estimate === 'string' ? parseFloat(estimate) : estimate
-    return estimateNum - avgRealChange
-  }
-  
-  return null
+  const estimate = Number(holding.estimateChange)
+  const real = Number(holding.realChange)
+  if (!getComparisonState(holding).hasActualDiff || !Number.isFinite(estimate) || !Number.isFinite(real)) return null
+  return real - estimate
 }
 
-// [WHAT] 实差/均差显示文本
+// 实差显示文本
 const getDisplayDiff = (holding: any) => {
   const diff = getDiffChange(holding)
   if (diff === null || isNaN(diff)) return null
@@ -589,9 +559,9 @@ const getDisplayDiff = (holding: any) => {
   return `${sign}${diff.toFixed(2)}%`
 }
 
-// [WHAT] 实差/均差标签（根据 isRealChangeToday 判断）
+// 实差标签
 const getDiffLabel = (holding: any) => {
-  return holding.isRealChangeToday ? '实差' : '均差'
+  return '实差'
 }
 
 // [WHAT] 实差 CSS 类名
@@ -623,7 +593,12 @@ const getLatestIncome = (holding: any) => {
 }
 
 const getTodayRate = (holding: any) => {
-  const value = holding.isRealChangeToday ? (holding.realChange ?? holding.todayChange) : holding.todayChange
+  const comparison = getComparisonState(holding)
+  const value = comparison.isCurrentReal
+    ? holding.realChange
+    : isEstimateDateToday(holding.estimateTime || '', getTodayStr())
+      ? holding.todayChange
+      : '--'
   return value === '--' || value === undefined || value === null ? '--' : formatPercent(value)
 }
 
@@ -636,9 +611,23 @@ const hasDiffData = (holding: any) => {
 
 // [WHAT] 真实涨跌幅标签（盘中显示"昨"，盘后根据数据日期显示"真实"或"昨"）
 const getRealChangeLabel = (holding: any) => {
-  if (isTradingHours.value) return '昨'
-  // 盘后：如果数据是今日的显示"真实"，否则显示"昨"
-  return holding.isRealChangeToday ? '真实' : '昨'
+  return getComparisonState(holding).realChangeLabel || '净值'
+}
+
+const getDisplayEstimateChange = (holding: any) => {
+  const rawValue = holding.estimateChange
+  const value = Number(rawValue)
+  return rawValue !== null && rawValue !== undefined && rawValue !== '' && rawValue !== '--' && Number.isFinite(value)
+    ? formatPercent(value)
+    : '--'
+}
+
+const getEstimateChangeClass = (holding: any) => {
+  const rawValue = holding.estimateChange
+  const value = Number(rawValue)
+  return rawValue !== null && rawValue !== undefined && rawValue !== '' && rawValue !== '--' && Number.isFinite(value)
+    ? getChangeStatus(value)
+    : ''
 }
 
 // [WHAT] 真实涨跌幅 CSS 类名
@@ -652,7 +641,10 @@ const getRealChangeClass = (holding: any) => {
 async function onRefresh() {
   isPullRefreshing.value = true
   try {
-    await holdingStore.refreshEstimates()
+    await Promise.all([
+      holdingStore.refreshEstimates(),
+      marketIndexBoard.value?.refresh()
+    ])
     holdingStore.updateHoldingDays()
   } finally {
     isPullRefreshing.value = false
@@ -1271,36 +1263,26 @@ async function startAiOcrImport() {
   extractedFunds.value = []
   
   try {
-    // 检查API Key配置
-    const apiKey = import.meta.env.VITE_ZHIPU_API_KEY
-    if (!apiKey || apiKey === 'your_zhipu_api_key_here') {
-      showToast('请先配置智谱API Key')
-      isImporting.value = false
-      importProgress.value = 0
-      return
-    }
-    
     // 将图片转换为Base64
     importProgress.value = 20
     const base64 = await fileToBase64(importImageFile.value)
     
-    // 调用智谱GLM-OCR API
+    // The backend owns the provider credential; the client only uploads the image.
     importProgress.value = 40
     
-    const response = await fetch('https://open.bigmodel.cn/api/paas/v4/layout_parsing', {
+    const response = await fetch(`${API_BASE_URL}/api/ocr/holding-import`, {
       method: 'POST',
       headers: {
-        'Content-Type': 'application/json',
-        'Authorization': apiKey
+        'Content-Type': 'application/json'
       },
       body: JSON.stringify({
-        model: 'glm-ocr',
         file: base64
       })
     })
     
     if (!response.ok) {
-      throw new Error(`API请求失败: ${response.status}`)
+      const payload = await response.json().catch(() => null)
+      throw new Error(payload?.error || `API请求失败: ${response.status}`)
     }
     
     const result = await response.json()
@@ -1333,122 +1315,25 @@ async function startAiOcrImport() {
   }
 }
 
-// [NEW] 从AI响应中提取基金数据 - 核心解析器
-function extractFundDataFromAI(aiResult: any): any[] {
-  const funds: any[] = []
-  
-  // ====== 步骤1：获取原始文本 ======
-  let rawText = ''
-  
-  // [FIX] GLM-OCR 实际字段名是 md_results (下划线)，不是 mdResults
-  const aiFields = ['md_results', 'mdResults', 'markdown', 'text', 'content']
-  
-  for (const field of aiFields) {
-    if (aiResult[field] && typeof aiResult[field] === 'string') {
-      rawText = aiResult[field]
-      console.log(`📥 数据来源: ${field} (${rawText.length}字符)`)
-      break
-    }
-    if (aiResult.data?.[field] && typeof aiResult.data[field] === 'string') {
-      rawText = aiResult.data[field]
-      console.log(`📥 数据来源: data.${field} (${rawText.length}字符)`)
-      break
-    }
-  }
-  
-  // 备选：layoutDetails
-  if (!rawText && Array.isArray(aiResult.layoutDetails)) {
-    const items = Array.isArray(aiResult.layoutDetails[0]) ? aiResult.layoutDetails[0] : aiResult.layoutDetails
-    const tableContents = items
-      .filter((item: any) => item.label === 'table' && item.content?.includes('<table'))
-      .map((item: any) => item.content)
-    if (tableContents.length > 0) {
-      rawText = tableContents.join('\n')
-      console.log(`📥 数据来源: layoutDetails (${rawText.length}字符, ${tableContents.length}个表格)`)
-    }
-  }
-  
-  if (!rawText || rawText.length < 20) {
-    console.warn('⚠️ 无法获取有效数据')
-    console.log('🔍 尝试检查其他字段...')
-    for (const key in aiResult) {
-      if (key !== 'layoutVisualization' && key !== 'usage' && key !== 'dataInfo') {
-        const val = aiResult[key]
-        if (typeof val === 'string' && val.length > 50) {
-          console.log(`🔍 ${key}: ${val.substring(0, 100)}...`)
-        }
+// AI endpoint returns the validated compact { items: [...] } contract.
+function extractFundDataFromAI(result: any): any[] {
+  if (!Array.isArray(result?.items)) return []
+  return result.items
+    .filter((item: any) => typeof item?.n === 'string' && item.n.trim())
+    .map((item: any) => {
+      const code = /^\d{6}$/.test(String(item.c || '')) ? String(item.c) : ''
+      return {
+        code,
+        name: item.n.trim(),
+        amount: item.a || undefined,
+        profit: item.p || undefined,
+        rate: item.r ? `${item.r}%` : undefined,
+        costPrice: item.t || undefined,
+        shareClass: (item.n.match(/([ABC])\s*$/i)?.[1] || '').toUpperCase(),
+        selected: Boolean(code),
+        matchConfidence: code ? 'exact' : 'none'
       }
-    }
-    return funds
-  }
-  
-  // ====== 步骤2：解析所有 <table> 标签 ======
-  const tableRegex = /<table[^>]*>([\s\S]*?)<\/table>/gi
-  const tables: string[] = []
-  let match: RegExpExecArray | null
-  
-  while ((match = tableRegex.exec(rawText)) !== null) {
-    tables.push(match[0])
-  }
-  
-  console.log(`📊 发现 ${tables.length} 个 <table>`)
-  
-  // 步骤3a：解析表格中的基金
-  for (const tableHtml of tables) {
-    const trRegex = /<tr[^>]*>([\s\S]*?)<\/tr>/gi
-    const rows: string[] = []
-    
-    while ((match = trRegex.exec(tableHtml)) !== null) {
-      // 清理HTML标签，提取单元格内容
-      let rowText = match[1]
-        .replace(/<\/td>\s*/gi, ' | ')
-        .replace(/<td[^>]*>/gi, '')
-        .replace(/<[^>]+>/g, '')
-        .trim()
-        .replace(/\s+/g, ' ')
-      
-      if (rowText.length > 3) rows.push(rowText)
-    }
-    
-    if (rows.length === 0) continue
-    console.log(`  表格行数: ${rows.length}, 首行: "${rows[0]?.substring(0, 50)}"`)
-    
-    // 过滤广告表格
-    const fullTableText = rows.join(' ')
-    if (/×|爆品|热度|聪明钱|年内涨幅|近\d+月涨/.test(fullTableText)) {
-      console.log(`  ⏭️ 跳过广告表格`)
-      continue
-    }
-    
-    const fund = parseTableToFund(rows)
-    if (fund) {
-      funds.push(fund)
-      console.log(`  ✅ ${fund.name} | ¥${fund.amount} | ${fund.profit} | ${fund.rate}`)
-    }
-  }
-  
-  // 步骤3b：同时解析非表格文本中的基金（第一只可能是纯文本行）
-  if (tables.length > 0) {
-    console.log('📝 额外检查非表格文本中的基金...')
-    const nonTableText = rawText.replace(/<table[^>]*>[\s\S]*?<\/table>/gi, '')
-    const textFunds = parseMarkdownTextFunds(nonTableText)
-    
-    for (const tf of textFunds) {
-      // 去重：按名称判断
-      if (!funds.some(f => f.name === tf.name || (f.name.includes(tf.name) || tf.name.includes(f.name)))) {
-        funds.push(tf)
-        console.log(`  ✅ 从文本补充: ${tf.name}`)
-      }
-    }
-  }
-  
-  // 如果表格解析为空但文本中有基金，直接用文本解析
-  if (funds.length === 0) {
-    console.log('📝 表格解析为空，进入Markdown文本解析模式')
-    return parseMarkdownTextFunds(rawText)
-  }
-  
-  return funds
+    })
 }
 
 // [NEW] 将表格行解析为单个基金对象
@@ -3678,18 +3563,94 @@ async function startOcrImportBackup() {
   }
 }
 
-// [NEW] 主入口：本地OCR直接调用原始备份方案
-async function startOcrImport() {
-  if (!importImageFile.value) return
+function withOcrTimeout<T>(operation: Promise<T>, timeoutMs: number, message: string): Promise<T> {
+  return Promise.race([
+    operation,
+    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(message)), timeoutMs))
+  ])
+}
 
-  // AI模式直接走AI识别
-  if (ocrMode.value === 'ai') {
-    await startAiOcrImport()
-    return
+async function prepareLocalOcrImage(file: File): Promise<Blob> {
+  if (typeof createImageBitmap !== 'function') return file
+  try {
+    const bitmap = await createImageBitmap(file)
+    const maxPixels = 2_400_000
+    const scale = Math.min(1, Math.sqrt(maxPixels / (bitmap.width * bitmap.height)))
+    if (scale >= 1) return file
+    const canvas = document.createElement('canvas')
+    canvas.width = Math.max(1, Math.round(bitmap.width * scale))
+    canvas.height = Math.max(1, Math.round(bitmap.height * scale))
+    canvas.getContext('2d')?.drawImage(bitmap, 0, 0, canvas.width, canvas.height)
+    bitmap.close()
+    return await new Promise<Blob>((resolve, reject) => canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error('图片预处理失败')), 'image/jpeg', 0.9))
+  } catch {
+    return file
   }
+}
 
-  // 本地OCR模式：直接走原始备份方案
-  await startOcrImportBackup()
+async function startLocalOcrImport() {
+  if (!importImageFile.value) return
+  isImporting.value = true
+  importProgress.value = 5
+  extractedFunds.value = []
+
+  let worker: any = null
+  let workerPromise: Promise<any> | null = null
+  try {
+    const source = await prepareLocalOcrImage(importImageFile.value)
+    importProgress.value = 12
+    workerPromise = createWorker('chi_sim+eng', 1, {
+      logger: (message: any) => {
+        if (message.status === 'recognizing text') importProgress.value = 15 + Math.round(message.progress * 70)
+      }
+    }) as Promise<any>
+    try {
+      worker = await withOcrTimeout(workerPromise, 45_000, '本地识别引擎启动超时，请改用 AI 智能识别')
+    } catch (error) {
+      void workerPromise.then(lateWorker => lateWorker.terminate()).catch(() => undefined)
+      throw error
+    }
+    await worker.setParameters({ tessedit_pageseg_mode: '6', preserve_interword_spaces: '1' })
+    const { data } = await withOcrTimeout(worker.recognize(source), 75_000, '本地识别超时，请改用 AI 智能识别')
+    importProgress.value = 88
+
+    const drafts = parseLocalHoldingText(data.text).slice(0, 30)
+    let directory: Array<{ code: string; name: string }> = []
+    try {
+      directory = await withOcrTimeout(fetchFundList(), 15_000, '基金目录加载超时')
+    } catch (error) {
+      console.warn('本地 OCR 无法加载基金目录:', error)
+    }
+
+    extractedFunds.value = drafts.map(draft => {
+      const matched = resolveLocalFund(draft.name, directory)
+      return {
+        code: matched?.code || '',
+        name: matched?.name || draft.name,
+        amount: draft.amount || undefined,
+        profit: draft.profit || undefined,
+        rate: draft.rate ? `${draft.rate}%` : undefined,
+        shareClass: matched?.name.match(/([ABC])\s*$/i)?.[1]?.toUpperCase() || '',
+        selected: Boolean(matched?.code),
+        matchConfidence: matched ? 'exact' : 'none'
+      }
+    })
+    importProgress.value = 100
+    const ready = extractedFunds.value.filter(fund => fund.code).length
+    showToast(ready > 0 ? `识别到 ${drafts.length} 条，${ready} 条可导入` : '未识别到可确认的基金代码')
+  } catch (error: any) {
+    console.error('本地 OCR 识别失败:', error)
+    showToast(error?.message || '本地识别失败，请改用 AI 智能识别')
+  } finally {
+    if (worker) await worker.terminate().catch(() => undefined)
+    isImporting.value = false
+    setTimeout(() => { importProgress.value = 0 }, 1000)
+  }
+}
+
+async function startOcrImport() {
+  if (ocrMode.value === 'ai') await startAiOcrImport()
+  else await startLocalOcrImport()
 }
 
 // [WHAT] 切换基金选中状态
@@ -3832,9 +3793,9 @@ function toggleSelectAll() {
 
 // [WHAT] 确认导入选中的基金到持仓
 async function confirmImportFunds() {
-  const selected = extractedFunds.value.filter(f => f.selected)
+  const selected = extractedFunds.value.filter(f => f.selected && /^\d{6}$/.test(f.code))
   if (selected.length === 0) {
-    showToast('请至少选择一只基金')
+    showToast('请先选择已确认基金代码的记录')
     return
   }
   
@@ -3842,6 +3803,8 @@ async function confirmImportFunds() {
   
   let successCount = 0
   let skipCount = 0
+  let failureCount = 0
+  let lastError = ''
   
   const newRecords: HoldingRecord[] = []
   
@@ -3857,37 +3820,11 @@ async function confirmImportFunds() {
       const estimate = await fetchFundEstimate(fund.code)
       const currentNav = parseFloat(estimate.gsz) || parseFloat(estimate.dwjz) || 1
       
-      // [NEW] 解析识别到的数值
-      const marketValue = parseFloat(fund.amount?.replace(/[,，]/g, '') || '0') || 0
-      const profit = parseFloat(fund.profit?.replace(/[,，]/g, '') || '0') || 0
-      const rateNum = parseFloat(fund.rate || '0') || 0
-      // [FIX] 优先使用OCR识别的成本价，否则使用当前净值
-      let costPriceVal = parseFloat(fund.costPrice || '0') || currentNav
+      const basis = deriveHoldingImportBasis(fund, currentNav)
+      if (!basis) throw new Error('识别到的金额无法计算持仓')
+      const { principal, shares, costPrice: costPriceVal } = basis
       
-      // [NEW] 计算投入本金（成本）
-      // 方法1: 如果有市值和收益率 → 本金 = 市值 / (1 + 收益率/100)
-      let principal = 0
-      if (marketValue > 0 && Math.abs(rateNum) > 0.001 && Math.abs(rateNum) < 100) {
-        principal = marketValue / (1 + rateNum / 100)
-      } else if (marketValue > 0 && profit !== 0) {
-        // 方法2: 如果有市值和盈亏 → 本金 = 市值 - 盈亏
-        principal = marketValue - profit
-        if (principal < 0) principal = marketValue // 保护：不能为负
-      }
-      
-      // 如果无法计算本金，使用市值作为本金
-      if (principal <= 0) principal = marketValue
-      
-      // [FIX] 确保成本单价合理（基金净值通常在0.1~20之间）
-      if (costPriceVal <= 0 || costPriceVal > 1000) {
-        console.warn(`[导入] ${fund.code} 成本价异常 ${costPriceVal}，使用当前净值 ${currentNav}`)
-        costPriceVal = currentNav > 0 && currentNav < 1000 ? currentNav : 1
-      }
-      
-      // 计算持有份额
-      const shares = principal > 0 && costPriceVal > 0 ? principal / costPriceVal : 0
-      
-      console.log(`[导入] ${fund.code}: 市值=${marketValue}, 盈亏=${profit}, 收益率=${rateNum}%, 成本价=${costPriceVal}, 本金=${principal.toFixed(2)}, 份额=${shares.toFixed(2)}, 净值=${currentNav}`)
+      console.log(`[导入] ${fund.code}: 市值=${fund.amount}, 盈亏=${fund.profit}, 收益率=${fund.rate}, 成本价=${costPriceVal}, 本金=${principal.toFixed(2)}, 份额=${shares.toFixed(2)}, 净值=${currentNav}`)
       
       // 创建持仓记录
       const record: HoldingRecord = {
@@ -3906,24 +3843,39 @@ async function confirmImportFunds() {
       }
       
       newRecords.push(record)
-      successCount++
-    } catch (err) {
+    } catch (err: any) {
+      failureCount++
+      lastError = err?.message || '基金数据处理失败'
       console.error(`[导入] ${fund.code} 处理失败:`, err)
     }
   }
   
-  // 批量添加到store
+  // Write every record before reporting success so a failed local write is visible.
   for (const record of newRecords) {
-    holdingStore.addHoldingDirect(record)
+    try {
+      await holdingStore.addHoldingDirect(record)
+      successCount++
+    } catch (err: any) {
+      failureCount++
+      lastError = err?.message || '持仓保存失败'
+      console.error(`[导入] ${record.code} 保存失败:`, err)
+    }
   }
   
   closeToast()
   
   if (successCount > 0) {
-    showToast(`成功导入 ${successCount} 只基金${skipCount > 0 ? `，跳过 ${skipCount} 只已持有` : ''}`)
+    const suffix = [
+      skipCount > 0 ? `跳过 ${skipCount} 只已持有` : '',
+      failureCount > 0 ? `${failureCount} 只失败` : ''
+    ].filter(Boolean).join('，')
+    showToast(`成功导入 ${successCount} 只基金${suffix ? `，${suffix}` : ''}`)
     await holdingStore.refreshEstimates()
   } else if (skipCount > 0) {
     showToast(`所有基金已持有，跳过 ${skipCount} 只`)
+  } else {
+    showToast(`导入失败：${lastError || '未生成有效持仓记录'}`)
+    return
   }
   
   showImportDialog.value = false
@@ -3943,57 +3895,7 @@ function closeImportDialog() {
 
 <template>
   <div class="holding-page">
-            <!-- 顶部操作栏（无标题无返回箭头） -->
-    <van-nav-bar :border="false">
-      <template #right>
-        <div class="nav-right-icons">
-          <!-- 立即刷新按钮 -->
-          <div class="refresh-btn" @click="onManualRefresh" :class="{ refreshing: holdingStore.isRefreshing }">
-            <van-icon name="replay" size="18" :class="{ spinning: isManualRefreshing }" />
-            <span class="refresh-label">立即刷新</span>
-          </div>
-          
-          <!-- [NEW] 导入按钮（带二级菜单） -->
-          <div class="import-menu-wrapper" ref="ocrMenuRef">
-            <van-icon 
-              name="photo-o" 
-              size="22" 
-              @click="triggerOcrMenu" 
-              class="nav-icon nav-icon-import"
-            />
-            
-            <!-- 二级弹出菜单 -->
-            <transition name="ocr-menu-fade">
-              <div v-if="showOcrMenu" class="ocr-dropdown-menu">
-                <div 
-                  v-for="option in ocrOptions" 
-                  :key="option.value"
-                  class="ocr-menu-item"
-                  @click.stop="selectOcrMode(option.value)"
-                >
-                  <van-icon :name="option.icon" size="18" class="menu-item-icon" />
-                  <div class="menu-item-content">
-                    <span class="menu-item-label">{{ option.label }}</span>
-                    <span class="menu-item-desc">{{ option.desc }}</span>
-                  </div>
-                  <van-icon 
-                    v-if="ocrMode === option.value" 
-                    name="success" 
-                    size="16" 
-                    class="menu-item-check" 
-                    color="#1989fa"
-                  />
-                </div>
-              </div>
-            </transition>
-          </div>
-          
-          <van-icon name="add-o" size="22" @click="openAddDialog" class="nav-icon-add" />
-        </div>
-      </template>
-    </van-nav-bar>
-    
-        <!-- 隐藏的文件输入 -->
+    <!-- 隐藏的文件输入 -->
     <input
       ref="fileInputRef"
       type="file"
@@ -4002,32 +3904,40 @@ function closeImportDialog() {
       @change="handleImageSelected"
     />
 
+    <van-pull-refresh
+      v-model="isPullRefreshing"
+      @refresh="onRefresh"
+      class="holding-global-refresh"
+    >
+
+    <MarketIndexBoard ref="marketIndexBoard" variant="holding" />
+
     <!-- 汇总统计卡片 -->
     <div v-if="holdingStore.holdings.length > 0" class="summary-card">
-      <div class="summary-row">
+      <div class="summary-total">
+        <div class="summary-label">总资产</div>
+        <div class="summary-total-value">{{ formatMoney(holdingStore.summary.totalValue) }}</div>
+      </div>
+      <div class="summary-metrics">
         <div class="summary-item">
-          <div class="summary-label">账户资产</div>
-          <div class="summary-value">{{ formatMoney(holdingStore.summary.totalValue) }}</div>
+          <div class="summary-label">持有收益</div>
+          <div class="summary-value" :class="summaryProfitClass">
+            {{ holdingStore.summary.totalProfit >= 0 ? '+' : '' }}{{ formatMoney(holdingStore.summary.totalProfit) }}
+          </div>
+        </div>
+        <div class="summary-item">
+          <div class="summary-label">昨日收益</div>
+          <div class="summary-value" :class="summaryYesterdayClass">
+            {{ holdingStore.summary.yesterdayProfit >= 0 ? '+' : '' }}{{ formatMoney(holdingStore.summary.yesterdayProfit) }}
+          </div>
+          <div class="summary-rate" :class="summaryYesterdayClass">{{ formatPercent(holdingStore.summary.yesterdayProfitRate) }}</div>
         </div>
         <div class="summary-item">
           <div class="summary-label">当日收益</div>
           <div class="summary-value" :class="summaryTodayClass">
             {{ holdingStore.summary.todayProfit >= 0 ? '+' : '' }}{{ formatMoney(holdingStore.summary.todayProfit) }}
           </div>
-        </div>
-      </div>
-      <div class="summary-row">
-        <div class="summary-item">
-          <div class="summary-label">持仓盈亏</div>
-          <div class="summary-value" :class="summaryProfitClass">
-            {{ holdingStore.summary.totalProfit >= 0 ? '+' : '' }}{{ formatMoney(holdingStore.summary.totalProfit) }}
-          </div>
-        </div>
-        <div class="summary-item">
-          <div class="summary-label">收益率</div>
-          <div class="summary-value" :class="summaryProfitClass">
-            {{ formatPercent(holdingStore.summary.totalProfitRate) }}
-          </div>
+          <div class="summary-rate" :class="summaryTodayClass">{{ formatPercent(holdingStore.summary.todayProfitRate) }}</div>
         </div>
       </div>
     </div>
@@ -4077,41 +3987,32 @@ function closeImportDialog() {
     <div v-if="holdingStore.holdings.length > 0" class="list-header">
       <span class="col-name">基金</span>
       <div class="col-right">
-        <span class="col-position">金额/最新收益</span>
+        <span class="col-position">持仓金额/最新收益</span>
         <span class="col-profit">持有收益/率</span>
         <span class="col-today">今日收益/率</span>
       </div>
     </div>
 
     <!-- 持仓列表 -->
-    <van-pull-refresh
-      v-model="isPullRefreshing"
-      @refresh="onRefresh"
-      class="holding-list-container"
-    >
-            <template v-if="holdingStore.holdings.length > 0">
+    <div class="holding-list-container">
+      <template v-if="holdingStore.holdings.length > 0">
         <van-swipe-cell v-for="holding in filteredHoldings" :key="holding.code">
-                                                                                <div class="holding-item" @click="goToDetail(holding.code)">
-                                                <div class="col-name">
+          <div class="holding-item" @click="goToDetail(holding.code)">
+            <div class="col-name">
               <div class="fund-name" :style="getFundNameStyle(holding.name)">
-                <span v-if="shouldScrollFundName(holding.name)" class="fund-name-track">
-                  <span>{{ holding.name || '加载中...' }}</span>
-                </span>
-                <span v-else>{{ holding.name || '加载中...' }}</span>
+                <span>{{ holding.name || '加载中...' }}</span>
               </div>
               <div class="fund-meta">
                 <a class="fund-code" :href="getJdFundLink(holding.code)" @click.stop>{{ holding.code }}</a>
+                <span v-if="holding.type" class="fund-type"> · {{ holding.type }}</span>
                 <span :class="['fund-tag', getStatusTagClass(holding)]">{{ getStatusTag(holding) }}</span>
                 <template v-for="(tag, idx) in getPendingTags(holding)" :key="idx">
                   <span :class="['fund-tag', 'tag-pending', tag.type === 'add' ? 'tag-pending-add' : 'tag-pending-reduce']">{{ tag.label }}</span>
                 </template>
               </div>
-                                                                                                                                                                        <!-- 估值、真实涨跌幅、实差/均差 -->
               <div class="fund-diff-info" v-if="hasDiffData(holding)">
                 <span class="diff-label">估值</span>
-                <span :class="['diff-value', getChangeStatus(holding.estimateChange || holding.todayChange || 0)]">
-                  {{ holding.estimateChange === '--' ? '--' : formatPercent(holding.estimateChange ?? holding.todayChange ?? 0) }}
-                </span>
+                <span :class="['diff-value', getEstimateChangeClass(holding)]">{{ getDisplayEstimateChange(holding) }}</span>
                 <span class="diff-separator">|</span>
                 <span class="diff-label">{{ getRealChangeLabel(holding) }}</span>
                 <span :class="['diff-value', getRealChangeClass(holding)]">{{ getDisplayRealChange(holding) || '--' }}</span>
@@ -4120,27 +4021,21 @@ function closeImportDialog() {
                 <span :class="['diff-value', getDiffClass(holding)]">{{ getDisplayDiff(holding) || '待计算' }}</span>
               </div>
             </div>
-                                                <div class="col-right">
+            <div class="col-right">
               <div class="col-position">
                 <div class="position-amount">{{ getHoldingMarketValue(holding) }}</div>
                 <div class="position-nav" :class="getChangeStatus(holding.todayProfit || 0)">{{ getLatestIncome(holding) }}</div>
               </div>
               <div class="col-profit" :class="getChangeStatus(holding.profit || 0)">
-                <div class="profit-amount">
-                  {{ holding.profit !== undefined ? (holding.profit >= 0 ? '+' : '') + formatMoney(holding.profit) : '--' }}
-                </div>
-                <div class="profit-rate">
-                  {{ holding.profitRate !== undefined ? formatPercent(holding.profitRate) : '--' }}
-                </div>
+                <div class="profit-amount">{{ holding.profit !== undefined ? (holding.profit >= 0 ? '+' : '') + formatMoney(holding.profit) : '--' }}</div>
+                <div class="profit-rate">{{ holding.profitRate !== undefined ? formatPercent(holding.profitRate) : '--' }}</div>
               </div>
               <div class="col-today" :class="getChangeStatus(holding.todayProfit || 0)">
                 <span class="today-profit">{{ holding.todayProfit !== undefined ? (holding.todayProfit >= 0 ? '+' : '') + formatMoney(holding.todayProfit) : '--' }}</span>
                 <span class="today-rate">{{ getTodayRate(holding) }}</span>
-            </div>
+              </div>
             </div>
           </div>
-          
-          <!-- 滑动操作按钮：编辑(左) 调仓(中) 删除(右) -->
           <template #right>
             <van-button square type="primary" text="编辑" class="action-btn" @click="handleEdit(holding.code)" />
             <van-button square type="warning" text="调仓" class="action-btn action-trade" @click="openTradeDialog(holding.code, holding.name)" />
@@ -4149,25 +4044,55 @@ function closeImportDialog() {
         </van-swipe-cell>
       </template>
 
-      <!-- 空状态 -->
       <van-empty v-else description="暂无持仓记录">
-        <van-button round type="primary" @click="openAddDialog">
-          添加基金
-        </van-button>
+        <van-button round type="primary" @click="openAddDialog">添加基金</van-button>
       </van-empty>
+    </div>
     </van-pull-refresh>
+
+    <div class="holding-floating-actions" aria-label="持仓操作">
+      <div class="import-menu-wrapper" ref="ocrMenuRef">
+        <button type="button" class="floating-action-button floating-import-button" title="图片导入" aria-label="图片导入" @click="triggerOcrMenu">
+          <van-icon name="scan" size="21" />
+        </button>
+        <transition name="ocr-menu-fade">
+          <div v-if="showOcrMenu" class="ocr-dropdown-menu">
+            <div v-for="option in ocrOptions" :key="option.value" class="ocr-menu-item" @click.stop="selectOcrMode(option.value)">
+              <van-icon :name="option.icon" size="18" class="menu-item-icon" />
+              <div class="menu-item-content">
+                <span class="menu-item-label">{{ option.label }}</span>
+                <span class="menu-item-desc">{{ option.desc }}</span>
+              </div>
+              <van-icon v-if="ocrMode === option.value" name="success" size="16" class="menu-item-check" color="#1989fa" />
+            </div>
+          </div>
+        </transition>
+      </div>
+      <button type="button" class="floating-action-button floating-add-button" title="添加基金" aria-label="添加基金" @click="openAddDialog">
+        <van-icon name="add-o" size="22" />
+      </button>
+    </div>
 
     <!-- 添加/编辑持仓弹窗 -->
     <van-popup
       v-model:show="showAddDialog"
+      class="holding-editor-popup"
       position="bottom"
       round
+      teleport="body"
+      :z-index="2001"
+      :safe-area-inset-bottom="true"
       :style="{ height: '68%' }"
     >
       <div class="add-dialog">
         <div class="dialog-header">
           <span>{{ isEditing ? '编辑持仓' : '添加基金' }}</span>
-          <van-icon name="cross" @click="showAddDialog = false" />
+          <div class="dialog-header-actions">
+            <van-button v-if="isEditing" class="dialog-save-button" size="small" type="primary" @click="submitForm">
+              保存
+            </van-button>
+            <van-icon name="cross" @click="showAddDialog = false" />
+          </div>
         </div>
 
         <div class="dialog-content">
@@ -4351,12 +4276,12 @@ function closeImportDialog() {
           </div>
         </div>
 
-        <div class="dialog-footer">
-          <van-button v-if="!isEditing" plain type="primary" @click="skipHolding">
+        <div v-if="!isEditing" class="dialog-footer">
+          <van-button plain type="primary" @click="skipHolding">
             跳过持仓
           </van-button>
           <van-button type="primary" @click="submitForm">
-            {{ isEditing ? '保存修改' : '确认添加' }}
+            确认添加
           </van-button>
         </div>
             </div>
@@ -4365,8 +4290,12 @@ function closeImportDialog() {
     <!-- ========== 调仓（加仓/减仓）弹窗 ========== -->
     <van-popup
       v-model:show="showTradeDialog"
+      class="holding-trade-popup"
       position="bottom"
       round
+      teleport="body"
+      :z-index="2001"
+      :safe-area-inset-bottom="true"
       :style="{ height: '65%' }"
     >
       <div class="trade-dialog">
@@ -4456,10 +4385,10 @@ function closeImportDialog() {
             <div class="trade-time-tip" v-if="addTradeForm.tradeDate && addTradeForm.amount">
               <van-icon name="info-o" size="14" />
               <span v-if="addTradeForm.tradeTimeSlot === 'before'">
-                15:00前提交 → 按当日净值成交，官方净值公布后自动结算
+                15:00前提交 → 下一交易日官方净值公布后自动结算
               </span>
               <span v-else>
-                15:00后提交 → 按下一开放日净值成交，周末和节假日自动顺延
+                15:00后提交 → 下一交易日官方净值公布后自动结算
               </span>
             </div>
           </template>
@@ -4530,10 +4459,10 @@ function closeImportDialog() {
             <div class="trade-time-tip" v-if="reduceTradeForm.tradeDate && reduceTradeForm.shares">
               <van-icon name="info-o" size="14" />
               <span v-if="reduceTradeForm.tradeTimeSlot === 'before'">
-                15:00前提交 → 按当日净值赎回，官方净值公布后自动结算
+                15:00前提交 → 下一交易日官方净值公布后自动结算
               </span>
               <span v-else>
-                15:00后提交 → 按下一开放日净值赎回，周末和节假日自动顺延
+                15:00后提交 → 下一交易日官方净值公布后自动结算
               </span>
             </div>
           </template>
@@ -4781,29 +4710,36 @@ function closeImportDialog() {
 
 <style scoped>
 .holding-page {
-  /* [FIX] 单滚动布局：flex列 + 100vh + overflow hidden */
-  height: 100vh;
-  display: flex;
-  flex-direction: column;
-  overflow: hidden;
+  --holding-tabbar-height: calc(50px + env(safe-area-inset-bottom, 0px));
+  min-height: 100%;
+  box-sizing: border-box;
+  /* 持仓页没有独立顶部工具栏，只为系统状态栏保留安全区。 */
+  padding-top: env(safe-area-inset-top, 0px);
+  padding-bottom: calc(28px + var(--holding-tabbar-height));
   background: var(--bg-primary);
   transition: background-color 0.3s;
-  /* 安全区域：适配刘海屏/状态栏 */
-  padding-top: env(safe-area-inset-top, 0);
 }
 
-/* [FIX] 导航栏紧凑化（无标题时减少高度） */
-.holding-page :deep(.van-nav-bar) {
-  flex-shrink: 0;
-  height: auto;
-  min-height: 38px;
+.holding-global-refresh {
+  min-height: calc(100vh - var(--holding-tabbar-height) - env(safe-area-inset-top, 0px));
 }
 
-/* [FIX] 顶部固定区域不压缩 */
-.holding-page :deep(.summary-card),
-.holding-page :deep(.list-header),
-.holding-page :deep(.filter-bar) {
+/* 与自选页 .top-header 对齐，避免在页面容器上重复叠加安全区。 */
+.holding-top-header {
+  position: absolute;
+  top: 0;
+  right: 0;
+  left: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 12px;
+  height: var(--holding-header-height);
+  box-sizing: border-box;
+  padding: env(safe-area-inset-top, 0px) 16px 0;
+  background: var(--bg-secondary);
   flex-shrink: 0;
+  z-index: 100;
 }
 
 /* 日期输入框 */
@@ -4837,11 +4773,17 @@ function closeImportDialog() {
 
 /* 汇总卡片 */
 .summary-card {
-  background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-  margin: 8px 10px;
-  padding: 10px 12px;
+  --asset-up: #f04458;
+  --asset-down: #07845a;
+  position: relative;
+  overflow: hidden;
+  margin: 8px 12px 12px;
+  padding: 12px 14px 11px;
   border-radius: 8px;
   color: #fff;
+  background: linear-gradient(rgba(236, 255, 245, .42), rgba(236, 255, 245, .42)), #73d2a5 url('/images/holding-asset-card-bg.png') center / cover no-repeat;
+  background-blend-mode: screen, normal;
+  box-shadow: 0 8px 18px rgba(32, 133, 89, .14);
 }
 
 .summary-row {
@@ -4856,6 +4798,7 @@ function closeImportDialog() {
 
 .summary-item {
   flex: 1;
+  min-width: 0;
 }
 
 .summary-label {
@@ -4867,15 +4810,23 @@ function closeImportDialog() {
 .summary-value {
   font-size: 15px;
   font-weight: 600;
+  font-variant-numeric: tabular-nums;
 }
 
 .summary-value.up {
-  color: #ffcccc;
+  color: var(--asset-up);
 }
 
 .summary-value.down {
-  color: #90EE90;
+  color: var(--asset-down);
 }
+
+.summary-total { margin-bottom: 10px; }
+.summary-total-value { font-size: 25px; line-height: 1; font-weight: 700; font-variant-numeric: tabular-nums; }
+.summary-metrics { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 8px; }
+.summary-rate { margin-top: 1px; font-size: 10px; font-variant-numeric: tabular-nums; opacity: .86; }
+.summary-rate.up { color: var(--asset-up); }
+.summary-rate.down { color: var(--asset-down); }
 
 /* 列表表头 */
 .list-header {
@@ -4891,13 +4842,8 @@ function closeImportDialog() {
 
 /* 持仓列表 */
 .holding-list-container {
-  /* [FIX] flex:1 填充剩余空间，避免嵌套滚动 */
-  flex: 1;
-  overflow-y: auto;
-  -webkit-overflow-scrolling: touch;
-  overscroll-behavior-y: contain;
-  /* 安全区域：底部TabBar + iPhone Home indicator */
-  padding-bottom: calc(20px + env(safe-area-inset-bottom, 0));
+  overflow: visible;
+  padding-bottom: 82px;
 }
 
 .holding-item {
@@ -4932,14 +4878,19 @@ function closeImportDialog() {
 }
 
 .col-name .fund-code {
-  font-size: 10px;
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+
+.col-name .fund-type {
+  font-size: 11px;
   color: var(--text-secondary);
 }
 
 .col-name .fund-tag {
-  font-size: 9px;
-  padding: 1px 3px;
-  border-radius: 2px;
+  font-size: 10px;
+  padding: 1px 4px;
+  border-radius: 3px;
   margin-left: 4px;
 }
 
@@ -4997,33 +4948,33 @@ function closeImportDialog() {
 
 .col-position {
   text-align: right;
-  font-size: 10px;
+  font-size: 11px;
   min-width: 0;
 }
 
 .col-profit {
   text-align: right;
-  font-size: 11px;
+  font-size: 14px;
   min-width: 0;
 }
 
 .col-profit .profit-amount {
-  font-size: 11px;
+  font-size: 14px;
 }
 
 .col-profit .profit-rate {
-  font-size: 10px;
+  font-size: 11px;
   opacity: 0.8;
 }
 
 .col-today {
   text-align: right;
-  font-size: 11px;
+  font-size: 13.2px;
   min-width: 0;
 }
 
 .col-today .today-profit {
-  font-size: 11px;
+  font-size: 13.2px;
   font-weight: 600;
   display: block;
 }
@@ -5037,14 +4988,18 @@ function closeImportDialog() {
 
 .position-amount {
   color: var(--text-primary);
-  font-size: 11px;
+  font-size: 14px;
   font-weight: 500;
 }
 
-.position-nav,
+.position-nav {
+  color: var(--text-secondary);
+  font-size: 11px;
+}
+
 .today-rate {
   color: var(--text-secondary);
-  font-size: 10px;
+  font-size: 12.1px;
 }
 
 
@@ -5058,7 +5013,7 @@ function closeImportDialog() {
   align-items: center;
   gap: 2px;
   margin-top: 2px;
-  font-size: 9px;
+  font-size: 11px;
   font-family: -apple-system, 'SF Mono', 'Roboto Mono', monospace;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
@@ -5067,7 +5022,7 @@ function closeImportDialog() {
 
 .diff-label {
   color: var(--text-secondary);
-  font-size: 8px;
+  font-size: 10px;
 }
 
 .diff-value {
@@ -5346,9 +5301,12 @@ function closeImportDialog() {
 /* 底部操作栏 */
 .trade-footer {
   margin-top: auto;
-  padding: 12px 16px 24px;
+  flex: 0 0 auto;
+  padding: 12px 16px calc(12px + env(safe-area-inset-bottom, 0px));
   background: var(--bg-secondary);
   border-top: 1px solid var(--border-color);
+  position: relative;
+  z-index: 2;
 }
 
 .trade-mode-switch {
@@ -5449,13 +5407,19 @@ function closeImportDialog() {
 }
 
 .dialog-footer {
-  padding: 16px;
   display: flex;
+  flex: 0 0 auto;
   gap: 12px;
+  padding: 12px 16px calc(12px + env(safe-area-inset-bottom, 0px));
+  border-top: 1px solid var(--border-color);
+  background: var(--bg-secondary);
+  position: relative;
+  z-index: 2;
 }
 
 .dialog-footer .van-button {
   flex: 1;
+  min-height: 44px;
 }
 
 /* 导航栏右侧图标 */
@@ -5463,7 +5427,6 @@ function closeImportDialog() {
   display: flex;
   align-items: center;
   gap: 16px;
-  margin-right: 16px;
 }
 
 .nav-icon {
@@ -6316,29 +6279,16 @@ function closeImportDialog() {
   max-width: 120px;
 }
 
-/* 较长基金名称不截断，使用单行横幅完整展示。 */
+/* Long fund names remain static so rows stay readable while scanning. */
 .col-name .fund-name {
   display: block;
   width: 100%;
   min-width: 0;
-  height: 14px;
-  line-height: 14px;
+  height: 17px;
+  line-height: 17px;
   overflow: hidden;
-  text-overflow: clip;
+  text-overflow: ellipsis;
   white-space: nowrap;
-}
-
-.fund-name-track {
-  display: inline-block;
-  width: max-content;
-  white-space: nowrap;
-  will-change: transform;
-  animation: fund-name-marquee 9s linear 1s infinite;
-}
-
-@keyframes fund-name-marquee {
-  from { transform: translateX(0); }
-  to { transform: translateX(-100%); }
 }
 
 .list-toolbar {
@@ -6346,45 +6296,86 @@ function closeImportDialog() {
   justify-content: space-between;
   align-items: center;
   flex-shrink: 0;
-  padding: 0 18px 12px;
+  gap: 10px;
+  padding: 9px 12px 8px;
+  background: var(--bg-primary);
+  border-bottom: 1px solid var(--border-color);
+}
+
+.dialog-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+}
+
+.dialog-save-button {
+  min-width: 64px;
 }
 
 .list-toolbar h2 {
   margin: 0;
-  font-size: 23px;
-  line-height: 1;
-  color: #13243a;
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 16px;
+  line-height: 20px;
+  font-weight: 600;
+  color: var(--text-primary);
 }
 
 .filter-bar {
   display: flex;
-  gap: 8px;
+  flex: 0 0 auto;
+  align-items: center;
+  gap: 6px;
   padding: 0;
   background: transparent;
   border: 0;
 }
 
 .filter-dropdown {
-  min-width: 88px;
+  min-width: 0;
+  height: 30px;
   justify-content: center;
-  gap: 5px;
-  padding: 9px 8px;
-  color: #2f516b;
-  background: #fff;
-  border: 1px solid #e0e5e8;
-  border-radius: 6px;
-  box-shadow: 0 1px 2px rgba(20, 44, 63, .04);
+  gap: 4px;
+  padding: 0 8px;
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+  border: 1px solid #3b4350;
+  border-radius: 4px;
+  box-shadow: none;
 }
 
-.filter-label { font-size: 13px; white-space: nowrap; }
-.dropdown-menu { z-index: 20; top: calc(100% + 6px); right: 0; border-radius: 8px; }
+.filter-dropdown:active { background: #3b4350; }
+.filter-dropdown :deep(.van-icon) { color: var(--text-secondary); }
+.filter-label { font-size: 11px; font-weight: 500; white-space: nowrap; }
+.dropdown-menu {
+  z-index: 20;
+  top: calc(100% + 5px);
+  right: 0;
+  left: auto;
+  min-width: 112px;
+  background: var(--bg-secondary);
+  border: 1px solid #3b4350;
+  border-radius: 4px;
+  box-shadow: 0 10px 24px rgba(0, 0, 0, .35);
+}
+.dropdown-item {
+  padding: 9px 12px;
+  font-size: 12px;
+  color: var(--text-primary);
+}
+.dropdown-item:active,
+.dropdown-item.active {
+  color: var(--color-primary);
+  background: var(--color-primary-bg);
+}
 
 .list-header {
-  padding: 0 20px 7px;
-  color: #8b96a2;
-  font-size: 12px;
-  background: transparent;
-  border-bottom: 1px solid #e5e8eb;
+  padding: 0 12px 7px;
+  color: var(--text-secondary);
+  font-size: 10px;
+  background: var(--bg-primary);
+  border-bottom: 1px solid var(--border-color);
 }
 
 .list-header .col-name {
@@ -6398,14 +6389,68 @@ function closeImportDialog() {
   white-space: nowrap;
 }
 
-.holding-item .col-name {
-  flex: 0 0 calc(100% - 197px);
-  max-width: none;
-  padding-right: 4px;
+/* 右下角操作保留在全局滚动之上，不占用列表行宽。 */
+.holding-floating-actions {
+  position: fixed;
+  right: 16px;
+  bottom: calc(64px + env(safe-area-inset-bottom, 0px));
+  z-index: 90;
+  display: grid;
+  gap: 10px;
+}
+
+.floating-action-button {
+  display: grid;
+  width: 48px;
+  height: 48px;
+  place-items: center;
+  padding: 0;
+  border: 0;
+  border-radius: 50%;
+  color: #315a7c;
+  background: color-mix(in srgb, #b8d3eb 27%, transparent);
+  box-shadow: none;
+  cursor: pointer;
+  transition: background-color .18s ease, color .18s ease, transform .18s ease;
+}
+
+.floating-action-button:hover { background: color-mix(in srgb, #b8d3eb 38%, transparent); }
+.floating-action-button:focus-visible { outline: 2px solid color-mix(in srgb, #315a7c 56%, transparent); outline-offset: 2px; }
+.floating-action-button:active { transform: scale(.92); }
+.floating-import-button,
+.floating-add-button { color: #315a7c; }
+
+/* 深色模式保留同样的轻圆形入口，避免形成高对比的悬浮方块。 */
+[data-theme="dark"] .floating-action-button {
+  color: #9ec8eb;
+  background: color-mix(in srgb, #6e96bf 23%, transparent);
+}
+[data-theme="dark"] .floating-action-button:hover { background: color-mix(in srgb, #6e96bf 33%, transparent); }
+[data-theme="dark"] .floating-action-button:focus-visible { outline-color: color-mix(in srgb, #9ec8eb 70%, transparent); }
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) .floating-action-button {
+    color: #9ec8eb;
+    background: color-mix(in srgb, #6e96bf 23%, transparent);
+  }
+
+  :root:not([data-theme="light"]) .floating-action-button:hover { background: color-mix(in srgb, #6e96bf 33%, transparent); }
+}
+
+.holding-floating-actions .import-menu-wrapper { position: relative; display: block; }
+.holding-floating-actions .ocr-dropdown-menu {
+  top: auto;
+  right: 0;
+  bottom: calc(100% + 10px);
+  margin: 0;
+  border-radius: 8px;
 }
 
 @media (max-width: 390px) {
-  .list-toolbar { padding-right: 12px; padding-left: 12px; }
-  .filter-dropdown { min-width: 78px; }
+  .list-toolbar { gap: 7px; padding-right: 10px; padding-left: 10px; }
+  .list-toolbar h2 { font-size: 15px; }
+  .filter-bar { gap: 5px; }
+  .filter-dropdown { padding: 0 7px; }
+  .filter-label { font-size: 10px; }
 }
 </style>

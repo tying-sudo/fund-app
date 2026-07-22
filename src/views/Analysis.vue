@@ -10,8 +10,11 @@ import { useTradeStore } from '@/stores/trade'
 import { useThemeStore } from '@/stores/theme'
 import { useSettingsStore } from '@/stores/settings'
 import { formatMoney, formatPercent, getChangeStatus } from '@/utils/format'
-import { showToast } from 'vant'
+import { showConfirmDialog, showFailToast, showLoadingToast, showSuccessToast, showToast, closeToast } from 'vant'
 import { fetchFinanceNews, type NewsItem } from '@/api/tiantianApi'
+import { fetchAppRelease, isVersionLower, type AppReleaseInfo } from '@/api/remote'
+import { APP_VERSION } from '@/config/version'
+import { downloadAndInstallAppUpdate } from '@/utils/inAppUpdate'
 
 const router = useRouter()
 const holdingStore = useHoldingStore()
@@ -31,6 +34,78 @@ const showNewsPanel = ref(false)
 
 // [WHAT] 刷新设置折叠状态（默认展开）
 const showRefreshSettings = ref(true)
+
+const versionChecking = ref(false)
+const latestRelease = ref<AppReleaseInfo | null>(null)
+
+const versionStatus = computed(() => {
+  if (versionChecking.value) return '检查中...'
+  if (latestRelease.value && isVersionLower(APP_VERSION, latestRelease.value.version)) {
+    return `发现 v${latestRelease.value.version}`
+  }
+  return '检查更新'
+})
+
+function formatReleaseSize(sizeBytes: number | null) {
+  if (!sizeBytes) return ''
+  return `${(sizeBytes / 1024 / 1024).toFixed(1)} MB`
+}
+
+async function openReleaseDownload(url: string) {
+  showLoadingToast({ message: '正在下载更新...', forbidClick: true, duration: 0 })
+  try {
+    const result = await downloadAndInstallAppUpdate(url)
+    closeToast()
+    if (result.needsPermission) {
+      showToast('请允许“安装未知应用”，然后再次点击更新')
+      return
+    }
+    showSuccessToast('下载完成，正在打开安装')
+  } catch (error) {
+    closeToast()
+    showFailToast(error instanceof Error ? error.message : '更新下载失败')
+  }
+}
+
+async function checkAppUpdate() {
+  if (versionChecking.value) return
+  versionChecking.value = true
+  try {
+    const release = await fetchAppRelease()
+    latestRelease.value = release
+    if (!release) {
+      showFailToast('版本检查失败，请稍后重试')
+      return
+    }
+
+    if (!isVersionLower(APP_VERSION, release.version)) {
+      showSuccessToast(`当前已是最新版本 v${APP_VERSION}`)
+      return
+    }
+
+    if (!release.available || !release.apkUrl) {
+      showToast(`发现 v${release.version}，安装包暂未发布`)
+      return
+    }
+
+    const notes = release.releaseNotes.length > 0
+      ? `\n\n${release.releaseNotes.join('\n')}`
+      : ''
+    const size = formatReleaseSize(release.sizeBytes)
+    const sizeText = size ? `（${size}）` : ''
+    await showConfirmDialog({
+      title: release.title || `发现新版本 v${release.version}`,
+      message: `v${release.version}${sizeText}${notes}`,
+      confirmButtonText: '立即更新',
+      cancelButtonText: '暂不更新'
+    })
+    await openReleaseDownload(release.apkUrl)
+  } catch {
+    // 用户取消更新时保持在当前页面。
+  } finally {
+    versionChecking.value = false
+  }
+}
 
 // [WHAT] 初始化数据
 onMounted(() => {
@@ -473,6 +548,20 @@ function goToTrades() {
           </van-cell>
                 </van-cell-group>
       </div>
+    </div>
+
+    <!-- Android 版本更新 -->
+    <div class="section version-section">
+      <van-cell
+        title="版本更新"
+        :label="`当前版本 v${APP_VERSION}`"
+        :value="versionStatus"
+        icon="upgrade"
+        is-link
+        center
+        :clickable="!versionChecking"
+        @click="checkAppUpdate"
+      />
     </div>
 
     <!-- 资讯详情弹窗 -->
@@ -961,5 +1050,9 @@ function goToTrades() {
   font-size: 14px;
   font-weight: 500;
   color: var(--text-primary);
+}
+
+.version-section :deep(.van-cell__value) {
+  white-space: nowrap;
 }
 </style>
