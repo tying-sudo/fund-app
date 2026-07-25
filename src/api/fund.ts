@@ -293,25 +293,30 @@ export async function getFundType(code: string): Promise<string> {
 }
 
 /**
+ * 批量查找基金清单信息。
+ * 自选初始化同时需要名称和类型，集中索引可避免逐代码扫描全量清单。
+ */
+export async function getFundDirectoryEntries(codes: string[]): Promise<Map<string, FundInfo>> {
+  try {
+    const requested = new Set(codes)
+    const list = await fetchFundList()
+    return new Map(list
+      .filter((fund) => requested.has(fund.code))
+      .map((fund) => [fund.code, fund]))
+  } catch (error) {
+    console.warn('[Fund API] 获取基金清单信息失败，返回空Map:', error)
+    return new Map<string, FundInfo>()
+  }
+}
+
+/**
  * 批量查找基金类型
  * [WHY] 初始化自选/持仓列表时批量获取类型，避免逐个请求
  * [WHAT] 从后端API获取基金列表并提取类型
  */
 export async function getFundTypes(codes: string[]): Promise<Map<string, string>> {
-  try {
-    const list = await fetchFundList()
-    const typeMap = new Map<string, string>()
-    for (const code of codes) {
-      const fund = list.find((item) => item.code === code)
-      if (fund) {
-        typeMap.set(code, fund.type)
-      }
-    }
-    return typeMap
-  } catch (error) {
-    console.warn('[Fund API] 获取基金类型失败，返回空Map:', error)
-    return new Map<string, string>()
-  }
+  const directory = await getFundDirectoryEntries(codes)
+  return new Map([...directory].map(([code, fund]) => [code, fund.type]))
 }
 
 /**

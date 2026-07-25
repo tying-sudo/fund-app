@@ -307,6 +307,39 @@ def _next_batch_id(batches: list, date_str: str) -> str:
     return f"b{date_part}{letter}"
 
 
+def _ensure_fund(data: dict, fund_code: str) -> dict:
+    """Return the mutable fund entry, creating the standard empty shape."""
+    funds = data.setdefault("funds", {})
+    if fund_code not in funds:
+        funds[fund_code] = {
+            "fund_name": "",
+            "max_position": 5000,
+            "batches": [],
+            "supplement_count": 0,
+            "cooldown_until": None,
+        }
+    return funds[fund_code]
+
+
+def _add_batch_to_data(data: dict, fund_code: str, amount: float, nav: float,
+                       note: str, buy_date: str) -> dict:
+    """Append a confirmed batch to an already locked positions document."""
+    fund = _ensure_fund(data, fund_code)
+    batch = {
+        "id": _next_batch_id(fund["batches"], buy_date),
+        "buy_date": buy_date,
+        "amount": round(amount, 2),
+        "nav": round(nav, 4),
+        "shares": round(amount / nav, 2) if nav > 0 else 0.0,
+        "status": "holding",
+        "note": note,
+        "is_supplement": False,
+        "is_rebuy": False,
+    }
+    fund["batches"].append(batch)
+    return batch
+
+
 @position_write
 def add_batch(fund_code: str, amount: float, nav: float = None, note: str = "",
               buy_date: str = None, is_supplement: bool = False,
@@ -322,18 +355,7 @@ def add_batch(fund_code: str, amount: float, nav: float = None, note: str = "",
     - 返回新增的 batch dict
     """
     data = load_positions()
-    funds = data.setdefault("funds", {})
-
-    if fund_code not in funds:
-        funds[fund_code] = {
-            "fund_name": "",
-            "max_position": 5000,
-            "batches": [],
-            "supplement_count": 0,
-            "cooldown_until": None,
-        }
-
-    fund = funds[fund_code]
+    fund = _ensure_fund(data, fund_code)
 
     # 买入日期：支持手动指定（录入历史持仓），默认今天
     if buy_date and _is_valid_date(buy_date):
@@ -342,27 +364,15 @@ def add_batch(fund_code: str, amount: float, nav: float = None, note: str = "",
         date_str = beijing_now().strftime("%Y-%m-%d")
 
     _nav = nav if nav and nav > 0 else 0.0
-    shares = round(amount / _nav, 2) if _nav > 0 else 0.0
-
     # 自动识别补仓：显式标记 或 note 以"补仓"开头
     _is_supp = is_supplement or (note and note.startswith("补仓"))
 
-    batch = {
-        "id": _next_batch_id(fund["batches"], date_str),
-        "buy_date": date_str,
-        "amount": round(amount, 2),
-        "nav": round(_nav, 4),
-        "shares": shares,
-        "status": "holding",
-        "note": note,
-        "is_supplement": _is_supp,
-        # v5.X: 延迟回补标记（与 backtest.py 的 is_rebuy 字段对齐）
-        "is_rebuy": bool(is_rebuy),
-    }
+    batch = _add_batch_to_data(data, fund_code, amount, _nav, note, date_str)
+    batch["is_supplement"] = _is_supp
+    # v5.X: 延迟回补标记（与 backtest.py 的 is_rebuy 字段对齐）
+    batch["is_rebuy"] = bool(is_rebuy)
     if pending_rebuy_id:
         batch["from_pending_rebuy"] = pending_rebuy_id
-    fund["batches"].append(batch)
-
     # 补仓计数递增
     if _is_supp:
         fund["supplement_count"] = fund.get("supplement_count", 0) + 1
@@ -984,6 +994,196 @@ def sell_fifo(fund_code: str, total_sell_shares: float,
         "total_profit": round(total_profit, 2) if any(d["profit"] is not None for d in batch_details) else None,
         "nav_pending": sell_nav is None or sell_nav <= 0,
     }
+
+
+def _sell_fifo_in_data(data: dict, fund_code: str, total_sell_shares: float,
+                       sell_nav: float, sell_date: str, note: str) -> dict:
+    """Apply a FIFO sale to a loaded document without persisting it."""
+    fund = data.get("funds", {}).get(fund_code)
+    if not fund:
+        return {"sold_shares": 0.0, "available_shares": 0.0, "batch_count": 0}
+
+    holding = sorted(
+        (batch for batch in fund.get("batches", []) if batch.get("status") == "holding" and batch.get("shares", 0) > 0),
+        key=lambda batch: batch.get("buy_date", ""),
+    )
+    available = round(sum(float(batch.get("shares", 0) or 0) for batch in holding), 2)
+    if available <= 0:
+        return {"sold_shares": 0.0, "available_shares": 0.0, "batch_count": 0}
+
+    remaining = min(total_sell_shares, available)
+    sold = 0.0
+    details = []
+    sell_records = fund.setdefault("sell_records", [])
+    for batch in holding:
+        if remaining <= 0.005:
+            break
+        original_shares = float(batch.get("shares", 0) or 0)
+        shares_to_sell = min(remaining, original_shares)
+        if abs(shares_to_sell - original_shares) < 0.01:
+            shares_to_sell = original_shares
+        buy_date = datetime.strptime(batch["buy_date"], "%Y-%m-%d").date()
+        sale_date = datetime.strptime(sell_date, "%Y-%m-%d").date()
+        hold_days = (sale_date - buy_date).days
+        fee_rate = get_sell_fee_rate(fund_code, hold_days)
+        cost_ratio = shares_to_sell / original_shares if original_shares else 1.0
+        cost = round(float(batch.get("amount", 0) or 0) * cost_ratio, 2)
+        gross = round(shares_to_sell * sell_nav, 2) if sell_nav and sell_nav > 0 else None
+        fee = round(gross * fee_rate / 100, 2) if gross is not None else None
+        net = round(gross - fee, 2) if gross is not None else None
+        profit = round(net - cost, 2) if net is not None else None
+        profit_pct = round(profit / cost * 100, 1) if profit is not None and cost > 0 else None
+        same_day = [record for record in sell_records if record.get("sell_date") == sell_date]
+        record_id = f"s{sell_date.replace('-', '')}{chr(ord('a') + min(len(same_day), 25))}"
+        sell_records.append({
+            "id": record_id,
+            "batch_id": batch["id"],
+            "sell_date": sell_date,
+            "sell_shares": round(shares_to_sell, 2),
+            "buy_nav": round(float(batch.get("nav", 0) or 0), 4),
+            "sell_nav": round(sell_nav, 4) if sell_nav and sell_nav > 0 else None,
+            "cost": cost,
+            "gross": gross,
+            "fee": fee,
+            "net": net,
+            "profit": profit,
+            "profit_pct": profit_pct,
+            "hold_days": hold_days,
+            "sell_fee_rate": fee_rate,
+            "note": note,
+        })
+        full_sale = abs(shares_to_sell - original_shares) < 0.01
+        if full_sale:
+            batch["status"] = "sold"
+            batch["sell_date"] = sell_date
+            batch["sell_shares"] = round(shares_to_sell, 2)
+            if sell_nav and sell_nav > 0:
+                batch["sell_nav"] = round(sell_nav, 4)
+        else:
+            batch.setdefault("original_amount", batch.get("amount", 0))
+            batch.setdefault("original_shares", original_shares)
+            batch["shares"] = round(original_shares - shares_to_sell, 2)
+            batch["amount"] = round(float(batch.get("amount", 0) or 0) * (1 - cost_ratio), 2)
+        sold += shares_to_sell
+        remaining -= shares_to_sell
+        details.append({"batch_id": batch["id"], "sell_shares": round(shares_to_sell, 2), "sell_record_id": record_id})
+
+    if sold > 0:
+        sale_day = datetime.strptime(sell_date, "%Y-%m-%d").date()
+        fund["cooldown_until"] = (sale_day + timedelta(days=COOLDOWN_DAYS_NATURAL)).strftime("%Y-%m-%d")
+        fund["cooldown_sell_date"] = sell_date
+        fund["cooldown_trade_days"] = COOLDOWN_TRADE_DAYS
+        if not any(batch.get("status") == "holding" for batch in fund.get("batches", [])):
+            fund["supplement_count"] = 0
+    return {"sold_shares": round(sold, 2), "available_shares": available, "batch_count": len(details), "batch_details": details}
+
+
+def _is_jd_timeline_batch(batch: dict) -> bool:
+    return batch.get("source") == "jd_timeline" or str(batch.get("note", "")).startswith("京东导入")
+
+
+@position_write
+def import_jd_grid_transactions(transactions: list) -> dict:
+    """Atomically import normalized JD buy/sell legs and retain their ledger ids."""
+    data = load_positions()
+    ledger = data.setdefault("imported_transaction_ids", {})
+    results = []
+    imported = skipped = partial = 0
+    verified_codes = {
+        str(item.get("code", "")).strip()
+        for item in transactions
+        if item.get("timeline_verified") and str(item.get("code", "")).strip()
+    }
+    blocked_codes = set()
+    for code in verified_codes:
+        fund = data.get("funds", {}).get(code)
+        batches = fund.get("batches", []) if fund else []
+        if not batches:
+            continue
+        if not all(_is_jd_timeline_batch(batch) for batch in batches):
+            blocked_codes.add(code)
+            continue
+        removed_ids = {batch.get("id") for batch in batches}
+        fund["batches"] = []
+        fund["sell_records"] = [
+            record for record in fund.get("sell_records", [])
+            if record.get("batch_id") not in removed_ids
+        ]
+        fund["supplement_count"] = 0
+
+    ordered = sorted(transactions, key=lambda item: (item.get("trade_date", ""), item.get("trade_time", ""), item.get("ledger_id", "")))
+    for item in ordered:
+        ledger_id = str(item.get("ledger_id", "")).strip()
+        code = str(item.get("code", "")).strip()
+        action = item.get("action")
+        trade_date = str(item.get("trade_date", "")).strip()
+        if not ledger_id or not code or action not in {"buy", "sell", "seed"} or not _is_valid_date(trade_date):
+            results.append({"ledger_id": ledger_id, "status": "skipped", "reason": "invalid_transaction"})
+            skipped += 1
+            continue
+        if code in blocked_codes:
+            results.append({"ledger_id": ledger_id, "code": code, "status": "skipped", "reason": "existing_manual_grid_position"})
+            skipped += 1
+            continue
+        if ledger_id in ledger and not item.get("timeline_verified"):
+            results.append({"ledger_id": ledger_id, "code": code, "status": "skipped", "reason": "duplicate"})
+            skipped += 1
+            continue
+
+        note = str(item.get("note", "京东导入")).strip() or "京东导入"
+        name = str(item.get("name", "")).strip()
+        if name:
+            _ensure_fund(data, code)["fund_name"] = name
+
+        if action == "seed":
+            existing_batches = data.get("funds", {}).get(code, {}).get("batches", [])
+            if existing_batches:
+                results.append({"ledger_id": ledger_id, "code": code, "status": "skipped", "reason": "existing_grid_position"})
+                ledger[ledger_id] = {"source": "jd", "outcome": "skipped", "processed_at": beijing_now().strftime("%Y-%m-%d %H:%M:%S")}
+                skipped += 1
+                continue
+
+        if action in {"buy", "seed"}:
+            amount = float(item.get("amount", 0) or 0)
+            nav = float(item.get("nav", 0) or 0)
+            if amount <= 0 or nav <= 0:
+                results.append({"ledger_id": ledger_id, "code": code, "status": "skipped", "reason": "missing_buy_value"})
+                ledger[ledger_id] = {"source": "jd", "outcome": "skipped", "processed_at": beijing_now().strftime("%Y-%m-%d %H:%M:%S")}
+                skipped += 1
+                continue
+            batch = _add_batch_to_data(data, code, amount, nav, note, trade_date)
+            if item.get("timeline_verified"):
+                batch["source"] = "jd_timeline"
+                batch["source_ledger_id"] = ledger_id
+            ledger[ledger_id] = {"source": "jd", "outcome": "imported", "processed_at": beijing_now().strftime("%Y-%m-%d %H:%M:%S")}
+            results.append({"ledger_id": ledger_id, "code": code, "action": action, "status": "imported", "batch_id": batch["id"]})
+            imported += 1
+            continue
+
+        shares = float(item.get("shares", 0) or 0)
+        nav_value = item.get("nav")
+        nav = float(nav_value) if nav_value not in (None, "") else None
+        if shares <= 0:
+            results.append({"ledger_id": ledger_id, "code": code, "status": "skipped", "reason": "missing_sell_shares"})
+            ledger[ledger_id] = {"source": "jd", "outcome": "skipped", "processed_at": beijing_now().strftime("%Y-%m-%d %H:%M:%S")}
+            skipped += 1
+            continue
+        sale = _sell_fifo_in_data(data, code, shares, nav, trade_date, note)
+        outcome = "imported" if sale["sold_shares"] >= shares - 0.01 else "partial" if sale["sold_shares"] > 0 else "skipped"
+        ledger[ledger_id] = {"source": "jd", "outcome": outcome, "processed_at": beijing_now().strftime("%Y-%m-%d %H:%M:%S")}
+        if sale["sold_shares"] <= 0:
+            results.append({"ledger_id": ledger_id, "code": code, "action": action, "status": "skipped", "reason": "no_matching_batches"})
+            skipped += 1
+        elif sale["sold_shares"] < shares - 0.01:
+            results.append({"ledger_id": ledger_id, "code": code, "action": action, "status": "partial", "requested_shares": round(shares, 2), **sale})
+            partial += 1
+        else:
+            results.append({"ledger_id": ledger_id, "code": code, "action": action, "status": "imported", **sale})
+            imported += 1
+
+    if results:
+        save_positions(data)
+    return {"success": True, "imported": imported, "skipped": skipped, "partial": partial, "results": results}
 
 
 def get_fund_position(fund_code: str) -> dict:

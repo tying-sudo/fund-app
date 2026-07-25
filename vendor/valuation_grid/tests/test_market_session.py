@@ -29,11 +29,12 @@ class MarketSessionTests(unittest.TestCase):
         core._intraday_cache_loaded = True
 
     @staticmethod
-    def result(change):
+    def result(change, confidence=0.65):
         return {
             "fund_code": "018524",
             "estimation_change": change,
             "asof_time": "2026-07-20 14:59:00",
+            "confidence": confidence,
             "notes": [],
         }
 
@@ -72,9 +73,23 @@ class MarketSessionTests(unittest.TestCase):
         self.assertEqual("nav", settled["_source"])
         self.assertEqual("2026-07-20", settled["_nav_date"])
         self.assertEqual(2.7, settled["estimation_change"])
-        self.assertEqual(1.0, settled["confidence"])
-        self.assertEqual(1.0, settled["calibrated_confidence"])
+        self.assertEqual(0.65, settled["confidence"])
+        self.assertNotIn("calibrated_confidence", settled)
         record.assert_called_once()
+
+    def test_settled_nav_does_not_override_calibrated_confidence(self):
+        result = {
+            "confidence": 0.58,
+            "calibrated_confidence": 0.70,
+            "notes": [],
+        }
+        settled = core._set_nav_result(
+            result,
+            {"date": "2026-07-20", "change": 2.7},
+            "使用真实净值涨跌 2026-07-20",
+        )
+        self.assertEqual(0.58, settled["confidence"])
+        self.assertEqual(0.70, settled["calibrated_confidence"])
 
     def test_stale_live_source_is_not_relabelled_as_today(self):
         value = self.finalize(

@@ -2,6 +2,22 @@
 
 Append material implementation and release milestones here. This log does not contain credentials, private keys, or environment values.
 
+## 2026-07-25
+
+- Replaced the JD account-login surfaces on the holdings and grid pages with one shared Cookie entry dialog. It stores the submitted Cookie only in the device's browser/WebView storage, restores it when either dialog is opened again, and provides a delete action; the Cookie is never sent to this application's backend.
+- The grid dialog remains available from the upper-right of "录入持仓" and continues to import only current JD holdings plus their eligible buy, sell, and conversion batches.
+- Published Android `1.0.76 (77)`: the JD grid importer now materializes each uncovered current-holding snapshot independently, writes its fund name, uses the snapshot cost net value or `(market value - holding profit) / shares` as the cost basis, and uses JD's holding date or profit date to fill the seed batch date. Existing grid positions remain untouched.
+- Published Android `1.0.77 (78)`: Cookie holdings now carry the explicit JD holding-cost amount through the native plugin, grid request, and batch writer. The parser accepts alternate market-value, share, cost, and profit field names plus nested value objects; grid seeding prioritizes the Cookie cost amount over inferred values.
+- Published Android `1.0.81 (82)`: JD H5 trade rows now normalize the fund product identifier `1` plus six-digit fund code (for example `1026211` to `026211`) before grid filtering. The importer retains the real JD `bizTime` transaction date and writes chronological buy, sell, and conversion batches; it does not fabricate a snapshot date when JD has no real transaction date.
+- Public verification: `/api/app/version` reports `available=true`, `1.0.81 (82)`, and the matching HTTPS download. The downloaded APK is `6,801,404` bytes with SHA-256 `5cb8a263ee38dbcf21096ee2e7e0059b36048b78d52dc1b72dd020331b093c31`; `/v1/health` returns `ok` and `/low-frequency-grid` returns HTTP 200. Rollbacks: `/opt/fund-app.previous-20260725T032122` and `/opt/valuation-grid/.jd-import-backup-20260725T032122`.
+- Published Android `1.0.82 (83)`: JD grid import now retains only each current holding's cycle after the last verified full exit. It includes chronological buy, redemption, and conversion legs, reads all available trade pages without stopping on an unrecognized page, and refuses to synthesize a batch from a holding-cost snapshot when the real opening trade is unavailable.
+- Holding confirmation rules: a pre-15:00 adjustment tag remains through the following day at 12:00 and the position participates in that next session; a post-15:00 tag remains through the following day at 15:00 and the position's settlement return starts one further trading session later. The detail audit trail remains available after the temporary row tag disappears.
+- Public verification: `/api/app/version` reports `available=true`, `1.0.82 (83)`. The downloaded APK is `6,802,259` bytes with SHA-256 `a4064249dbd4dd90b4866e7227b28acd44ac6196e9dfea3a39fb4d6bbaf843f3`, matching release metadata; `/v1/health` is `ok`, `/low-frequency-grid` returns HTTP 200, and public `ValuationGrid-82ZClAVT.js` matches the local build by SHA-256. Rollbacks: `/opt/fund-app.previous-20260725T050716` and `/opt/valuation-grid/.jd-import-backup-20260725T050716`.
+- Published Android `1.0.84 (85)`: grid import now anchors every current fund to the JD Cookie share count and walks its full buy, redemption, and conversion timeline backwards. A fund is written only when the selected current cycle exactly reconciles to that count; missing values or mismatches reject the entire fund, preserving its existing manual batches and grid signals. JD detail templates that omit a display-only cost label no longer drop a valid current holding with a real share count.
+- Public verification: `/api/app/version` reports `available=true`, `1.0.84 (85)`. The HTTPS APK is `6,802,516` bytes with SHA-256 `c70d0deaf95917e8bdf30c901045a992ea56841a7f8760091899606614a43375`, matching local. `/v1/health` is `ok` and `/low-frequency-grid` returns HTTP 200. Rollbacks: `/opt/fund-app.previous-20260725T072023` and `/opt/valuation-grid/.jd-import-backup-20260725T072023`.
+- Published Android `1.0.85 (86)`: inspected the current JD `昨日收益 -> 交易` page bundle and changed the native reader from the obsolete `cfGateway/h5` route to JD's active `cfGateway/newna` transaction-list route. It keeps the old route only as a no-row compatibility fallback and continues to use the returned real `bizTime`, amount, share, and status fields for timeline certification.
+- Public verification: `/api/app/version` reports `available=true`, `1.0.85 (86)`. The HTTPS APK is `6,802,352` bytes with SHA-256 `db9d7eedf4c6b4ae5ffb75a68da1fa92f7e90e1e8bbcd39b86ae42f642824d4a`, matching local. `/v1/health` is `ok` and `/low-frequency-grid` returns HTTP 200. Rollbacks: `/opt/fund-app.previous-20260725T101942` and `/opt/valuation-grid/.jd-import-backup-20260725T101942`.
+
 ## 2026-07-19
 
 - Restored the market index board with six default indices, drag sorting, deletion, and the Hang Seng Tech quote source.
@@ -184,3 +200,159 @@ Append material implementation and release milestones here. This log does not co
 
 - Prepared the complete `1.0.58 (59)` source tree for publication to `tying-sudo/fund-app`. The README and documentation now describe the current Web/Android/backend feature set, use the active repository for clone, Issue, and Release links, and credit both the historical `xiriovo/fund-app` base and the live `shangjinma-source/valuation_grid` upstream.
 - Git publication excludes local npm caches, deployment credential helpers, remote source snapshots, generated runtime market/holding data, and historical release artifacts. Verification passed: holding settlement regression, grid import 5/5, strategy order 2/2, server 47/47, valuation-grid Python 7/7, `vue-tsc --noEmit`, and the Vite production build.
+
+- Published Android debug APK `1.0.59 (60)` with a durable backend daily-return snapshot for the holding asset card. `/api/funds/:code/daily-returns` now returns `latest`, `current`, and the prior Beijing-calendar return. The asset card calculates yesterday's profit from that retained prior record, so a same-evening NAV publication no longer replaces yesterday's card; it advances at Beijing midnight. The card also displays total holding return rate beneath holding profit.
+- Fund-type text in both the holding and watchlist lists now opens the Alipay fund detail mini-app using the encoded `alipays://platformapi/startapp` URL and app ID `20000793`; the Android plugin pins the Alipay package and falls back to the HTTPS detail page if Alipay is unavailable.
+- Verification passed: holding settlement regression, Alipay URL tests 3/3, grid import 5/5, grid strategy order 2/2, server tests 49/49, `vue-tsc --noEmit`, Vite, Capacitor sync, Java compile, and JDK 21 Gradle debug APK build. The signed `1.0.59 (60)` APK is 6,782,793 bytes with SHA-256 `97dd83a9aff4f98be2ef0265c8702e8b161cb8f7bdab4c1cd72312ab800d78e0`; public metadata/download match, and public health, daily-return, homepage, Home, and Holding asset checks pass. Static rollback is `/opt/fund-app.previous-20260722-1.0.59`.
+
+- Published Android debug APK `1.0.60 (61)` with JD-aligned delayed-QDII daily-profit attribution. A QDII NAV first published on the following Beijing workday is now counted as current-day income; the preceding published NAV return remains the holding card's yesterday income until midnight.
+- The reported difference was traced to `100055` and `018147`: on 2026-07-22 their newly published `2026-07-21` returns (`+4.51%`, `+6.78%`) belong to current-day income, while yesterday uses `2026-07-20` (`+1.09%`, `-0.13%`). Regular fund `017472` continues to use `2026-07-21/+6.53%` for yesterday.
+- Verification passed: holding settlement regression, `vue-tsc --noEmit`, Vite, Capacitor sync, JDK 21 Gradle build, server tests 50/50, and live daily-return semantics. The public 6,782,718-byte APK matches SHA-256 `b49a172c36f487b466911949cae06e0892e488d226d00ce710a588657c8c3976`; backend-only publication preserved the static frontend and the unrelated local market-index data change.
+
+- Published Android debug APK `1.0.62 (63)` to complete the JD-aligned global-QDII current-day income behavior. The client now carries the backend's explicit current-publication attribution through the estimate cache and gives a newly published delayed official return priority for today's profit/rate, while retaining the live estimate for current holding value and total holding profit. Pure Hong Kong QDII funds keep their normal market-session calculation.
+- Public verification on 2026-07-22 returned `100055 current=2026-07-21/+4.51%`, `018147 current=2026-07-21/+6.78%`, and pure-Hong-Kong `018524 current=2026-07-22/-3.37%`. Holding regression, `vue-tsc --noEmit`, backend tests 15/15, Vite, Capacitor sync, JDK 21 Gradle build, package/version checks, and APK v1/v2 signatures passed.
+- The public HTTPS APK is 6,782,846 bytes with SHA-256 `eda0b786c4cafc11a9758ac365217c36adc62073d375761e4d848ad9ee1ccf1f`, matching the local artifact and `/api/app/version`. Backend-only publication preserved the static frontend, and the isolated release snapshot restored the committed market-index fallback instead of uploading the unrelated local data change.
+
+## 2026-07-23
+
+- Republished the completed asset-card current/yesterday QDII attribution fix as Android `1.0.63 (64)`. The prior `1.0.62 (63)` metadata reused a version already installed on the test device, so it could not trigger an upgrade even though the APK bytes had changed; this release uses a strictly higher version name and code.
+- Public `/api/app/version` reports `1.0.63 (64)`, `available=true`, and an HTTPS APK URL. The downloaded APK is 6,782,803 bytes with SHA-256 `2344f613950d6ff9d7e1629c01cbcac3f25a0c5e979de98108412a8b969508b5`; package/version and v1/v2 signatures match the local build. Backend-only publication preserved the static frontend and excluded the unrelated local market-index data change.
+
+- Published Android debug APK `1.0.64 (65)` with the JD Finance fund-holdings import and the watchlist data corrections. The holdings page now offers one-time `京东 Cookie 添加` through a fixed JD endpoint; the Cookie is validated, sent only upstream, never persisted or returned, and cleared from the client after every completion, failure, or dialog close. The response has `Cache-Control: no-store`; only normalized fund rows reach the existing confirmation flow. Browser-local Tesseract OCR and its dependency/docs were removed, while the server-side AI image recognition path remains available.
+- Watchlist initialization now restores each fund's name and type from the fund directory, and a blank provider name can no longer replace a known name. Published all-market snapshots now carry their paired official NAV, so a newer official snapshot (for example `008888` at `2.2232 / -1.37%`) supersedes stale cached actual-change data instead of rendering a synthetic or mismatched value.
+- Release verification passed: frontend utility tests 14/14, holding settlement regression, server tests 55/55, `vue-tsc --noEmit`, Vite production build, Capacitor Android sync, and JDK 21 Gradle debug build. The generated package is `com.fundapp.realtime 1.0.64 (65)`, v1/v2 signed; local and public APKs are 6,775,276 bytes with SHA-256 `f908299bad16328b199fc7b6478b0264cbe3755aeed594e156f0e86599e1c492`.
+- Public verification returned `/api/app/version` with `available=true` and an HTTPS download URL, and `/`, `/holding`, `/api/health`, `/v1/health`, and `/v1/state` each returned HTTP 200. A public empty-body test of `POST /api/jd/holdings/import` returned HTTP 400 with `Cache-Control: no-store, max-age=0`. Static release cutover is atomic; the retained rollback tree is `/opt/fund-app.previous-20260722T205609`, and the unrelated local `market-indices.json` was deliberately not uploaded.
+
+- Published Android debug APK `1.0.65 (66)` with the in-app JD Finance login import, restored valuation-board catalogue, watchlist name protection, and the global-QDII income attribution correction. The native JD WebView keeps its authenticated Cookie inside the App process, uses it only for the fixed holdings request, and clears the session after completion, cancellation, or failure.
+- Restored the valuation board from the preserved original catalogue into the tracked `vendor/valuation_grid/default_state.json` seed: 34 sectors and 575 funds, including 38 semiconductor funds. The production runtime state was restored without replacing positions or unrelated runtime data.
+- State resilience now recovers a missing or malformed runtime `data/state.json` from that seed, takes a server backup before a valid deletion reduces the fund count, and rejects stale page submissions with HTTP 409 rather than allowing an old browser cache to overwrite the recovered board.
+- Verification passed: state-resilience tests 3/3, frontend utility tests 7/7, backend fund-data tests 15/15, holding-settlement regression, `vue-tsc --noEmit`, Vite, Capacitor, and JDK 21 Gradle. Public `/v1/state` returns 34 sectors / 575 funds / 38 semiconductor funds; `/api/app/version` reports `1.0.65 (66)`. The 6,783,313-byte HTTPS APK matches SHA-256 `a3f1dc0bbcc825717a72fc8b777bd9fac92fde8596e06c808b69aabb1fa72ed2`.
+
+- Published Android debug APK `1.0.66 (67)` with durable yesterday-profit recovery for holdings that are deleted and later added back. The holding store now rebuilds the asset card's previous-day profit from the fund's completed official NAV and the newly entered/imported share count, rather than relying on the deleted list item's in-memory cache.
+- Holding refreshes now coalesce safely: an add or import during a background refresh schedules one follow-up pass, so the new fund cannot be skipped. Official daily-return data is still applied when a transient estimate request fails, allowing the asset card to show yesterday's profit without waiting for a live estimate.
+- Verification passed: holding-settlement regression, `vue-tsc --noEmit`, Vite build, Capacitor Android sync, JDK 21 Gradle build, package/version inspection, and APK v1/v2 signature verification. Public `/api/app/version` reports `1.0.66 (67)`; the downloaded 6,783,489-byte APK matches SHA-256 `32a88c6dff7f61a6d18042c19a087ff90264fbf95bbb211dfaea3b6c1d867d7f`.
+- This was an APK-and-metadata-only release. No server source, runtime data, or static frontend tree was uploaded.
+
+- Atomically published the completed static frontend after `1.0.66 (67)` so the durable holding yesterday-profit recovery is available in the web application as well. Only the verified `dist/` tree was uploaded; no server source, runtime data, APK metadata, or unrelated dirty worktree changes were deployed.
+- Public `/` and `/holding` return HTTP 200 with the new production entry assets. Public `assets/Holding-PLVfIsxf.js` is 47,901 bytes and its SHA-256 `a7fbe5f76fd7faa8443e89927d0ac889864b5b0cafc26f8bc15a08729a8e7cb3` matches the local production build and the staged remote file.
+- The previous static tree remains available for rollback at `/opt/fund-app.previous-20260723T002832Z`.
+
+- Restored the valuation-grid confidence contract to the original project algorithm. A settled NAV now changes only the displayed return; it no longer overwrites the holdings-coverage, holdings-staleness, and historical-deviation confidence calculation with `100%`.
+- Confirmed the fund-fitness backtest script and `fitness_cache.json` remain byte-for-byte aligned with the upstream reference. The API preserves its raw cached values and grades, including `002052 = 49.8 / C-一般` and `008021 = 65.4 / B-良好`.
+- Deployed only `valuation/core.py` to the running `valuation-grid` service after staging and compilation validation. Public `002052`, `008021`, `022891`, and `026613` now return calibrated/raw confidence `0.600`, `0.632`, `0.419`, and `0.000` rather than a forced `1.000`; public `/v1/health` is healthy. The retained file rollback is `/opt/valuation-grid/valuation/core.py.previous-20260723T004434Z`.
+- Verification passed: valuation-grid Python tests 11/11, Python compilation, targeted remote source hash comparison, and public valuation/fitness API checks.
+# 2026-07-23 - JD holdings sync, conversion adjustment, and mobile row layout
+
+- Renamed the Android flow to `京东登录导入同步` and added a 30-day request window for authenticated JD holdings data.
+- Current JD holdings now update existing local positions instead of being skipped; only the current snapshot can add a fund, so cleared funds are not restored from history.
+- Normalized and deduplicated recent JD buy, redemption, and fund-conversion records for local audit without applying them twice to current positions.
+- Added a share-based fund conversion mode to the holding swipe adjustment dialog. Both source and target rows show `调仓·转换` while pending.
+- Reworked the mobile holding row into a bounded two-column grid so status tags wrap and the three numeric columns do not overlap fund metadata.
+- Bumped the Android app to `1.0.67 (68)`; local verification covers TypeScript, holding settlement, JD normalization, Vite/Capacitor, Android compilation, signatures, and responsive browser rendering.
+
+## 2026-07-23 - Local static and backend republish
+
+- Rebuilt the production `dist` tree locally after aligning the source version files to `1.0.69 (70)`. JD holding normalization, holding settlement, fund-data service, and fund-chart service tests passed (20 checks), and `server/server.mjs` plus `server/fund-data-service.mjs` passed syntax validation.
+- Atomically published the locally built static frontend and the backend source with the dedicated deployment key. Runtime data and the locally modified market-index snapshot were deliberately excluded. The rollback tree is `/opt/fund-app.previous-20260723T161537`.
+- Public verification passed: `/api/health` restarted cleanly, the published `Holding-twbGmQIl.js` is 54,009 bytes and contains the JD sync and conversion UI, and `/api/funds/000001/daily-returns` returned a non-stale Eastmoney record for `2026-07-23` after the deploy.
+- No APK was published in this deployment. The local Android SDK has only interrupted `.installer` directories for Build-Tools `34.0.0` and `35.0.0`, so Gradle cannot verify an APK; public APK metadata remains `1.0.68 (69)` until a complete local Build-Tools package is available.
+
+## 2026-07-24 - JD transaction synchronization completion
+
+- The Android JD import now pages through the authenticated 30-day trade endpoint, maps actual `unit` share fields, retains successful/complete buy, redemption, and conversion rows, and keeps cleared-fund history out of current holdings.
+- Login completion directly persists the current holdings snapshot and all recent audit records. The holding page shows native read progress, avoids a second confirmation action, preserves the latest synced adjustment tag, and initializes the asset card from JD market value/profit before local valuation refresh.
+- The pending/synced conversion label remains `调仓·转换`; current holdings remain the sole source of position quantity so transaction history cannot be applied twice.
+- Published Android `1.0.70 (71)` and the matching static holding page. The public APK is 6,794,309 bytes with SHA-256 `b3c35d16d21658cb3a775aa9cf1a18caa60cdec63f955fd80336294dc76f0ff0`; the previous static tree is retained at `/opt/fund-app.previous-20260723T182045Z`.
+
+## 2026-07-24 - JD audit-only synchronization and official yesterday profit
+
+- Changed JD login synchronization to audit-only behavior: it stores only the authenticated 30-day buy, redemption, and conversion records plus JD's official yesterday-profit summary. It no longer creates, replaces, or refreshes local holding quantities, costs, or current asset values.
+- Preserved exact JD transaction times and status details. The holding list can show synchronized buy, sell, and conversion labels, including on the conversion target fund, while the adjustment dialog shows time, status, shares, amount, and conversion destination.
+- Persisted JD's official yesterday profit separately from automatic valuation data. The reproduced JD total and the 12-fund sum both equal `-773.50`; automatic refreshes and app restarts no longer replace that value with the former locally recalculated `-842.53`.
+- Verification passed: JD utility tests 2/2, holding settlement regression, `vue-tsc --noEmit`, Vite build, Capacitor sync, JDK 21 Gradle build, package/version inspection, APK v1/v2 signatures, and mobile browser interaction checks.
+- Atomically published the matching static frontend and Android `1.0.71 (72)` without publishing backend source. Public `Holding-BYvQf6t8.js` is 57,085 bytes with SHA-256 `620ad26d705b8bdb293d0059f079fd4ade8b1173073783edbecdbcaec0e5202f`, matching the local build.
+- Public APK metadata and the downloaded 6,795,319-byte APK match SHA-256 `4bf451f5c02566fd99187ec67c958da35d8fe48552f7a92e3c20c6e9e02ef370`. Public `/api/health` and `/v1/health` returned healthy JSON responses. Rollbacks are `/opt/fund-app.previous-20260724T1309` and `/opt/fund-proxy/data/app-version.json.previous-20260724T1309-1.0.70`.
+
+## 2026-07-24 - Grid position deletion compatibility
+
+- Investigated the unexpected grid position `020465`: its live batch was marked `导入自现有持仓`, which is written only by the grid's explicit existing-holding import flow. The upstream synchronizer already excludes `data/`; its runtime-state rule now explicitly protects both `data/state.json` and `data/positions.json`.
+- The deployed grid delete route requires `confirm=<fund key>`, while both clients still called the former URL and received HTTP 400. Both clients now include the required confirmation. The unwanted live `020465` position was removed through the protected endpoint and verified absent from public positions/signals.
+
+## 2026-07-24 - JD grid transaction import
+
+- Added a JD login action to the upper-right of the grid position-entry dialog. It reuses the Android WebView session and imports the current JD holdings' recent buy, sell, and conversion legs as grid batches.
+- The grid backend filters by the current JD holdings snapshot, records durable JD ledger ids in `positions.json`, and applies every request atomically. Retries do not duplicate batches; unmatched historical sells are reported as skipped or partial instead of aborting other transactions.
+- Verification passed: JD grid payload test, isolated valuation-grid import tests (4/4), `vue-tsc --noEmit`, Vite production build, and `git diff --check`. Full FastAPI import was not run locally because the available Python environments lack either `PIL` or `fastapi` from existing grid dependencies.
+- Public verification passed: `/api/app/version` reports `1.0.72 (73)` with `available=true`; the HTTPS APK is 6,796,236 bytes and SHA-256 `ad9fc5c5b10e767028933cb7eda4b5d89bf2a172b4eb104d1b593d7adcc3adcb`, matching the published metadata and signed local artifact. Public `/v1/health` returns healthy JSON, and an empty `POST /v1/positions/jd-import` returns HTTP 422 without writing data. The deployed `assets/ValuationGrid-C2YH8zC4.js` returns HTTP 200 and contains the JD import action. Static rollback is `/opt/fund-app.previous-20260724T145805`; grid source rollback is `/opt/valuation-grid/.jd-import-backup-20260724T145805`.
+
+## 2026-07-24 - Three-source valuation selector
+
+- Rebuilt the watchlist estimate entry as a compact, clickable `估值` control and replaced the old long source sheet with a mobile-sized selector matching the requested radio-row layout, automatic mode, recommendation, and explicit cancel/confirm actions.
+- Replanned the comparison contract around three named providers: Tiantian `FundValuationLast`, Sina Finance intraday estimate, and Eastmoney `pingzhongdata` latest published NAV. Sina's former A/B fields now remain one provider because they share one upstream response. Eastmoney and post-close Tiantian values are explicitly marked as official NAV instead of being rendered as intraday estimates.
+- Added `server/valuation_source_scraper.py` for worker or scheduled use. It uses `requests` with headers/timeouts and `BeautifulSoup` normalization, returns structured JSON, captures provider/network failures, and leaves Selenium/Playwright fallback hooks optional rather than making a browser runtime a production dependency.
+- Verification passed: live `000001` source bundle (`Tiantian 1.3720`, Sina `1.3737 / +0.34% / 16:04`, Eastmoney `1.3720 / +0.22%`), Python compilation and scraper execution, Node syntax/runtime source resolution, `vue-tsc --noEmit`, Vite production build, and `git diff --check`.
+
+## 2026-07-25 - Three-source valuation selector release
+
+- Published the static selector, the `fund-proxy` three-source backend, and Android `1.0.74 (75)` with the dedicated ED25519 deployment key. The release endpoint now returns exactly `tiantian`, `sina`, and `eastmoney` for `000001`; Sina is an intraday estimate while the available post-close Tiantian and Eastmoney records are explicitly marked as official NAV.
+- Public verification passed: `/api/health` is healthy, `/api/app/version` reports `available=true`, `1.0.74 (75)`, `6,795,689` bytes, and SHA-256 `5ed896557edffd36f8401081e49534be93c66c507bb0661f0265037a9b0ae61b`. The independently downloaded HTTPS APK has the same size and hash.
+- The first deployment target used the inactive `/opt/fund-app/server` path; the publish script now correctly updates the active `/opt/fund-proxy` service and the corrected release was verified publicly. Latest rollback locations are `/opt/fund-app.previous-20260724T161059` and `/opt/fund-proxy/.valuation-source-backup-20260724T161059`.
+
+## 2026-07-25 - Holding source selector and JD grid numeric import fix
+
+- Added the compact `估值` source control to each holding row and connected it to the same persisted three-source preference as the watchlist. Holding refresh now reads the selected Tiantian, Sina, or Eastmoney result and treats official-NAV provider responses as NAV rather than intraday estimates.
+- Hardened the JD grid importer for amount/share strings such as `1,234.56元` and `800份`; these previously failed the numeric conversion and could make every eligible trade appear as skipped. The grid completion notice now includes the backend skip-reason breakdown.
+- Local verification passed: TypeScript check, Vite production build, JD holding payload tests 2/2, JD grid payload tests 2/2, grid transaction tests 5/5, Python syntax check, and direct numeric-parser cases. This fix is built locally and awaiting an explicit production release request.
+
+## 2026-07-24 - JD grid current-holding baseline fix
+
+- Fixed the empty-import path when all JD orders predate the 30-day audit window. The grid now creates one deduplicated baseline batch from each still-held JD fund's shares and cost net value, while closed funds remain excluded.
+- The fallback runs only when JD returns no usable recent transaction rows. Existing grid positions and repeated JD imports are protected by the durable snapshot ledger id and cannot create duplicate batches.
+- Local verification passed: frontend JD/grid tests 9/9, `vue-tsc --noEmit`, isolated grid backend tests 8/8, Vite build, Capacitor sync, and a v1/v2-signed `com.fundapp.realtime 1.0.73 (74)` APK (`6,795,490` bytes, SHA-256 `0541d22b7235a647d9778c54a7664c4074298cbe9419989891f027ab9fc31888`).
+- Published and publicly verified `1.0.73 (74)`: `/api/app/version` returns `available=true` and the HTTPS APK has the same `6,795,490` bytes and SHA-256. Public `/low-frequency-grid` and `assets/ValuationGrid-CsewyQ-Q.js` return HTTP 200; the deployed bundle contains `current_holdings`. Rollbacks: `/opt/fund-app.previous-20260724T155637` and `/opt/valuation-grid/.jd-import-backup-20260724T155637`.
+
+## 2026-07-25 - JD grid full-history and snapshot-cost import
+
+- Replaced the legacy JD current-holding request with the new web holding list and per-fund detail interfaces. The detail response contains JD's actual holding amount, shares, cost amount, and cost unit price; no external NAV is used to infer a position.
+- Expanded the grid-specific Android order reader from the former 30-day window to paginated account history. It preserves JD confirmation/trade timestamps in preference to order-creation timestamps, and the grid importer applies legs in that actual chronological order. A snapshot without a real JD trade date is now reported as skipped instead of creating a fictitious current-day batch.
+- Published and publicly verified Android `1.0.78 (79)`. Public `/api/app/version` reports `available=true`; the HTTPS APK is `6,801,186` bytes with SHA-256 `e6f45a7bfea57445a85ba6cd3c60a827664d3251e39ee8bf419b6ff7b558c528`, matching the signed local artifact. The grid health endpoint reports `ok`. Rollbacks: `/opt/fund-app.previous-20260724T235744` and `/opt/valuation-grid/.jd-import-backup-20260724T235744`.
+
+## 2026-07-25 - JD grid live trade-list import repair
+
+- Captured the authenticated JD H5 trade-order page and replaced the incompatible legacy request parameters with its verified `FUND` request: real 20-row pagination, `pageType=na`, title/client fields, and the ten-year timestamp window. The response exposes `tradeOrderVoList` with `bizTime`, `unit`, `allAmount`, `productId`, and trade status, which the native importer now converts into chronological grid batches.
+- The grid keeps the strict real-date guard. It now distinguishes missing JD cost/share values from a missing real transaction date, so the result message no longer claims a valid-cost position lacks cost data.
+- Published and publicly verified Android `1.0.80 (81)`. Public `/api/app/version` reports `available=true`; the downloaded HTTPS APK is `6,801,207` bytes with SHA-256 `ffa282cc60772cd01f26980bc2575e24a3150c71d093a66b9332cc549906ea57`, matching published metadata and the signed local artifact. Public `/v1/health` is `ok`, and the public `ValuationGrid-DZbe9fJr.js` SHA-256 matches the deployed local bundle. Rollbacks: `/opt/fund-app.previous-20260725T005404` and `/opt/valuation-grid/.jd-import-backup-20260725T005404`.
+## 2026-07-25 - JD grid historical buy amount repair
+- Fixed imports where a genuine JD buy carries shares but no order amount. The grid now requests sufficient paginated official NAV history for that transaction's actual date and calculates only that missing order amount as `shares * same-day published NAV`.
+- This preserves the real JD buy/sell timestamps and does not synthesize a batch from the current holding cost or latest NAV. A regression case covers a 2024 buy and verifies the importer requests more than the former 90-day history window.
+- The release script now includes `valuation/providers.py` in the same backup, upload, compile, and rollback transaction as the grid API, so the historical NAV pagination is deployed with its caller.
+- Published Android `1.0.83 (84)`, the matching static grid, and the grid API on 2026-07-25. Local checks passed: JD grid client test, isolated grid API/import tests, Python compilation, Vite production build, Capacitor sync, and Android v1/v2 signature verification.
+- Public verification passed through `https://tyingfund.com`: the release endpoint reports `available=true`, `1.0.83 (84)`, 6,802,282 bytes, and SHA-256 `fb993c6fdc617780b335c7e472ba85bd323543a1606c9b200ff4fdb5d46c6501`; an independently downloaded HTTPS APK has the same size and hash. `/v1/health` returns `{\"status\":\"ok\"}` and `/low-frequency-grid` returns HTTP 200.
+- Rollbacks: `/opt/fund-app.previous-20260725T055042`, `/opt/valuation-grid/.jd-import-backup-20260725T055042`, and `/opt/fund-proxy/data/app-version.json.previous-20260725T055042`.
+
+## 2026-07-25 - JD Finance scheme and timeline bootstrap performance
+
+- Kept the verified JD Finance fund-detail route: `jdmobile://share?jumpType=7&jumpUrl=<encoded lc.jr.jd.com fund URL>`, with `jumpType=7` and the existing `fundUtmSource=340` / `fundUtmParam=AppShare` parameters. Android now launches that scheme explicitly through the installed `com.jd.jrapp` client instead of relying on a WebView anchor handler.
+- Reworked the native transaction reader to load one authenticated JD transaction page and paginate its decoded cross-fund timeline, replacing the prior one-page-per-holding loop. Current-position cycle reconciliation remains unchanged, so closed funds are still excluded and transaction dates are still sourced from JD records.
+- Added bridge-log suppression so the Cookie argument is not written to Android logcat. Local `1.0.87 (88)` builds, TypeScript checking, and JD utility tests passed; the device click test entered `com.jd.jrapp` successfully. This build is local-only pending a real-device sync-completeness test and production release request.
+
+## 2026-07-25 - JD queryTradeOrderList decoded pagination repair
+
+- Replaced the WebView importer’s network-response interception with a narrow hook at the JD trade page’s decoded `tradeOrderVoList` handoff. `queryTradeOrderList` is encrypted in transit, so no capture-file decryption, Cookie extraction, or request replay is used.
+- The hook preserves the JD page’s actual 20-row pagination rule, records each decoded page once, and requests the next page only after the page has completed its own callback. The normalized grid path still retains only transactions relevant to the current JD position set.
+- Local Android debug build `1.0.88 (89)` is prepared for device sync verification. It has not been published.
+
+## 2026-07-25 - JD fund-detail record import redesign
+
+- Replaced the active grid and holding Cookie import timeline with the new JD fund-detail-page flow. It reads the current holding snapshot, opens each fund detail page, expands its holding information, enters the fund-specific transaction record, and normalizes only plain transaction rows for that fund.
+- The former account-wide `queryTradeOrderList` path is no longer called by either importer. A missing fund transaction entry or an unfinished page now fails the entire import before any grid mutation, preventing partial fund coverage from corrupting existing batches.
+- Local Android debug build `1.0.89 (90)` is for device verification only and has not been published.
+
+## 2026-07-25 - JD daily-income detail route release
+
+- Removed the incomplete account-wide transaction tab from the active single-fund import path. The importer now reaches only the fund detail route supplied by JD, opens the detail page's holding-information expander, then enters that fund's own transaction record.
+- The importer remains serial by design: one authenticated WebView navigation owns each fund detail and record timeline, preventing concurrent page transitions from mixing funds or triggering JD rate limits. Progress reports the current fund index and total count.
+
+## 2026-07-25 - JD Roma detail WebView host correction
+
+- Corrected the published detail-page script gate from `*.jr.jd.com` to the verified JD HTTPS host set. The real rendered fund-detail page is `roma.jd.com`; the former gate prevented the expander and per-fund transaction-record bootstrap from running at all and caused a deterministic timeout for `018147`.

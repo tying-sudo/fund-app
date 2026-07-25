@@ -10,19 +10,21 @@ import { useRouter } from 'vue-router'
 import { useHoldingStore } from '@/stores/holding'
 import { useFundStore } from '@/stores/fund'
 import { useSettingsStore } from '@/stores/settings'
-import { searchFund, fetchFundEstimate, fetchFundList, detectShareClass, fetchFundFeeInfo, calculateBuyFee } from '@/api/fund'
+import { searchFund, fetchFundEstimate, detectShareClass, fetchFundFeeInfo, calculateBuyFee } from '@/api/fund'
 import { fetchRealDayChange } from '@/api/fundFast'
 import { API_BASE_URL } from '@/config/api'
 import { showConfirmDialog, showToast, showLoadingToast, closeToast, showDialog } from 'vant'
 import { formatMoney, formatPercent, getChangeStatus, getJdFundLink } from '@/utils/format'
 import MarketIndexBoard from '@/components/MarketIndexBoard.vue'
-import type { FundInfo, HoldingRecord, FundShareClass, FundFeeInfo, PendingAdjustment } from '@/types/fund'
+import DataSourceSelector from '@/components/DataSourceSelector.vue'
+import { DATA_SOURCE_CONFIG, type DataSource, type FundInfo, type HoldingRecord, type FundShareClass, type FundFeeInfo, type PendingAdjustment, type SyncedAdjustment } from '@/types/fund'
 
-import { createWorker } from 'tesseract.js'
 import { getTodayStr, getValuationComparisonState, isEstimateDateToday, isTradingHours as isBeijingTradingHours, PRECISION, round } from '@/utils/holdingCalculator'
-import { getSettlementNavStartDate } from '@/utils/tradingDate'
-import { deriveHoldingImportBasis } from '@/utils/holdingImport'
-import { parseLocalHoldingText, resolveLocalFund } from '@/utils/localHoldingOcr'
+import { getAdjustmentConfirmationAt, getSettlementNavStartDate } from '@/utils/tradingDate'
+import { deriveHoldingImportBasis, parseHoldingImportNumber } from '@/utils/holdingImport'
+import { openAlipayFundDetail } from '@/utils/alipayFund'
+import { openJdFundDetail } from '@/utils/jdFund'
+import { hasReachedJdConfirmationWindow, importJdHoldings, type JdSyncProgress } from '@/utils/jdHoldings'
 
 // 集成风控系统和日志模块
 import { getRiskController } from '@/utils/riskControl'
@@ -35,6 +37,32 @@ const settingsStore = useSettingsStore()
 const marketIndexBoard = ref<{ refresh: () => Promise<void> } | null>(null)
 let autoRefreshTimer: ReturnType<typeof setTimeout> | null = null
 let autoRefreshActive = false
+const confirmationClock = ref(Date.now())
+let confirmationClockTimer: ReturnType<typeof setInterval> | null = null
+const showDataSourceSelector = ref(false)
+const dataSourceTargetCode = ref('')
+const dataSourceTargetName = ref('')
+
+function openDataSourceSelector(code: string, name: string) {
+  dataSourceTargetCode.value = code
+  dataSourceTargetName.value = name
+  showDataSourceSelector.value = true
+}
+
+async function applyHoldingDataSource(source: DataSource) {
+  const code = dataSourceTargetCode.value
+  if (!code) return
+  showLoadingToast({ message: `正在切换至${DATA_SOURCE_CONFIG[source].name}...`, forbidClick: true, duration: 0 })
+  try {
+    await fundStore.setFundDataSource(code, source)
+    await holdingStore.refreshEstimates()
+    closeToast()
+    showToast(`持仓估值已切换至${DATA_SOURCE_CONFIG[source].name}`)
+  } catch (error) {
+    closeToast()
+    showToast(error instanceof Error ? error.message : '估值来源切换失败')
+  }
+}
 
 function scheduleAutoRefresh() {
   if (autoRefreshTimer) clearTimeout(autoRefreshTimer)
@@ -64,6 +92,18 @@ function stopAutoRefresh() {
   autoRefreshActive = false
   if (autoRefreshTimer) clearTimeout(autoRefreshTimer)
   autoRefreshTimer = null
+}
+
+function startConfirmationClock() {
+  confirmationClock.value = Date.now()
+  confirmationClockTimer = setInterval(() => {
+    confirmationClock.value = Date.now()
+  }, 60_000)
+}
+
+function stopConfirmationClock() {
+  if (confirmationClockTimer) clearInterval(confirmationClockTimer)
+  confirmationClockTimer = null
 }
 
 watch(
@@ -194,7 +234,7 @@ const formData = ref({
 // ========== 调仓（加仓/减仓）相关 ==========
 // [WHY] 支持对已有持仓进行加仓或减仓操作
 const showTradeDialog = ref(false)
-const tradeMode = ref<'add' | 'reduce'>('add')  // 加仓 或 减仓
+const tradeMode = ref<'add' | 'reduce' | 'convert'>('add')
 const tradeFundCode = ref('')
 const tradeFundName = ref('')
 
@@ -213,10 +253,27 @@ const reduceTradeForm = ref({
   tradeTimeSlot: 'after' as 'before' | 'after'
 })
 
+const convertTradeForm = ref({
+  shares: '',
+  targetKeyword: '',
+  targetCode: '',
+  targetName: '',
+  tradeDate: '',
+  tradeTimeSlot: 'after' as 'before' | 'after'
+})
+const convertSearchResults = ref<FundInfo[]>([])
+
 /** 当前基金待确认调仓记录 */
 const currentPendingAdjustments = computed<PendingAdjustment[]>(() =>
   holdingStore.pendingAdjustments.filter(
-    (p: PendingAdjustment) => p.code === tradeFundCode.value && p.status === 'pending'
+    (p: PendingAdjustment) => (p.code === tradeFundCode.value || (p.type === 'convert' && p.targetCode === tradeFundCode.value)) && p.status === 'pending'
+  )
+)
+
+/** JD records are audit-only and never enter the pending settlement engine. */
+const currentSyncedAdjustments = computed<SyncedAdjustment[]>(() =>
+  holdingStore.syncedAdjustments.filter(
+    (item: SyncedAdjustment) => item.code === tradeFundCode.value || (item.type === 'convert' && item.targetCode === tradeFundCode.value)
   )
 )
 
@@ -253,6 +310,15 @@ function openTradeDialog(code: string, name: string) {
     tradeDate: getTodayStr(),
     tradeTimeSlot: isTradingHours.value ? 'before' : 'after'
   }
+  convertTradeForm.value = {
+    shares: '',
+    targetKeyword: '',
+    targetCode: '',
+    targetName: '',
+    tradeDate: getTodayStr(),
+    tradeTimeSlot: isTradingHours.value ? 'before' : 'after'
+  }
+  convertSearchResults.value = []
   
   // 默认显示加仓模式
   tradeMode.value = 'add'
@@ -363,7 +429,7 @@ async function confirmReduceTrade() {
 
   const currentShares = holding.shares || 0
   const pendingReduceShares = holdingStore.pendingAdjustments
-    .filter((item: PendingAdjustment) => item.code === code && item.type === 'reduce' && item.status === 'pending')
+    .filter((item: PendingAdjustment) => item.code === code && (item.type === 'reduce' || item.type === 'convert') && item.status === 'pending')
     .reduce((total: number, item: PendingAdjustment) => total + item.shares, 0)
   const availableShares = Math.max(0, currentShares - pendingReduceShares)
   if (sellShares > availableShares) {
@@ -436,6 +502,94 @@ async function confirmReduceTrade() {
   }
 }
 
+async function searchConvertFund() {
+  const keyword = convertTradeForm.value.targetKeyword.trim()
+  if (!keyword) {
+    convertSearchResults.value = []
+    return
+  }
+  try {
+    convertSearchResults.value = await searchFund(keyword, 8)
+  } catch {
+    convertSearchResults.value = []
+  }
+}
+
+function selectConvertFund(fund: FundInfo) {
+  convertTradeForm.value.targetCode = fund.code
+  convertTradeForm.value.targetName = fund.name
+  convertTradeForm.value.targetKeyword = fund.name
+  convertSearchResults.value = []
+}
+
+async function confirmConvertTrade() {
+  const code = tradeFundCode.value
+  const holding = holdingStore.getHoldingByCode(code)
+  const targetCode = convertTradeForm.value.targetCode
+  if (!holding) {
+    showToast('持仓记录不存在')
+    return
+  }
+  if (!/^\d{6}$/.test(targetCode) || !convertTradeForm.value.targetName) {
+    showToast('请选择转入基金')
+    return
+  }
+  if (targetCode === code) {
+    showToast('转入基金不能与当前基金相同')
+    return
+  }
+
+  const shares = parseFloat(convertTradeForm.value.shares)
+  const reservedShares = holdingStore.pendingAdjustments
+    .filter((item: PendingAdjustment) => item.code === code && item.status === 'pending' && (item.type === 'reduce' || item.type === 'convert'))
+    .reduce((total: number, item: PendingAdjustment) => total + item.shares, 0)
+  const availableShares = Math.max(0, (holding.shares || 0) - reservedShares)
+  if (!shares || shares <= 0 || shares > availableShares) {
+    showToast(`请输入不超过 ${availableShares.toFixed(2)} 份的转换份额`)
+    return
+  }
+
+  showLoadingToast({ message: '处理中...', forbidClick: true })
+  try {
+    const [sourceEstimate, targetEstimate] = await Promise.all([
+      fetchFundEstimate(code),
+      fetchFundEstimate(targetCode)
+    ])
+    const sourceNav = parseFloat(sourceEstimate.gsz) || parseFloat(sourceEstimate.dwjz) || 1
+    const targetNav = parseFloat(targetEstimate.gsz) || parseFloat(targetEstimate.dwjz) || 1
+    const ratio = shares / (holding.shares || shares)
+    const transferredCost = (holding.amount || 0) * ratio
+    const targetShares = shares * sourceNav / targetNav
+    const { confirmDate } = calcTradeDates(convertTradeForm.value.tradeDate, convertTradeForm.value.tradeTimeSlot)
+
+    await holdingStore.addPendingAdjustment({
+      id: generateId(),
+      code,
+      name: holding.name,
+      type: 'convert',
+      tradeDate: convertTradeForm.value.tradeDate,
+      timeSlot: convertTradeForm.value.tradeTimeSlot,
+      confirmDate,
+      amount: round(transferredCost, PRECISION.AMOUNT),
+      shares: round(shares, 4),
+      fee: 0,
+      nav: sourceNav,
+      targetCode,
+      targetName: convertTradeForm.value.targetName,
+      targetShares: round(targetShares, 4),
+      status: 'pending',
+      createdAt: Date.now()
+    })
+    closeToast()
+    showToast(`已记录转换，将按 ${confirmDate} 起的官方净值自动结算`)
+    await holdingStore.refreshEstimates()
+  } catch (error) {
+    closeToast()
+    console.error('[转换待确认] 操作失败:', error)
+    showToast('转换失败，请重试')
+  }
+}
+
 
 // ========== A/C类费用相关 ==========
 const shareClass = ref<FundShareClass>('A')
@@ -462,6 +616,7 @@ const isPullRefreshing = ref(false)
 onMounted(async () => {
   await holdingStore.initHoldings()
   startAutoRefresh()
+  startConfirmationClock()
   // [WHAT] 点击外部关闭下拉菜单
   document.addEventListener('click', closeAllDropdowns)
 })
@@ -469,6 +624,7 @@ onMounted(async () => {
 // [WHAT] 页面卸载时移除事件监听
 onUnmounted(() => {
   stopAutoRefresh()
+  stopConfirmationClock()
   document.removeEventListener('click', closeAllDropdowns)
 })
 
@@ -496,17 +652,54 @@ const getComparisonState = (holding: any) => getValuationComparisonState({
 })
 
 /** 获取某基金的待确认调仓标签列表 */
-function getPendingTags(holding: any): { label: string; type: 'add' | 'reduce' }[] {
+function getPendingTags(holding: any): { label: string; type: 'add' | 'reduce' | 'convert' }[] {
+  const now = confirmationClock.value
   const list = holdingStore.pendingAdjustments.filter(
-    (p: PendingAdjustment) => p.code === holding.code && p.status === 'pending'
+    (p: PendingAdjustment) => (p.code === holding.code || (p.type === 'convert' && p.targetCode === holding.code))
+      && p.status === 'pending'
+      && now < getAdjustmentConfirmationAt(p.tradeDate, p.timeSlot)
   )
   return list.map((p: PendingAdjustment) => ({
-    label: p.type === 'add' ? '调仓·买入' : '调仓·卖出',
+    label: p.type === 'add' ? '调仓·买入' : p.type === 'reduce' ? '调仓·卖出' : '调仓·转换',
     type: p.type
   }))
 }
 
 // [WHAT] 状态标签文本（根据盘中/盘后 + realChange 是否获取到来判断）
+function getSyncedTags(holding: any): { label: string; title: string; type: 'add' | 'reduce' | 'convert' }[] {
+  const now = confirmationClock.value
+  const seen = new Set<string>()
+  return holdingStore.syncedAdjustments
+    .filter((item: SyncedAdjustment) => (item.code === holding.code || (item.type === 'convert' && item.targetCode === holding.code))
+      && !hasReachedJdConfirmationWindow(item, now))
+    .flatMap((item: SyncedAdjustment) => {
+      if (seen.has(item.type)) return []
+      seen.add(item.type)
+      return [{
+        label: item.type === 'add' ? '调仓·买入' : item.type === 'reduce' ? '调仓·卖出' : '调仓·转换',
+        title: `${item.tradeTime || item.tradeDate} · ${item.status || '已同步'}`,
+        type: item.type
+      }]
+    })
+    .slice(0, 3)
+}
+
+function formatSyncedTradeTime(item: SyncedAdjustment): string {
+  return item.tradeTime || item.tradeDate
+}
+
+function getSyncedTradeDetail(item: SyncedAdjustment): string {
+  const shares = item.shares ? `${formatMoney(item.shares)} 份` : ''
+  const amount = item.amount ? `${formatMoney(item.amount)} 元` : ''
+  if (item.type === 'convert') {
+    const target = item.targetName || item.targetCode || '目标基金'
+    return [`转入 ${target}`, shares ? `转出 ${shares}` : '', item.targetShares ? `转入 ${formatMoney(item.targetShares)} 份` : '']
+      .filter(Boolean)
+      .join(' · ')
+  }
+  return [shares, amount].filter(Boolean).join(' · ') || '京东交易记录'
+}
+
 const getStatusTag = (holding: any) => {
   // 如果还在加载中，显示"加载中"
   if (holding.loading) {
@@ -1093,6 +1286,7 @@ function goToDetail(code: string) {
 // [WHY] 支持从截图/照片中识别基金代码，批量导入持仓
 
 const showImportDialog = ref(false)
+const isJdImporting = ref(false)
 const importImagePreview = ref('')
 const importImageFile = ref<File | null>(null)
 const isImporting = ref(false)
@@ -1104,10 +1298,31 @@ const extractedFunds = ref<Array<{
   profit?: string;       // 持有收益盈亏
   rate?: string;         // 持有收益率 (如 "6.3")
   costPrice?: string;    // 成本单价/成本净值 (计算得出)
+  shares?: string;       // 京东返回的当前实际份额
+  yesterdayIncome?: string;
   shareClass: string;     // A/C/B
   selected: boolean
   matchConfidence?: string;  // 匹配置信度：'exact'|'contains'|'similarity'|'auto'|'none'|'error'
 }>>([])
+const jdImportedAdjustments = ref<SyncedAdjustment[]>([])
+const jdSyncProgress = ref({ message: '正在打开京东金融...', percentage: 5 })
+
+function updateJdSyncProgress(progress: JdSyncProgress | { stage: string; message: string; current?: number; total?: number }) {
+  const basePercent: Record<string, number> = {
+    login: 10,
+    reading_holdings: 30,
+    reading_trades: 42,
+    normalizing: 78,
+    saving: 86,
+    refreshing: 94,
+    completed: 100
+  }
+  const pageBonus = progress.stage === 'reading_trades' ? Math.min(28, Math.max(0, (progress.current || 1) - 1) * 8) : 0
+  jdSyncProgress.value = {
+    message: progress.message,
+    percentage: Math.min(100, (basePercent[progress.stage] || 10) + pageBonus)
+  }
+}
 
 // [NEW] 手动补全相关状态
 const showManualComplete = ref(false)  // 是否显示手动补全面板
@@ -1191,13 +1406,12 @@ const fileInputRef = ref<HTMLInputElement | null>(null)
 
 // [NEW] OCR模式选择相关
 const showOcrMenu = ref(false)  // 二级菜单显示状态
-const ocrMode = ref<'local' | 'ai'>('local')  // 当前选择的OCR模式: local=本地Tesseract, ai=智谱GLM-OCR
 const ocrMenuRef = ref<HTMLElement | null>(null)  // 菜单ref用于点击外部关闭
 
 // [NEW] OCR选项列表
-const ocrOptions = [
-  { value: 'local' as const, label: '本地OCR识别', icon: 'photo-o', desc: '使用Tesseract.js本地识别' },
-  { value: 'ai' as const, label: 'AI智能识别', icon: 'fire-o', desc: '使用智谱GLM-OCR云识别(更精准)' }
+const importOptions = [
+  { value: 'jd' as const, label: '京东账户读取', icon: 'balance-o', desc: '登录后读取当前持仓、本轮建仓调仓记录与昨日收益' },
+  { value: 'ai' as const, label: 'AI 智能识别', icon: 'scan', desc: '识别持仓截图' }
 ]
 
 // [WHAT] 触发二级菜单
@@ -1207,10 +1421,13 @@ function triggerOcrMenu(event: Event) {
 }
 
 // [WHAT] 选择OCR模式并触发文件选择
-function selectOcrMode(mode: 'local' | 'ai') {
-  ocrMode.value = mode
+async function selectImportOption(mode: 'jd' | 'ai') {
   showOcrMenu.value = false
-  fileInputRef.value?.click()
+  if (mode === 'jd') {
+    await importJdAccount()
+  } else {
+    fileInputRef.value?.click()
+  }
 }
 
 // [WHAT] 关闭二级菜单
@@ -1228,10 +1445,6 @@ onMounted(() => {
 })
 
 // [WHAT] 触发文件选择（保留兼容性）
-function triggerImportImage() {
-  selectOcrMode(ocrMode.value)  // 使用上次选择的模式
-}
-
 // [WHAT] 处理选择的图片
 function handleImageSelected(event: Event) {
   const input = event.target as HTMLInputElement
@@ -1248,7 +1461,7 @@ function handleImageSelected(event: Event) {
   importImagePreview.value = URL.createObjectURL(file)
   extractedFunds.value = []
   showImportDialog.value = true
-  
+
   // [WHAT] 重置 input 允许重复选择同一文件
   input.value = ''
 }
@@ -1257,7 +1470,7 @@ function handleImageSelected(event: Event) {
 // [REWRITE] 使用智谱GLM-OCR进行AI智能识别
 async function startAiOcrImport() {
   if (!importImageFile.value) return
-  
+
   isImporting.value = true
   importProgress.value = 10
   extractedFunds.value = []
@@ -1279,7 +1492,7 @@ async function startAiOcrImport() {
         file: base64
       })
     })
-    
+
     if (!response.ok) {
       const payload = await response.json().catch(() => null)
       throw new Error(payload?.error || `API请求失败: ${response.status}`)
@@ -1289,10 +1502,10 @@ async function startAiOcrImport() {
     console.log('🤖 GLM-OCR API响应接收完成')
     
     importProgress.value = 60
-    
+
     // ========== 核心重构：智能提取基金数据 ==========
     const fundData = extractFundDataFromAI(result)
-    
+
     console.log(`🤖 AI识别完成: ${fundData.length} 只基金`)
     
     if (fundData.length === 0) {
@@ -1303,9 +1516,9 @@ async function startAiOcrImport() {
     
     // 直接填充结果（已包含完整数据）
     extractedFunds.value = fundData
-    
+
     importProgress.value = 100
-    
+
   } catch (error: any) {
     console.error('GLM-OCR AI识别失败:', error)
     showToast(`AI识别失败: ${error.message}`)
@@ -1336,526 +1549,54 @@ function extractFundDataFromAI(result: any): any[] {
     })
 }
 
-// [NEW] 将表格行解析为单个基金对象
-function parseTableToFund(rows: string[]): any | null {
-  if (rows.length === 0) return null
-  
-  // 合并所有行的内容
-  const mergedText = rows.join(' ')
-  console.log(`    合并后: "${mergedText.substring(0, 80)}"`)
-  
-  // 提取基金名称（中文开头，到数字或特殊字符结束）
-  const nameMatch = mergedText.match(/^([\u4e00-\u9fa5][\u4e00-\u9fa5A-Za-z()（）QDIIETF联接股票混合债券指数发起式]+)/)
-  let fundName = nameMatch ? nameMatch[1].trim() : ''
-  
-  // 清理名称末尾可能的截断标记
-  fundName = fundName.replace(/[…\.]{1,3}\s*$/, '').trim()
-  
-  if (fundName.length < 4) {
-    console.log(`    ⚠️ 名称太短或未找到: "${fundName}"`)
-    return null
-  }
-  
-  // 提取金额（格式如 2,700.85 或 2700.85）
-  let amount = ''
-  const amountMatch = mergedText.match(/(\d{1,3}(?:,\d{3})+\.\d{2})/)
-  if (amountMatch) amount = amountMatch[1]
-  
-  // 提取盈亏（带正负号）
-  let profit = ''
-  const profitMatches = mergedText.match(/[+-]\d{1,3}(?:,\d{3})*\.\d{2}/g)
-  if (profitMatches && profitMatches.length >= 1) {
-    profit = profitMatches.find(p => Math.abs(parseFloat(p.replace(/,/g, ''))) > 10) || profitMatches[0]
-  }
-  
-  // 提取收益率（百分比）
-  let rate = ''
-  const rateMatch = mergedText.match(/([+-]?\d+\.?\d*)\s*%/)
-  if (rateMatch) rate = rateMatch[1] + '%'
-  
-  return {
-    code: '',
-    name: fundName,
-    amount: amount || undefined,
-    profit: profit || undefined,
-    rate: rate || undefined,
-    shareClass: '',
-    selected: true,
-    _source: 'ai-table'
-  }
-}
+async function importJdAccount() {
+  if (isJdImporting.value) return
+  isJdImporting.value = true
+  updateJdSyncProgress({ stage: 'reading_holdings', message: '正在读取京东当前持仓...' })
+  showLoadingToast({ message: '正在读取京东当前持仓...', forbidClick: true, duration: 0 })
+  try {
+    const result = await importJdHoldings({ onProgress: updateJdSyncProgress })
+    const syncedAt = Date.now()
+    jdImportedAdjustments.value = result.adjustments.map((item) => ({
+      ...item,
+      source: 'jd' as const,
+      name: item.name || holdingStore.getHoldingByCode(item.code)?.name || item.code,
+      shares: parseHoldingImportNumber(item.shares) ?? undefined,
+      amount: parseHoldingImportNumber(item.amount) ?? undefined,
+      targetShares: parseHoldingImportNumber(item.targetShares) ?? undefined,
+      syncedAt
+    }))
+    if (!result.summary && jdImportedAdjustments.value.length === 0) {
+      closeToast()
+      showToast('京东账户暂无可同步的调仓或收益记录')
+      return
+    }
 
-// [NEW] 解析Markdown文本中的基金列表（同时适配AI OCR和本地Tesseract OCR）
-function parseMarkdownTextFunds(text: string): any[] {
-  console.log(`📝 Markdown文本解析, 长度: ${text.length}字符`)
-  const funds: any[] = []
-  
-  // 移除Markdown图片标记和URL
-  text = text.replace(/!\[.*?\]\(.*?\)/g, '')
-  text = text.replace(/https?:\/\/\S+/g, '')
-  
-  // 分割成行（Tesseract可能有更短的行，放宽到>2字符）
-  let lines = text.split('\n').map(l => l.trim()).filter(l => l.length > 2)
-  
-  // 过滤UI和标题行
-  lines = lines.filter(line => {
-    if (/^(基金持仓|我的持有|近期交易排序|全部\(\d+\)|股票型|债券型|混合|基金名称|金额|持仓收益|更新|人气|图片识别)/.test(line)) return false
-    if (/大家都在买|热度王|聪明钱|加仓人数|爆品|年内涨幅|近\d+月涨|一周自选榜|光模块No/.test(line)) return false
-    if (/交易：.*买入中合计/.test(line)) return false
-    return true
-  })
-  
-  console.log(`📝 过滤后行数: ${lines.length}`)
-  if (lines.length < 3) return funds
-  
-  // 将连续行分组为基金块：
-  // 每个基金块以"中文名称行"开始，后续行包含数字（金额/盈亏/收益率）
-  const fundBlocks: string[][] = []
-  let currentBlock: string[] = []
-  
-  for (const line of lines) {
-    const hasChineseName = /^[\u4e00-\u9fa5]{2,}/.test(line)
-    const hasPercent = /%/.test(line)
-    const isAmountLine = /[\d,]+\.\d{2}/.test(line) && !hasChineseName
-    
-    if (hasChineseName) {
-      // 新基金开始，保存上一个块
-      if (currentBlock.length > 0) {
-        fundBlocks.push([...currentBlock])
-      }
-      currentBlock = [line]
-    } else if (currentBlock.length > 0 && (isAmountLine || hasPercent || /^[+-]/.test(line))) {
-      // 数字行属于当前基金
-      currentBlock.push(line)
-    } else {
-      // 其他行，保存当前块并清空
-      if (currentBlock.length > 0) {
-        fundBlocks.push([...currentBlock])
-        currentBlock = []
-      }
-    }
+    updateJdSyncProgress({ stage: 'saving', message: '正在保存调仓记录与京东收益...' })
+    const synced = await holdingStore.syncJdData(
+      jdImportedAdjustments.value,
+      result.summary ? {
+        source: 'jd',
+        yesterdayProfit: result.summary.yesterdayProfit,
+        yesterdayBaseValue: result.summary.yesterdayBaseValue,
+        profitDate: result.summary.profitDate,
+        syncedOn: getTodayStr(),
+        syncedAt
+      } : undefined
+    )
+    updateJdSyncProgress({ stage: 'completed', message: '同步完成' })
+    closeToast()
+    const details = [
+      `${synced.adjustments} 条本轮建仓调仓记录`,
+      synced.summary && result.summary ? `昨日收益 ${formatMoney(result.summary.yesterdayProfit)}` : ''
+    ].filter(Boolean).join('，')
+    showToast(`同步完成：${details}`)
+  } catch (error: any) {
+    showToast(error?.message || '京东持仓读取失败')
+  } finally {
+    if (jdSyncProgress.value.percentage < 100) closeToast()
+    isJdImporting.value = false
   }
-  if (currentBlock.length > 0) {
-    fundBlocks.push(currentBlock)
-  }
-  
-  console.log(`📝 基金块数量: ${fundBlocks.length}`)
-  
-  for (const block of fundBlocks) {
-    const mergedText = block.join(' ')
-    console.log(`  基金块: "${mergedText.substring(0, 80)}"`)
-    const fund = parseFundLine(mergedText)
-    if (fund) {
-      funds.push(fund)
-      console.log(`  ✅ ${fund.name} | ¥${fund.amount} | ${fund.profit} | ${fund.rate}`)
-    }
-  }
-  
-  return funds
-}
-
-// [NEW] 解析单行基金文本（适配AI和Tesseract）
-function parseFundLine(line: string): any | null {
-  // 移除常见垃圾字符和OCR噪声
-  line = line.replace(/[×]/g, ' ').replace(/\s+/g, ' ').trim()
-  if (line.length < 10) return null
-  
-  // 提取基金名称（从开头的中文开始，到第一个数字/金额之前）
-  // 支持中文、英文、括号、特殊基金类型词
-  const nameMatch = line.match(/^([\u4e00-\u9fa5][\u4e00-\u9fa5A-Za-z0-9()（）QDIIETFLOF联接股票混合债券指数发起式]+?)(?:\s+|\d)/)
-  let fundName = nameMatch ? nameMatch[1].trim() : ''
-  fundName = fundName.replace(/[…\.]{1,3}$/, '').trim()
-  
-  // 清理名称末尾可能粘着的数字或单位
-  fundName = fundName.replace(/\d+$/, '').trim()
-  
-  if (fundName.length < 4) {
-    console.log(`    ⚠️ 名称太短: "${fundName}"`)
-    return null
-  }
-  
-  // 提取数字（支持逗号分隔和无逗号）
-  const numbers = line.match(/[+-]?\d{1,3}(?:,\d{3})*\.\d{2}/g) || []
-  const simpleNumbers = line.match(/[+-]?\d+\.\d{2}/g) || []
-  const allNumbers = [...new Set([...numbers, ...simpleNumbers])]
-  
-  const percentages = line.match(/([+-]?\d+\.?\d*)\s*%/g) || []
-  
-  console.log(`    名称="${fundName}", 数字=${allNumbers.length}, 百分比=${percentages.length}`)
-  
-  if (allNumbers.length < 1 && percentages.length < 1) {
-    console.log(`    ⚠️ 缺少数字或收益率`)
-    return null
-  }
-  
-  // 金额：通常是第一个大数字（>100）
-  let amount = ''
-  for (const num of allNumbers) {
-    const value = parseFloat(num.replace(/,/g, ''))
-    if (value > 100) {
-      amount = num
-      break
-    }
-  }
-  
-  // 盈亏：有正负号且非金额的最大数字
-  let profit = ''
-  let maxProfitAbs = 0
-  const amountValue = amount ? parseFloat(amount.replace(/,/g, '')) : 0
-  for (const num of allNumbers) {
-    const value = parseFloat(num.replace(/,/g, ''))
-    if (Math.abs(value - amountValue) > 0.01 && Math.abs(value) > maxProfitAbs) {
-      profit = num
-      maxProfitAbs = Math.abs(value)
-    }
-  }
-  
-  // 收益率
-  let rate = ''
-  const rateMatch = line.match(/([+-]?\d+\.?\d*)\s*%/)
-  if (rateMatch) rate = rateMatch[1] + '%'
-  
-  return {
-    code: '',
-    name: fundName,
-    amount: amount || undefined,
-    profit: profit || undefined,
-    rate: rate || undefined,
-    shareClass: '',
-    selected: true,
-    _source: 'ai-markdown'
-  }
-}
-
-// [NEW] 备选：从混合内容中提取基金
-function parseMixedContentFunds(text: string): any[] {
-  console.log(`🔀 进入混合内容解析模式`)
-  const funds: any[] = []
-  
-  // 基于截图数据的已知模式匹配
-  const knownPatterns = [
-    /华泰紫金恒生互联[^\d]*(\d[\d,.]*)\s*([+-][\d,.]*)\s*([+-]?[\d.]*%)/,
-    /国泰中证机床ETF发起联接C\s*(\d[\d,.]*)\s*([+-][\d,.]*)\s*([+-]?[\d.]*%)/,
-    /建信新兴市场混合\(QDII\)C\s*(\d[\d,.]*)\s*([+-][\d,.]*)\s*([+-]?[\d.]*%)/,
-    /富国全球科技互联[^\d]*(\d[\d,.]*)\s*([+-][\d,.]*)\s*([+-]?[\d.]*%)/,
-    /方正富邦核心优势混合C\s*(\d[\d,.]*)\s*([+-][\d,.]*)\s*([+-]?[\d.]*%)/,
-    /平安科技精选混合发起式C\s*(\d[\d,.]*)\s*([+-][\d,.]*)\s*([+-]?[\d.]*%)/,
-    /嘉实成长共赢混合C\s*(\d[\d,.]*)\s*([+-][\d,.]*)\s*([+-]?[\d.]*%)/,
-    /工银战略新兴产业混合C\s*(\d[\d,.]*)\s*([+-][\d,.]*)\s*([+-]?[\d.]*%)/,
-    /华泰柏瑞上证科创[^\d]*(\d[\d,.]*)\s*([+-][\d,.]*)\s*([+-]?[\d.]*%)/,
-    /宏利半导体产业混合发起C\s*(\d[\d,.]*)\s*([+-][\d,.]*)\s*([+-]?[\d.]*%)/,
-    /嘉实信息产业股票发起式A\s*(\d[\d,.]*)\s*([+-][\d,.]*)\s*([+-]?[\d.]*%)/,
-    /德邦鑫星价值C\s*(\d[\d,.]*)\s*([+-][\d,.]*)\s*([+-]?[\d.]*%)/,
-  ]
-  
-  for (const pattern of knownPatterns) {
-    const match = text.match(pattern)
-    if (match) {
-      const namePart = match[0].replace(/[\d.,+\-%|]+\s*$/g, '').trim()
-      funds.push({
-        code: '',
-        name: namePart.replace(/[…\.]+$/, ''),
-        amount: match[1],
-        profit: match[2],
-        rate: match[3] || '',
-        shareClass: '',
-        selected: true,
-        _source: 'pattern-match'
-      })
-    }
-  }
-  
-  return funds
-}
-
-// [NEW] 从Markdown/HTML中提取纯文本（供本地OCR使用）
-function extractTextFromMarkdown(md: string): string {
-  if (!md) return ''
-  
-  let text = md
-  
-  // [FIX] 专门处理HTML表格结构 - 将<table>转换为多行文本
-  if (text.includes('<table') || text.includes('<td>') || text.includes('</tr>')) {
-    console.log(`🔍 检测到HTML表格, 原始长度: ${text.length}`)
-    
-    // 提取所有<tr>...</tr>块，每块转为一行
-    const trMatches = text.match(/<tr[^>]*>([\s\S]*?)<\/tr>/gi)
-    console.log(`📊 匹配到 <tr> 块数: ${trMatches ? trMatches.length : 0}`)
-    
-    if (trMatches && trMatches.length > 0) {
-      const rawLines: string[] = []
-      for (let idx = 0; idx < trMatches.length; idx++) {
-        const tr = trMatches[idx]
-        // 移除<tr>标签，提取<td>内容
-        let rowContent = tr.replace(/<tr[^>]*>/gi, '').replace(/<\/tr>/gi, '')
-        // 将</td>或<td>替换为分隔符，然后清理
-        rowContent = rowContent.replace(/<\/td>\s*/gi, ' | ')
-        rowContent = rowContent.replace(/<td[^>]*>/gi, '')
-        // 清理其他标签
-        rowContent = rowContent.replace(/<[^>]+>/g, '')
-        // 清理多余空白
-        rowContent = rowContent.trim().replace(/\s+/g, ' ')
-        
-        // 调试：显示前几行内容
-        if (idx < 6) {
-          console.log(`  原始行${idx}: "${rowContent.substring(0, 80)}"`)
-        }
-        
-        rawLines.push(rowContent)
-      }
-      
-      // [CRITICAL FIX] 合并相邻的基金行（每只基金占2个<tr>）
-      // AI返回格式：Row1="名称|金额|盈亏" Row2="份额类型|收益|收益率"
-      const mergedLines: string[] = []
-      for (let i = 0; i < rawLines.length; i++) {
-        const line = rawLines[i]
-        
-        // 跳过无用行（表头、广告、空行等）
-        if (line.length <= 5) continue
-        if (/^(基金名称|金额|持仓收益|图表中|我的持有|全部|股票型|债券型|混合)$/.test(line)) continue
-        // 跳过广告行（包含 × 符号或"爆品""热度"等）
-        if (/[××]|爆品|热度|聪明钱|年内涨幅/.test(line)) continue
-        
-        // 判断是否需要与下一行合并：
-        // 当前行以中文+数字结尾（如 "4,965.86 | -337.53"）→ 需要合并下一行
-        const needsMerge = (i + 1 < rawLines.length) &&
-          /\d+\.\d{2}\s*\|\s*-?\d+\.\d{2}\s*$/.test(line) &&  // 以"金额|盈亏"结尾
-          /^[A-C]|混合|联接|发起|股票|ETF|QDII|^$/.test(rawLines[i + 1].replace(/[|\d.,+%]/g, '').trim().substring(0, 5))
-        
-        if (needsMerge) {
-          // 合并当前行和下一行
-          const merged = line + ' ' + rawLines[i + 1]
-          mergedLines.push(merged)
-          console.log(`  📌 合并行${i}+${i+1}: "${merged.substring(0, 80)}..."`)
-          i++ // 跳过下一行（已合并）
-        } else {
-          // 单独一行就足够（如 mdResults 中已经完整的文本行）
-          mergedLines.push(line)
-        }
-      }
-      
-      // 如果成功解析了表格，直接返回
-      if (mergedLines.length > 0) {
-        console.log(`✅ HTML表格解析成功: ${rawLines.length}原始行 → ${mergedLines.length}合并后有效行`)
-        return mergedLines.join('\n')
-      } else {
-        console.log(`⚠️ 表格解析后无有效行`)
-      }
-    } else {
-      console.log(`⚠️ 未匹配到任何 <tr> 标签`)
-    }
-  }
-  
-  // 非表格HTML：移除标签但保留内容
-  text = text.replace(/<[^>]+>/g, '\n')
-  
-  // 移除Markdown格式符号
-  text = text.replace(/#{1,6}\s/g, '')
-  text = text.replace(/\*{1,2}([^*]+)\*{1,2}/g, '$1')
-  text = text.replace(/`([^`]+)`/g, '$1')
-  
-  // 清理多余空行
-  text = text.split('\n').map(line => line.trim()).filter(line => line.length > 0).join('\n')
-  
-  return text
-}
-
-// [NEW] 标准三步解析逻辑（本地OCR和AI共用）
-async function processStandardOcrParsing(text: string) {
-  console.log('📋 开始标准三步解析...')
-  console.log('原始文本:', text.substring(0, 500))
-  
-  let lines = text.split('\n').map(line => line.trim()).filter(line => line.length > 0)
-  
-  // [FIX] 智能拆分超长行（HTML表格合并行可能包含多只基金）
-  const expandedLines: string[] = []
-  for (const line of lines) {
-    // 如果一行超过80字符且包含多个"金额"模式，尝试拆分
-    if (line.length > 80 && (line.match(/\d+\.\d{2}/g) || []).length >= 2) {
-      // 按表格分隔符 | 拆分
-      if (line.includes('|')) {
-        const parts = line.split('|').map(p => p.trim()).filter(p => p.length > 0)
-        // 将相邻的短片段合并（一个基金信息可能跨多个td）
-        let currentChunk = ''
-        for (const part of parts) {
-          currentChunk += (currentChunk ? ' ' : '') + part
-          // 如果当前块已包含中文和数字，且下一部分也像新基金的开始，则切分
-          if (/[\u4e00-\u9fa5]{4,}.*\d+\.\d{2}/.test(currentChunk) && currentChunk.length > 10) {
-            expandedLines.push(currentChunk)
-            currentChunk = ''
-          }
-        }
-        if (currentChunk.trim()) expandedLines.push(currentChunk.trim())
-      } else {
-        // 无分隔符时，尝试按"中文名称+大额数字"模式拆分
-        // 匹配 "XXX基金名称 数字" 的边界
-        const segments = line.split(/(?<=[\u4e00-\u9fa5A-C]\s*)(?=\d{1,6}\.\d{2})/)
-        if (segments.length > 1) {
-          for (const seg of segments) {
-            const trimmed = seg.trim()
-            if (trimmed.length > 3) expandedLines.push(trimmed)
-          }
-        } else {
-          expandedLines.push(line)
-        }
-      }
-    } else {
-      expandedLines.push(line)
-    }
-  }
-  
-  lines = expandedLines
-  console.log(`分割后的行数: ${lines.length}`)
-  
-  const fundList: any[] = []
-  const codeMap = new Map<string, number>()
-  
-  // 第一步：扫描基金代码（使用相同过滤规则）
-  const foundCodes = new Map<string, { lineIndex: number, context: string }>()
-  
-  const invalidCodePatterns = [
-    /^0[0-2]\d{4}$/,
-    /^\d{4}[01]\d[0-3]\d$/,
-    /^[12]\d{5}$/,
-    /^03\d{4}$/,
-  ]
-  
-  for (let i = 0; i < lines.length; i++) {
-    const line = lines[i]
-    const codeMatches = line.match(/(?<!\d)(\d{6})(?!\d)/g)
-    if (codeMatches) {
-      for (const code of codeMatches) {
-        const isInvalid = invalidCodePatterns.some(p => p.test(code))
-        if (isInvalid) continue
-        
-        const codeIdx = line.indexOf(code)
-        const beforeCode = codeIdx >= 0 ? line.substring(0, codeIdx) : ''
-        const afterCode = codeIdx >= 0 ? line.substring(codeIdx + 6) : ''
-        
-        const isInValueContext = /[¥$￥:\s]\s*\d/.test(beforeCode.slice(-5)) || /[,.\d]%/.test(afterCode.slice(0, 5))
-        if (isInValueContext) continue
-        
-        if (!foundCodes.has(code)) {
-          foundCodes.set(code, { lineIndex: i, context: line })
-        }
-      }
-    }
-  }
-  
-  console.log(`发现 ${foundCodes.size} 个候选代码`)
-  
-  // 第二步：处理每个代码（复用现有逻辑）
-  for (const [fundCode, info] of foundCodes) {
-    const line = info.context
-    const i = info.lineIndex
-    
-    const codeIdx = line.indexOf(fundCode)
-    const beforeCode = codeIdx >= 0 ? line.substring(0, codeIdx) : ''
-    const nameMatch = beforeCode.match(/[\u4e00-\u9fa5]+(?:ETF|QDII|QFII|LOF)?/g)
-    let fundName = nameMatch ? nameMatch.join('') : ''
-    
-    if (fundName.length < 4 && i > 0) {
-      const prevLine = lines[i - 1]
-      if (/[\u4e00-\u9fa5]{4,}/.test(prevLine) && !/(\d{6})/.test(prevLine)) {
-        fundName = prevLine + fundName
-      }
-    }
-    
-    fundName = fundName.replace(/^(基金|名称|我的|持有|近期|交易|排序|连续\d+年跑赢大盘|长期绩优)/, '').trim()
-    if (fundName.length < 2) continue
-    
-    // 提取数值字段
-    const afterCode = codeIdx >= 0 ? line.substring(codeIdx + 6) : ''
-    const navMatch = afterCode.match(/(\d+\.\d{4})/)
-    const nav = navMatch ? navMatch[1] : ''
-    
-    let rate = ''
-    const rateMatch = line.match(/([+-]?\d+\.?\d*)\s*%/)
-    if (rateMatch) rate = rateMatch[1] + '%'
-    
-    let profit = ''
-    const profitMatches = line.match(/([+-]\d+\.?\d*)\s*(?!\s*%)/g)
-    if (profitMatches && profitMatches.length > 0) profit = profitMatches[0].trim()
-    
-    const ocrShareMatch = fundName.match(/([A-C])\s*$/)
-    const ocrShareClass = ocrShareMatch ? ocrShareMatch[1] : ''
-    const nameCore = ocrShareClass ? fundName.slice(0, -1) : fundName
-    
-    try {
-      let fundInfo = null as any
-      
-      if (nameCore.length >= 4) {
-        const nameResults = await searchFund(nameCore, 20)
-        
-        if (nameResults.length > 0) {
-          if (ocrShareClass) {
-            fundInfo = nameResults.find((f: any) => {
-              const apiShareMatch = f.name.match(/([A-C])\s*$/)
-              return apiShareMatch && apiShareMatch[1] === ocrShareClass
-            })
-          }
-          if (!fundInfo) fundInfo = nameResults[0]
-        }
-      }
-      
-      if (fundInfo) {
-        fundList.push({
-          code: fundInfo.code,
-          name: fundInfo.name,
-          amount: nav || undefined,
-          profit: profit || undefined,
-          rate: rate || undefined,
-          shareClass: ocrShareClass || '',
-          selected: true
-        })
-        codeMap.set(fundCode, fundList.length - 1)
-      } else {
-        fundList.push({
-          code: fundCode,
-          name: fundName,
-          amount: nav || undefined,
-          profit: profit || undefined,
-          rate: rate || undefined,
-          shareClass: ocrShareClass || '',
-          selected: true
-        })
-        codeMap.set(fundCode, fundList.length - 1)
-      }
-    } catch (err) {
-      console.error(`查询基金失败 (${fundCode}):`, err)
-    }
-  }
-  
-  // 第三步：兜底扫描无代码行（与本地OCR一致）
-  const coveredLines = new Set<number>()
-  for (const [, info] of foundCodes) coveredLines.add(info.lineIndex)
-  
-  for (let i = 0; i < lines.length; i++) {
-    if (coveredLines.has(i)) continue
-    
-    const line = lines[i]
-    
-    if (/^(基金|名称|金额|收益|持有|排序|全部|股票|债券|混合|我的|近期|交易|更新|人气|全球)/.test(line)) continue
-    if (/^(HE|es|@|A|zao|<|BE|QV|mHB|co|wo|持有=)/.test(line)) continue
-    if (line.length < 3) continue
-    
-    const hasChinese = /[\u4e00-\u9fa5]{2,}/.test(line)
-    
-    if (hasChinese) {
-      // ... 兜底逻辑（与本地OCR第三步完全一致）
-      // 为节省篇幅，这里简化处理
-    }
-  }
-  
-  if (fundList.length === 0) {
-    showToast('未识别到基金信息，请确保图片清晰')
-  } else {
-    extractedFunds.value = fundList
-    showToast(`识别到 ${fundList.length} 只基金`)
-  }
-  
-  importProgress.value = 100
-  console.log(`✅ 标准解析完成: ${fundList.length} 只基金`)
 }
 
 // [WHAT] 文件转Base64工具函数
@@ -1869,1788 +1610,6 @@ function fileToBase64(file: File): Promise<string> {
     reader.onerror = () => reject(new Error('文件读取失败'))
     reader.readAsDataURL(file)
   })
-}
-
-// [NEW] 深度递归搜索对象中包含<table的字符串值
-function deepSearchForTables(obj: any, depth = 0): string | null {
-  if (depth > 5) return null // 防止无限递归
-  
-  if (typeof obj === 'string' && obj.includes('<table')) {
-    return obj
-  }
-  
-  if (Array.isArray(obj)) {
-    for (const item of obj) {
-      const result = deepSearchForTables(item, depth + 1)
-      if (result) return result
-    }
-  }
-  
-  if (obj && typeof obj === 'object') {
-    for (const key of Object.keys(obj)) {
-      // 跳过已知非文本字段
-      if (['bbox2d', 'bbox_2d', 'height', 'width', 'index', 'label'].includes(key)) continue
-      
-      const result = deepSearchForTables(obj[key], depth + 1)
-      if (result) return result
-    }
-  }
-  
-  return null
-}
-
-// [NEW] GLM-OCR HTML表格智能解析器
-// 专门处理GLM-OCR返回的结构化HTML表格数据
-async function parseOcrHtmlTables(htmlText: string) {
-  console.log('=== 开始HTML表格解析 ===')
-  
-  // 1. 提取所有 <table>...</table> 块
-  const tableRegex = /<table[^>]*>([\s\S]*?)<\/table>/gi
-  const tables: string[] = []
-  let match: RegExpExecArray | null
-  
-  while ((match = tableRegex.exec(htmlText)) !== null) {
-    tables.push(match[1])
-  }
-  
-  console.log(`找到 ${tables.length} 个表格`)
-  
-  // 2. 解析每个表格，提取基金信息
-  for (const tableContent of tables) {
-    try {
-      const fundInfo = parseSingleTable(tableContent)
-      if (fundInfo && fundInfo.name.length >= 2) {
-        await searchAndAddFund(fundInfo)
-      }
-    } catch (e) {
-      console.error('解析表格失败:', e)
-    }
-  }
-  
-  importProgress.value = 100
-  console.log(`=== 表格解析完成，共识别 ${extractedFunds.value.length} 只基金 ===`)
-}
-
-// [NEW] 解析单个HTML表格
-function parseSingleTable(tableContent: string): { name: string, amount: string, profit: string, rate: string } | null {
-  // 提取所有 <td> 单元格内容
-  const cells: string[] = []
-  const tdRegex = /<td[^>]*>([\s\S]*?)<\/td>/gi
-  
-  let tdMatch: RegExpExecArray | null
-  while ((tdMatch = tdRegex.exec(tableContent)) !== null) {
-    const cellText = tdMatch[1]
-      .replace(/<[^>]+>/g, '')  // 移除嵌套HTML标签
-      .replace(/&nbsp;/g, ' ')
-      .replace(/&lt;/g, '<')
-      .replace(/&gt;/g, '>')
-      .trim()
-    
-    if (cellText.length > 0) {
-      cells.push(cellText)
-    }
-  }
-  
-  console.log('表格单元格:', cells)
-  
-  if (cells.length < 3) return null
-  
-  // 3. 分析单元格结构，提取基金信息
-  let fundName = ''
-  let amount = ''
-  let profit = ''
-  let rate = ''
-  
-  // 策略1：标准2行格式（最常见）
-  // 行1: 基金名称(可能截断) | 持有金额 | 盈亏金额
-  // 行2: 名称续 | 昨日收益/其他 | 收益率%
-  if (cells.length >= 6) {
-    // 第一行第1个单元格通常是基金名（可能被截断）
-    fundName = cells[0].trim()
-    // 第二行第1个单元格是名称续（如"发起联接C"、"混合C"等）
-    const nameContinuation = cells[3] || ''
-    
-    // 组合完整名称（过滤掉非名称内容）
-    if (nameContinuation && /^[A-C]$/.test(nameContinuation.trim())) {
-      fundName += nameContinuation.trim()  // 如 "国泰中证机床ETF" + "C"
-    } else if (nameContinuation && /(?:联接|混合|股票|债券|QDII|发起|指数|ETF)[A-C]?$/i.test(nameContinuation)) {
-      fundName = nameContinuation  // 第二行才是完整类型名
-    } else if (nameContinuation && !/[\d.]+/.test(nameContinuation) && nameContinuation.length <= 10) {
-      // 如果续看起来像名称的一部分，尝试拼接
-      if (!fundName.includes(nameContinuation)) {
-        fundName += nameContinuation
-      }
-    }
-    
-    // 第一行第2个单元格：持有金额（带逗号的大数，如 "5,219.94"）
-    amount = extractAmount(cells[1])
-    
-    // 第一行第3个单元格：盈亏金额（如 "-530.06"）
-    profit = extractSignedNumber(cells[2])
-    
-    // 第二行第3个单元格：收益率%（如 "-9.22%"）
-    rate = extractRate(cells[5] || cells[2])  // 有些表格只有一行
-    
-    console.log(`提取结果: 名称="${fundName}", 金额=${amount}, 盈亏=${profit}, 收益率=${rate}`)
-  }
-  // 策略2：单行格式（较少见）
-  else if (cells.length === 3) {
-    fundName = cells[0]
-    amount = extractAmount(cells[1])
-    profit = extractSignedNumber(cells[2])
-    
-    // 尝试从同一单元格提取百分比
-    if (cells[2].includes('%')) {
-      rate = extractRate(cells[2])
-    }
-  }
-  
-  // 清理基金名称
-  fundName = cleanFundName(fundName)
-  
-  // [NEW] 二次验证：如果清理后名称为空或太短，直接丢弃这条记录
-  if (!fundName || fundName.length < 2) {
-    console.log(`⚠️ 丢弃无效记录: 原始名称被过滤`)
-    return null
-  }
-  
-  // [NEW] 验证数据合理性：金额和盈亏不能同时为空（至少要有一个数值）
-  const hasAmount = amount && parseFloat(amount) > 0
-  const hasProfit = profit !== ''
-  const hasRate = rate !== ''
-  
-  if (!hasAmount && !hasProfit && !hasRate) {
-    console.log(`⚠️ 丢弃无效记录: 无有效数值数据 (名称: ${fundName})`)
-    return null
-  }
-  
-  // [NEW] 验证金额合理性：持有金额通常 > 10元
-  if (hasAmount && parseFloat(amount) < 10) {
-    console.log(`⚠️ 可疑金额: ${amount} (可能解析错误，名称: ${fundName})`)
-    // 不直接返回null，但标记为低置信度
-  }
-  
-  return { name: fundName, amount, profit, rate }
-}
-
-// [NEW] 检测是否为垃圾内容（广告/推荐语/宣传文案/UI标签等非基金信息）
-function isGarbageContent(text: string): boolean {
-  // 预处理：去除首尾空格
-  const t = text.trim()
-  if (!t) return true
-  
-  // ========== 关键词黑名单（直接包含即过滤）==========
-  const blacklistKeywords = [
-    // UI元素/页面标签/按钮/导航
-    '我的持有', '我的持仓', '基金持仓', '基金名称', '持仓盈亏',
-    '近期交易', '交易排序', '立即刷新', '全部', '已持有', '未持有',
-    '股票型', '债券型', '混合型', '货币型', '指数型', 'QDII',
-    '日排行', '周排行', '月排行', '年排行', '热销', '推荐',
-    // 操作按钮
-    '买入', '卖出', '加仓', '减仓', '定投', '转换', '赎回', '申购',
-    '确认', '取消', '完成', '继续', '跳过', '下一步', '上一步', '提交', '保存',
-    // 页面Tab
-    '首页', '自选', '跟单', '直播', '资讯', '理财', '工具', '行情', '市场',
-    '资产', '发现', '我的', '设置', '帮助', '反馈', '分享',
-    // 营销/广告
-    '爆品', '最新力作', '投研', '赛道', '收益亮眼', '业绩亮眼', '大家都在买',
-    '热度王', '聪明钱', '必买', '抢购', '爆款', '热门', '人气', '精选', '优选',
-    // 榜单类
-    '自选榜', '排名前', '热度榜', '加仓人数', '周加仓', '月加仓',
-    '长期绩优', '跑赢大盘',
-    // 涨幅宣传
-    '涨幅超', '涨超', '年内涨幅', '近期强势', '近期涨幅',
-    // 产业链宣传
-    '上游材料', '下游材料', '半导体产业链', '光模块产业链', '半导体上游',
-  ]
-  
-  for (const kw of blacklistKeywords) {
-    if (t.includes(kw)) return true
-  }
-  
-  const garbagePatterns = [
-    // ========== UI元素/页面标签/按钮/导航 ==========
-    /^\(\d+\)$|^\d+\)$|^\d+\u4e2a$/,  // (12), 12), 12个
-    /^(基金|我的|全部|更多|查看|点击|管理|设置|刷新|筛选|排序|搜索|确认|取消)$/,
-    /^(基金|持仓|名称|金额|收益|涨跌|估值|持有|买入|卖出|加仓|减仓|股票型|债券型|混合型|货币型|指数型)$/,
-    /^(加载中|暂无|空状态|没有更多|点击加载|下拉刷新|上拉加载|股票型\s*\d*)$/,
-    /^(首页|发现|行情|交易|我的|资产|理财|市场|资讯|快讯|公告|研报|直播|课堂)$/,
-    /^(登录|注册|退出|忘记密码|手机验证)$/,
-    /^(首页|自选|跟单|直播|资讯|理财|工具|关注|分享|点赞|收藏|评论|举报|帮助|反馈)$/,
-    /(全部\s*\(?\d*\)?|已持有|未持有|待确认|已确认|股票型\s*\d|债券型\s*\d|混合型\s*\d)/,
-    
-    // ========== 包含括号数字如"全部(12)" ==========
-    /[（(]\s*\d+\s*[)）]/,
-    
-    // ========== 排名/榜单类 ==========
-    /自选榜|排名前|No\.\d+|热度榜|加仓人数|连续\d+年/,
-    
-    // ========== 涨幅宣传 ==========
-    /涨幅超\d+%|涨超\d+倍|年内涨幅|近期强势/,
-    
-    // ========== 材料/行业宣传（非基金名） ==========
-    /上游材料|下游材料|半导体产业链|光模块产业链/,
-    
-    // ========== 数字占比过高（看起来像数据而非名称）==========
-    /\d{4,}/,  // 4个或以上连续数字
-    
-    // ========== 包含冒号/分号等结构化标记 ==========
-    /[：:]\s*[\d.]+|[；;]\s*\d/,
-    
-    // ========== 夸张表述 ==========
-    /!\?{2,}|！？{2,}|！！！/,
-    
-    // ========== 纯描述性文字（不含基金特征）==========
-    /说[\d.]+%$|看[\d.]+%$/,
-    
-    // ========== 短词UI元素 ==========
-    /^(近期|交易|排序|筛选|更多|收起|展开|详情|返回|股票型|债券型)$/,
-  ]
-  
-  return garbagePatterns.some(pattern => pattern.test(t))
-}
-
-// [NEW] 清理基金名称（去除干扰词）[ENHANCED]
-function cleanFundName(rawName: string): string {
-  let name = rawName.trim()
-  
-  // [NEW] 先检测是否为垃圾内容，如果是直接返回空
-  if (isGarbageContent(name)) {
-    console.log(`⚠️ 检测到垃圾内容被过滤: "${name}"`)
-    return ''
-  }
-  
-  // 移除常见的干扰后缀/前缀
-  name = name.replace(/^(爆品永赢投研最新力作！|半导体上游材料赛道|收益亮眼业绩表现亮眼|大家都在买\s*热度王！|聪明钱都在买TA)/gi, '')
-  name = name.replace(/(近\d+周加仓人数同类排名前\d+\.\d+%！？|近\d+月涨超\d+%|\s*×$)/gi, '')
-  name = name.replace(/^(光模块\s*No\.\d+)/gi, '')  // 这是标签不是名称
-  name = name.replace(/(一周自选榜No\.\d+>?;?)/gi, '')
-  
-  // 再次清理后检测（移除部分干扰词后的结果）
-  if (isGarbageContent(name) || name.length < 2) {
-    return ''
-  }
-  
-  // 清理末尾的特殊字符
-  name = name.replace(/[…·。,，!！?？×+$%\d]+$/g, '').trim()  // 增强版：也去掉末尾的%和数字
-  
-  // 如果名称太短或看起来不像基金名，返回空
-  if (name.length < 2 || /^[\d.+\-%]+$/.test(name)) return ''
-  
-  // 最终验证：基金名通常包含中文且不以特殊字符开头
-  if (!/^[\u4e00-\u9fa5]/.test(name) && !/^[A-Z]/.test(name)) {
-    return ''
-  }
-  
-  return name
-}
-
-// [NEW] 从文本中提取金额（支持千分位逗号）
-function extractAmount(text: string): string {
-  // 匹配：5,219.94 或 4965.86 或 2,700.85 等
-  const match = text.match(/(\d{1,3}(?:,\d{3})*(?:\.\d{2,4})?)/)
-  return match ? match[1].replace(/,/g, '') : ''
-}
-
-// [NEW] 从文本中提取带符号的数字（盈亏）
-function extractSignedNumber(text: string): string {
-  // 匹配：-530.06 或 +100.85 或 -337.53 等
-  const match = text.match(/([+-]\d{1,3}(?:,\d{3})*(?:\.\d{2,})?)/)
-  return match ? match[1].replace(/,/g, '') : ''
-}
-
-// [NEW] 从文本中提取百分比（收益率）
-function extractRate(text: string): string {
-  // 匹配：-9.22% 或 +6.30% 或 -7.84% 等
-  const match = text.match(/([+-]?\d+\.?\d*)\s*%/)
-  return match ? match[1] + '%' : ''
-}
-
-// [NEW] 用提取的信息搜索并添加基金
-// [ENHANCED] 智能名称预处理 - 处理OCR误差，提取核心搜索关键词
-function preprocessForSearch(rawName: string): { coreNames: string[], shareClass: string } {
-  // 提取份额类别
-  const shareMatch = rawName.match(/([A-C])\s*$/)
-  const shareClass = shareMatch ? shareMatch[1] : ''
-  let name = shareClass ? rawName.slice(0, -1).trim() : rawName
-  
-  // 清理常见OCR干扰词
-  const noiseWords = ['爆品', '永赢', '投研', '最新', '力作', '光模块', 'No\\.', '\\d+']
-  for (const word of noiseWords) {
-    name = name.replace(new RegExp(word), '').trim()
-  }
-  
-  // 生成多个搜索变体（按优先级排序）
-  const variants: string[] = []
-  
-  // 变体1：完整名称
-  if (name.length >= 2) variants.push(name)
-  
-  // 变体2：移除类型后缀的核心名
-  const typeSuffixes = ['混合型', '股票型', '债券型', '指数型', 'QDII', 'ETF联接', 'LOF']
-  let coreName = name
-  for (const suffix of typeSuffixes) {
-    if (coreName.endsWith(suffix)) {
-      coreName = coreName.slice(0, -suffix.length)
-      break
-    }
-  }
-  if (coreName !== name && coreName.length >= 2) variants.push(coreName)
-  
-  // 变体3：提取主要品牌+产品线关键词
-  const keywordPattern = /([\u4e00-\u9fa5]{2,8})(?:中证|上证|深证|创业板|科创)?(?:ETF|指数|混合|股票)/
-  const keywordMatch = name.match(keywordPattern)
-  if (keywordMatch && keywordMatch[1].length >= 2 && !variants.includes(keywordMatch[1])) {
-    variants.push(keywordMatch[1])
-  }
-  
-  // 变体4：如果名称包含"XX ETF"，尝试"XX"
-  const etfMatch = name.match(/([\u4e00-\u9fa5]{2,10})\s*ETF/)
-  if (etfMatch && !variants.includes(etfMatch[1])) {
-    variants.push(etfMatch[1])
-  }
-  
-  console.log(`📝 名称预处理: "${rawName}" → 变体:`, variants)
-  
-  return { coreNames: variants.filter(v => v.length >= 2), shareClass }
-}
-
-// [NEW] 计算字符串相似度（编辑距离算法）
-function levenshteinDistance(s1: string, s2: string): number {
-  const matrix: number[][] = []
-  
-  for (let i = 0; i <= s1.length; i++) {
-    matrix[i] = [i]
-  }
-  for (let j = 0; j <= s2.length; j++) {
-    matrix[0][j] = j
-  }
-  
-  for (let i = 1; i <= s1.length; i++) {
-    for (let j = 1; j <= s2.length; j++) {
-      const cost = s1[i - 1] === s2[j - 1] ? 0 : 1
-      matrix[i][j] = Math.min(
-        matrix[i - 1][j] + 1,     // deletion
-        matrix[i][j - 1] + 1,     // insertion
-        matrix[i - 1][j - 1] + cost // substitution
-      )
-    }
-  }
-  
-  return matrix[s1.length][s2.length]
-}
-
-// [NEW] 基于相似度的最佳匹配选择
-function findBestSimilarityMatch(target: string, candidates: any[], threshold = 0.6): any | null {
-  let bestMatch: any = null
-  let bestScore = 0
-  
-  for (const candidate of candidates) {
-    const candName = candidate.name || ''
-    
-    // 计算相似度分数
-    const distance = levenshteinDistance(target, candName)
-    const maxLen = Math.max(target.length, candName.length)
-    const similarity = maxLen > 0 ? 1 - (distance / maxLen) : 0
-    
-    // 加权：完全包含关系得高分
-    let score = similarity
-    if (candName.includes(target) || target.includes(candName.replace(/\s*[A-C]$/, ''))) {
-      score += 0.3
-    }
-    // 关键词重叠加分
-    const targetKeywords = target.split(/(?:混合|股票|债券|指数|ETF|QDII)/).filter(k => k.length >= 2)
-    for (const kw of targetKeywords) {
-      if (candName.includes(kw)) {
-        score += 0.1
-        break
-      }
-    }
-    
-    if (score > bestScore) {
-      bestScore = score
-      bestMatch = candidate
-    }
-  }
-  
-  console.log(`🎯 相似度匹配: 目标="${target}", 最佳得分=${bestScore.toFixed(2)}, 结果=${bestMatch?.name || '无'}`)
-  
-  return bestScore >= threshold ? bestMatch : null
-}
-
-async function searchAndAddFund(info: { name: string, amount: string, profit: string, rate: string }) {
-  console.log(`\n🔍 开始搜索基金: "${info.name}"`)
-  
-  try {
-    // 使用增强的预处理
-    const { coreNames, shareClass } = preprocessForSearch(info.name)
-    
-    if (coreNames.length === 0) {
-      console.log(`❌ 名称太短，跳过: "${info.name}"`)
-      return
-    }
-    
-    let bestMatch: any = null
-    const allResults: any[] = []  // 收集所有结果用于去重
-    
-    // 策略1：逐个尝试每个名称变体进行精确/模糊搜索
-    for (const searchName of coreNames) {
-      if (bestMatch) break  // 已找到就停止
-      
-      console.log(`   尝试搜索变体: "${searchName}"`)
-      const results = await searchFund(searchName, 20)
-      
-      if (!results || results.length === 0) continue
-      
-      // 收集结果
-      results.forEach(r => {
-        if (!allResults.find(e => e.code === r.code)) allResults.push(r)
-      })
-      
-      // 1a. 完全匹配（最高优先级）
-      bestMatch = results.find((f: any) => f.name === searchName)
-      if (bestMatch) {
-        console.log(`   ✅ 完全匹配成功!`)
-        break
-      }
-      
-      // 1b. 包含匹配（目标包含候选 或 候选包含目标）
-      bestMatch = results.find((f: any) => 
-        f.name.includes(searchName) || 
-        searchName.includes(f.name.replace(/\s*[A-C]$/, ''))
-      )
-      if (bestMatch) {
-        console.log(`   ✅ 包含匹配成功!`)
-        continue  // 继续看有没有更好的
-      }
-    }
-    
-    // 策略2：基于相似度的模糊匹配（当策略1未找到理想结果时）
-    if (!bestMatch && allResults.length > 0) {
-      console.log(`   📊 策略1未完美匹配，尝试相似度匹配 (${allResults.length}个候选)...`)
-      bestMatch = findBestSimilarityMatch(info.name, allResults, 0.55)
-    }
-    
-    // 策略3：使用第一个搜索结果（最终兜底）
-    if (!bestMatch && allResults.length > 0) {
-      bestMatch = allResults[0]
-      console.log(`   ⚠️ 使用第一个结果作为备选`)
-    }
-    
-    if (bestMatch) {
-      // 添加到结果列表
-      extractedFunds.value.push({
-        code: bestMatch.code,
-        name: bestMatch.name,
-        amount: info.amount,
-        profit: info.profit,
-        rate: info.rate,
-        shareClass: shareClass,
-        selected: true,
-        matchConfidence: bestMatch.similarityScore || 'auto'  // 标记匹配方式
-      })
-      
-      console.log(`✅ 成功匹配: ${bestMatch.code} - ${bestMatch.name}`)
-      console.log(`   数据: 金额=${info.amount}, 盈亏=${info.profit}, 收益=${info.rate}`)
-    } else {
-      console.log(`⚠️ 未找到任何匹配: "${info.name}"`)
-      
-      // 即使没找到代码也显示（用户可手动处理）
-      extractedFunds.value.push({
-        code: '',
-        name: info.name,
-        amount: info.amount,
-        profit: info.profit,
-        rate: info.rate,
-        shareClass: shareClass,
-        selected: true,
-        matchConfidence: 'none'
-      })
-    }
-  } catch (error: any) {
-    console.error(`搜索失败 (${info.name}):`, error)
-    // 出错时也添加到列表（带错误标记）
-    extractedFunds.value.push({
-      code: '',
-      name: info.name,
-      amount: info.amount,
-      profit: info.profit,
-      rate: info.rate,
-      shareClass: '',
-      selected: true,
-      matchConfidence: 'error'
-    })
-  }
-}
-
-// [NEW] 智能持仓截图解析器（专门针对"无代码纯名称"场景）
-async function smartFundHoldingParser(text: string): Promise<any[]> {
-  console.log('\n🚀 ===== 启动智能持仓截图解析器 =====')
-  
-  // Step 1: 预处理 - 分行并过滤
-  const rawLines = text.split('\n').map(l => l.trim()).filter(l => l.length > 0)
-  console.log(`📝 原始行数: ${rawLines.length}`)
-  
-  if (rawLines.length < 3) return []
-  
-  // Step 2: 行分类器
-  const classifiedLines = rawLines.map((line, idx) => ({
-    line,
-    index: idx,
-    type: classifyLine(line),
-    hasAmount: hasAmountPattern(line)
-  }))
-  
-  console.log(`📊 行分类结果:`)
-  classifiedLines.slice(0, 20).forEach(c => {
-    console.log(`   [${c.type}] ${c.line.substring(0, 50)}... (金额:${c.hasAmount})`)
-  })
-  
-  // Step 3: 提取数据行（包含金额的行 = 基金数据行）
-  const dataRows = classifiedLines.filter(c => c.hasAmount && c.type !== 'ad')
-  console.log(`💰 发现 ${dataRows.length} 个数据行`)
-  
-  if (dataRows.length === 0) {
-    console.log('⚠️ 未发现数据行，解析终止')
-    return []
-  }
-  
-  // Step 4: 从数据行提取基金信息
-  const results: any[] = []
-  
-  for (let i = 0; i < dataRows.length; i++) {
-    const row = dataRows[i]
-    
-    // 提取基金名称（从当前行或前几行的非金额文本）
-    const fundName = extractFundNameFromContext(classifiedLines, row.index)
-    
-    if (!fundName || fundName.length < 4) {
-      console.log(`⚠️ 无法提取有效名称，跳过: 行${row.index}`)
-      continue
-    }
-    
-    // 提取数值：市值、盈亏、收益率
-    const { amount, profit, rate } = extractFinancialData(row.line)
-    
-    console.log(`🔍 提取到: "${fundName}" | 金额=${amount || '-'} | 盈亏=${profit || '-'} | 收益=${rate || '-'}`)
-    
-    // Step 5: 调用API搜索匹配基金代码
-    try {
-      const matchedFund = await searchAndMatchFund(fundName)
-      
-      results.push({
-        code: matchedFund?.code || '',
-        name: matchedFund?.name || fundName,
-        amount: amount || '',
-        profit: profit || '',
-        rate: rate || '',
-        shareClass: matchedFund?.shareClass || '',
-        selected: true,
-        matchConfidence: matchedFund ? matchedFund.confidence : 'none'
-      })
-      
-      console.log(`   ✅ 匹配结果: ${matchedFund?.code || '未匹配'} - ${matchedFund?.name || fundName}`)
-      
-    } catch (err) {
-      console.error(`❌ 搜索失败 (${fundName}):`, err)
-      
-      // 即使搜索失败也保留记录（用于手动补全）
-      results.push({
-        code: '',
-        name: fundName,
-        amount: amount || '',
-        profit: profit || '',
-        rate: rate || '',
-        shareClass: '',
-        selected: true,
-        matchConfidence: 'none'
-      })
-    }
-  }
-  
-  console.log(`\n✅ ===== 智能解析完成: 共提取 ${results.length} 只基金 =====\n`)
-  return results
-}
-
-/**
- * [NEW] 行分类器 - 判断每行是什么类型
- */
-function classifyLine(line: string): 'header' | 'ui' | 'data' | 'ad' | 'unknown' {
-  const t = line.trim()
-  
-  // UI标题/标签
-  if (/^(基金|我的|全部|更多|查看|点击|管理|设置|刷新|筛选|排序|搜索|确认|取消|首页|自选|跟单|直播|资讯|理财|工具|行情|市场|资产|发现|我的)$/.test(t)) return 'ui'
-  if (/^(基金\s*持仓|我的\s*持仓|持有\s*盈亏|当日\s*收益|收益率|账户资产|持仓盈亏|近期交易|交易排序|立即刷新)/.test(t)) return 'header'
-  if (/^(买入|卖出|加仓|减仓|定投|转换|赎回|申购|导入选中的基金|本地OCR识别|AI智能识别|图片识别导入)$/.test(t)) return 'ui'
-  
-  // 表头列名
-  if (/^(股票型|债券型|货币型|混合型|指数型)\s*[\d(]?\d*\)?$/.test(t)) return 'header'
-  if (/^(全部|已持有|未持有|待确认|已确认|今日收益|持有盈亏|收益率|涨跌|昨日|操作)$/.test(t)) return 'header'
-  
-  // 广告/推荐语
-  if (isGarbageContent(t)) return 'ad'
-  
-  // 包含金额格式 → 数据行候选
-  if (hasAmountPattern(t)) return 'data'
-  
-  return 'unknown'
-}
-
-/**
- * [NEW] 检测是否包含金额格式
- */
-function hasAmountPattern(line: string): boolean {
-  // 匹配: 2,700.85 或 2700.85 或 11,591.63 等金额格式
-  return /\d{1,3}(?:,\d{3})*\.\d{2,4}/.test(line) && /[+-]?\d+\.?\d*[%]?/.test(line)
-}
-
-/**
- * [NEW] 从上下文中提取基金名称
- */
-function extractFundNameFromContext(lines: {line: string, type: string, hasAmount: boolean}[], currentIndex: number): string {
-  // 策略1: 当前行中的中文部分（排除数字和符号）
-  let currentLineText = lines[currentIndex].line
-  
-  // 提取中文名称部分
-  const chineseMatch = currentLineText.match(/^[^\d.,+\-]+/)
-  if (chineseMatch && chineseMatch[0].trim().length >= 4) {
-    const name = cleanFundName(chineseMatch[0].trim())
-    if (name && name.length >= 4 && !isGarbageContent(name)) {
-      return name
-    }
-  }
-  
-  // 策略2: 向上查找前1-2行的长文本作为名称（OCR常把名称拆成多行）
-  for (let offset = 1; offset <= Math.min(3, currentIndex); offset++) {
-    const prevLine = lines[currentIndex - offset]
-    if (!prevLine) continue
-    
-    // 如果前一行是未知类型且包含足够多的中文
-    if ((prevLine.type === 'unknown' || prevLine.type === 'data') && !prevLine.hasAmount) {
-      const prevChineseCount = (prevLine.line.match(/[一-龥]/g) || []).length
-      if (prevChineseCount >= 4) {
-        const name = cleanFundName(prevLine.line.trim())
-        if (name && name.length >= 4 && !isGarbageContent(name)) {
-          return name
-        }
-      }
-    }
-  }
-  
-  // 策略3: 合并当前行开头 + 前一行（处理断行情况）
-  if (currentIndex > 0) {
-    const prevLine = lines[currentIndex - 1]
-    if (!prevLine.hasAmount && prevLine.type !== 'ad' && prevLine.type !== 'ui') {
-      const combined = (prevLine.line.trim() + ' ' + currentLineText).replace(/\s+/g, ' ')
-      const nameMatch = combined.match(/^([^\d.,+\-%]+)/)
-      if (nameMatch && nameMatch[1].trim().length >= 6) {
-        const name = cleanFundName(nameMatch[1].trim())
-        if (name && name.length >= 4 && !isGarbageContent(name)) {
-          return name
-        }
-      }
-    }
-  }
-  
-  return ''
-}
-
-/**
- * [NEW] 从单行提取财务数据
- */
-function extractFinancialData(line: string): {amount: string, profit: string, rate: string} {
-  let amount = '', profit = '', rate = ''
-  
-  // 金额: 第一个符合格式的数字（通常是市值）
-  const amounts = line.match(/\d{1,3}(?:,\d{3})*\.\d{2,4}/g)
-  if (amounts && amounts.length > 0) {
-    amount = amounts[0].replace(/,/g, '')
-  }
-  
-  // 盈亏: 带正负号的数字
-  const signedNumbers = line.match(/[+-]\d{1,3}(?:,\d{3})*\.\d{2,}/g)
-  if (signedNumbers && signedNumbers.length > 0) {
-    profit = signedNumbers[0].replace(/,/g, '')
-  }
-  
-  // 收益率: 百分比
-  const rates = line.match(/[+-]?\d+\.?\d*%/)
-  if (rates && rates.length > 0) {
-    rate = rates[0].replace('%', '')
-  }
-  
-  return { amount, profit, rate }
-}
-
-/**
- * [NEW] 搜索并匹配基金（核心函数）- 增强版
- */
-async function searchAndMatchFund(name: string): Promise<any | null> {
-  console.log(`   🔎 开始搜索: "${name}"`)
-  
-  try {
-    const startTime = Date.now()
-    
-    // [NEW] 预处理：去除空格（OCR常把"嘉实信息产业"识别为"嘉实 信息 产业"）
-    const cleanName = name.replace(/\s+/g, '').trim()
-    console.log(`   🧹 清理空格后: "${cleanName}"`)
-    
-    // ===== 策略1: 完整名称搜索（无空格版本）=====
-    console.log(`   📌 策略1: 完整名称搜索 "${cleanName}"`)
-    let results1 = await searchFund(cleanName, 20)
-    console.log(`   📊 策略1结果数: ${results1?.length || 0}`)
-    
-    if (results1 && results1.length > 0) {
-      console.log(`   💡 前3结果: ${results1.slice(0, 3).map((r: any) => r.name).join(' | ')}`)
-      
-      // 策略1a: 精确匹配
-      const exactMatch = results1.find((f: any) => f.name === cleanName || f.name.replace(/\s+/g, '') === cleanName)
-      if (exactMatch) {
-        console.log(`   ✅ 精确匹配! ${exactMatch.code} - ${exactMatch.name}`)
-        return { ...exactMatch, confidence: 'exact', shareClass: detectShareClass(exactMatch.code, exactMatch.name) }
-      }
-      
-      // 策略1b: 包含匹配（前3个结果中找）
-      for (let i = 0; i < Math.min(3, results1.length); i++) {
-        const cand = results1[i]
-        const candNameClean = (cand.name || '').replace(/\s+/g, '')
-        
-        // 包含关系
-        if (cleanName.includes(candNameClean) || candNameClean.includes(cleanName)) {
-          console.log(`   ✅ 包含匹配! ${cand.code} - ${cand.name}`)
-          return { ...cand, confidence: 'contains', shareClass: detectShareClass(cand.code, cand.name) }
-        }
-      }
-      
-      // 策略1c: 取第一个结果兜底
-      console.log(`   ⚠️ 策略1取第一个结果兜底: ${results1[0].code} - ${results1[0].name}`)
-      return {
-        code: results1[0].code,
-        name: results1[0].name,
-        confidence: 'auto',
-        shareClass: detectShareClass(results1[0].code, results1[0].name)
-      }
-    }
-    
-    // ===== 策略2: 核心名称搜索（去掉后缀A/B/C等）=====
-    let coreName = cleanName
-      .replace(/([A-C])$/gi, '')                    // 去掉末尾A/B/C
-      .replace(/(发起式|联接|增强)$/gi, '')           // 去掉常见后缀
-      .replace(/\((LOF|ETF|QDII)\)/gi, '')          // 去掉括号类型
-      .replace(/\(.*?\)/g, '')                       // 去掉所有括号内容
-      .trim()
-    
-    if (coreName.length >= 4 && coreName !== cleanName) {
-      console.log(`   📌 策略2: 核心名称搜索 "${coreName}"`)
-      const results2 = await searchFund(coreName, 15)
-      console.log(`   📊 策略2结果数: ${results2?.length || 0}`)
-      
-      if (results2 && results2.length > 0) {
-        console.log(`   💡 前3结果: ${results2.slice(0, 3).map((r: any) => r.name).join(' | ')}`)
-        
-        // 包含匹配
-        for (let i = 0; i < Math.min(3, results2.length); i++) {
-          const cand = results2[i]
-          const candNameClean = (cand.name || '').replace(/\s+/g, '')
-          if (coreName.includes(candNameClean) || candNameClean.includes(coreName)) {
-            console.log(`   ✅ 策略2包含匹配! ${cand.code} - ${cand.name}`)
-            return { ...cand, confidence: 'contains', shareClass: detectShareClass(cand.code, cand.name) }
-          }
-        }
-        
-        // 取第一个兜底
-        console.log(`   ⚠️ 策略2取第一个结果: ${results2[0].code} - ${results2[0].name}`)
-        return {
-          code: results2[0].code,
-          name: results2[0].name,
-          confidence: 'auto',
-          shareClass: detectShareClass(results2[0].code, results2[0].name)
-        }
-      }
-    }
-    
-    // ===== 策略3: 关键词拆分搜索 =====
-    console.log(`   📌 策略3: 关键词拆分搜索`)
-    const keywords = extractSearchKeywords(cleanName)
-    console.log(`   🔑 提取的关键词: ${keywords.join(', ')}`)
-    
-    if (keywords.length > 0) {
-      for (const kw of keywords) {
-        if (kw.length < 3) continue
-        
-        console.log(`   🔍 搜索关键词: "${kw}"`)
-        const results3 = await searchFund(kw, 10)
-        
-        if (results3 && results3.length > 0) {
-          console.log(`   💡 关键词"${kw}"找到${results3.length}个结果`)
-          console.log(`   ✅ 策略3取第一个: ${results3[0].code} - ${results3[0].name}`)
-          return {
-            code: results3[0].code,
-            name: results3[0].name,
-            confidence: 'keyword',
-            shareClass: detectShareClass(results3[0].code, results3[0].name)
-          }
-        }
-      }
-    }
-    
-    console.log(`   ❌ 所有策略均未匹配 (${Date.now() - startTime}ms)`)
-    return null
-    
-  } catch (error: any) {
-    console.error(`   ❌ 搜索异常:`, error.message || error)
-    return null
-  }
-}
-
-/**
- * [NEW] 在结果列表中找最佳匹配（降低阈值 + 增加日志）
- */
-function findBestMatch(target: string, candidates: any[]): any | null {
-  if (!candidates || candidates.length === 0) {
-    console.log(`   ⚠️ findBestMatch: 候选列表为空!`)
-    return null
-  }
-  
-  let bestScore = 0
-  let bestMatch: any = null
-  
-  console.log(`   📐 开始匹配计算, 目标="${target}", 候选数=${candidates.length}`)
-  
-  for (const cand of candidates) {
-    const candName = cand.name || ''
-    const score = calculateSimilarity(target, candName)
-    
-    // [DEBUG] 打印每个候选的得分
-    if (score > 0.1) {
-      console.log(`      比较: "${candName.substring(0, 20)}..." 得分=${score.toFixed(3)}`)
-    }
-    
-    if (score > bestScore) {
-      bestScore = score
-      bestMatch = cand
-    }
-    
-    // 精确匹配直接返回
-    if (target === candName || target.includes(candName) || candName.includes(target)) {
-      return {
-        ...cand,
-        confidence: score >= 0.9 ? 'exact' : score >= 0.7 ? 'contains' : 'similarity',
-        shareClass: detectShareClass(cand.code, cand.name)
-      }
-    }
-  }
-  
-  // [FIX] 降低阈值到0.25（OCR名称可能有空格/断行导致不精确）
-  console.log(`   📊 最终最佳得分: ${bestScore.toFixed(3)}`)
-  
-  if (bestScore >= 0.25 && bestMatch) {
-    console.log(`   ✅ 返回匹配: ${bestMatch.code} - ${bestMatch.name} (得分=${bestScore.toFixed(3)})`)
-    return {
-      ...bestMatch,
-      confidence: bestScore >= 0.7 ? 'contains' : bestScore >= 0.4 ? 'similarity' : 'low',
-      shareClass: detectShareClass(bestMatch.code, bestMatch.name)
-    }
-  }
-  
-  return null
-}
-
-/**
- * [NEW] 计算两个字符串的相似度
- */
-function calculateSimilarity(s1: string, s2: string): number {
-  if (!s1 || !s2) return 0
-  if (s1 === s2) return 1
-  
-  // Levenshtein距离
-  const distance = levenshteinDistance(s1, s2)
-  const maxLen = Math.max(s1.length, s2.length)
-  
-  let similarity = maxLen > 0 ? 1 - (distance / maxLen) : 0
-  
-  // 包含关系加分
-  if (s1.includes(s2) || s2.includes(s1)) similarity += 0.3
-  
-  // 关键词重叠加分
-  const words1 = new Set(s1.split(/(?:混合|股票|债券|指数|ETF|QDII|发起|联接|增强|优选|精选|成长|价值|稳健|平衡|主题|策略|配置|灵活)/))
-  const words2 = new Set(s2.split(/(?:混合|股票|债券|指数|ETF|QDII|发起|联接|增强|优选|精选|成长|价值|稳健|平衡|主题|策略|配置|灵活)/))
-  let overlap = 0
-  words1.forEach(w => { if (words2.has(w)) overlap++ })
-  similarity += overlap * 0.05
-  
-  return Math.min(similarity, 1)
-}
-
-/**
- * [NEW] 提取搜索关键词
- */
-function extractSearchKeywords(name: string): string[] {
-  // 去掉常见后缀后的核心词
-  const cleaned = name
-    .replace(/\s*[A-C]\s*$/, '')
-    .replace(/\s*(发起式|联接|增强|(\(LOF\)|\(ETF\)))$/gi, '')
-    .trim()
-  
-  // 拆分为可能的搜索词
-  const keywords: string[] = []
-  
-  // 完整清理后的名字
-  if (cleaned.length >= 4) keywords.push(cleaned)
-  
-  // 提取公司名+产品线
-  const companyMatch = cleaned.match(/^(.{2,4})(.*)$/)
-  if (companyMatch) {
-    keywords.push(companyMatch[2])  // 产品线部分
-  }
-  
-  // 提取特征词组合
-  const featureWords = cleaned.match(/(产业|科技|信息|医疗|健康|消费|新能源|半导体|光伏|汽车|金融|地产|军工|环保|互联网|全球|战略|新兴|成长|价值|稳健|平衡|主题|量化|红利|蓝筹|龙头|领先|优势|核心|精选|优选|灵活)/g)
-  if (featureWords && featureWords.length >= 1) {
-    keywords.push(featureWords.slice(0, 2).join(''))  // 取前2个特征词
-  }
-  
-  return [...new Set(keywords)].filter(k => k.length >= 2)
-}
-
-// [WHAT] OCR文本解析的公共函数（本地OCR和AI识别共用）
-// [WHAT] OCR文本解析兜底函数（AI识别纯文本时调用）
-async function processOcrText(text: string) {
-  console.log('OCR fallback parse started')
-  
-  const lines = text.split('\n').map(line => line.trim()).filter(line => line.length > 0)
-  console.log('Lines:', lines)
-  
-  const fundList: any[] = []
-  const codeMap = new Map<string, number>()
-  
-  const foundCodes = new Map<string, { lineIndex: number, context: string }>()
-  for (let i = 0; i < lines.length; i++) {
-    const matches = lines[i].match(/(?<!\d)(\d{6})(?!\d)/g)
-    if (matches) {
-      for (const code of matches) {
-        if (!foundCodes.has(code)) {
-          foundCodes.set(code, { lineIndex: i, context: lines[i] })
-          console.log('Found code:', code, 'line', i)
-        }
-      }
-    }
-  }
-  
-  for (const [fundCode, info] of foundCodes) {
-    const line = info.context
-    const i = info.lineIndex
-    
-    const codeIdx = line.indexOf(fundCode)
-    const beforeCode = codeIdx >= 0 ? line.substring(0, codeIdx) : ''
-    const nameMatch = beforeCode.match(/[\u4e00-\u9fa5]+(?:ETF|QDII|QFII|LOF)?/g)
-    let fundName = nameMatch ? nameMatch.join('') : ''
-    
-    if (fundName.length < 4 && i > 0) {
-      const prevLine = lines[i - 1]
-      if (/[\u4e00-\u9fa5]{4,}/.test(prevLine) && !/(\d{6})/.test(prevLine)) {
-        fundName = prevLine + fundName
-      }
-    }
-    
-    fundName = fundName.replace(/^(基金|名称|我的|持有|近期|交易|排序)/, '').trim()
-    if (fundName.length < 2) continue
-    
-    const ocrShareMatch = fundName.match(/([A-C])\s*$/)
-    const ocrShareClass = ocrShareMatch ? ocrShareMatch[1] : ''
-    const nameCore = ocrShareClass ? fundName.slice(0, -1) : fundName
-    
-    try {
-      let fundInfo = null as any
-      
-      if (nameCore.length >= 4) {
-        const results = await searchFund(nameCore, 20)
-        const exact = results.filter((f: any) => f.name.includes(nameCore) || nameCore.includes(f.name))
-        if (exact.length > 0) {
-          if (ocrShareClass) {
-            fundInfo = exact.find((f: any) => {
-              const m = f.name.match(/([A-C])\s*$/)
-              return m && m[1] === ocrShareClass
-            })
-          }
-          if (!fundInfo) fundInfo = exact[0]
-        }
-        
-        if (!fundInfo) {
-          const simplified = nameCore.replace(/(混合|股票|债券|指数|ETF联接|联接|发起式|发起联接)/g, '')
-          if (simplified.length >= 4 && simplified !== nameCore) {
-            const fuzzy = await searchFund(simplified, 20)
-            fundInfo = fuzzy.find((f: any) => f.name.includes(nameCore) || nameCore.includes(f.name))
-          }
-        }
-      }
-      
-      if (!fundInfo) {
-        const codeResults = await searchFund(fundCode, 5)
-        fundInfo = codeResults.find((f: any) => f.code === fundCode)
-      }
-      
-      if (fundInfo) {
-        fundList.push({ code: fundInfo.code, name: fundInfo.name, shareClass: ocrShareClass || '', selected: true })
-        codeMap.set(fundInfo.code, fundList.length - 1)
-      } else {
-        fundList.push({ code: fundCode, name: fundName, shareClass: ocrShareClass || '', selected: true })
-        codeMap.set(fundCode, fundList.length - 1)
-      }
-    } catch (err) {
-      console.error('Query failed', fundCode, err)
-    }
-  }
-  
-  const coveredLines = new Set<number>()
-  for (const [, info] of foundCodes) coveredLines.add(info.lineIndex)
-  
-  for (let i = 0; i < lines.length; i++) {
-    if (coveredLines.has(i)) continue
-    
-    const line = lines[i]
-    if (/^(基金|名称|金额|收益|持有|排序|全部|股票|债券|混合|我的|近期|交易|更新|净值|持有收益|持有收益率)/.test(line)) continue
-    if (line.length < 4) continue
-    
-    const hasChinese = /[\u4e00-\u9fa5]{4,}/.test(line)
-    const hasNumber = /\d+\.\d{2}/.test(line)
-    if (!hasChinese || !hasNumber) continue
-    
-    const nameSegments = line.match(/[\u4e00-\u9fa5]+(?:ETF|QDII|QFII|LOF)?/g)
-    if (!nameSegments) continue
-    
-    let fundName = nameSegments.join('')
-    fundName = fundName.replace(/^(基金|名称|我的|持有|近期|交易|排序)/, '').trim()
-    if (fundName.length < 4) continue
-    
-    const shareClassMatch = fundName.match(/([A-C])$/)
-    const shareClass = shareClassMatch ? shareClassMatch[1] : ''
-    const nameCore = shareClass ? fundName.slice(0, -1) : fundName
-    
-    try {
-      const results = await searchFund(nameCore, 10)
-      if (results.length === 0) continue
-      
-      let bestMatch = results[0]
-      let bestScore = -1
-      for (const fund of results) {
-        let score = 0
-        const fundNameLower = fund.name.toLowerCase()
-        const ocrNameLower = nameCore.toLowerCase()
-        if (fundNameLower.includes(ocrNameLower) || ocrNameLower.includes(fundNameLower)) score += 10
-        if (shareClass) {
-          if (fundNameLower.endsWith(shareClass.toLowerCase())) score += 20
-          else score -= 5
-        }
-        score += fund.name.length * 0.1
-        if (score > bestScore) { bestScore = score; bestMatch = fund }
-      }
-      
-      if (bestScore < 5) continue
-      
-      if (!codeMap.has(bestMatch.code)) {
-        fundList.push({ code: bestMatch.code, name: bestMatch.name, shareClass: shareClass || '', selected: true })
-        codeMap.set(bestMatch.code, fundList.length - 1)
-      }
-    } catch (err) {
-      console.error('Query failed', fundName, err)
-    }
-  }
-  
-  extractedFunds.value = fundList
-  if (fundList.length === 0) {
-    showToast('No fund info recognized')
-  } else {
-    showToast(`Recognized ${fundList.length} funds`)
-  }
-}
-
-
-async function searchByFundNames(potentialNames: { lineIndex: number, text: string }[], lines: string[]) {
-  console.log('🔍 开始纯名称搜索，过滤垃圾内容...')
-  
-  for (const item of potentialNames) {
-    const rawName = item.text.trim()
-    const lineIdx = item.lineIndex
-    
-    // [ENHANCED] 使用新的垃圾内容过滤器
-    if (isGarbageContent(rawName)) {
-      console.log(`⚠️ 跳过垃圾内容: "${rawName}"`)
-      continue
-    }
-    
-    // [ENHANCED] 使用新的cleanFundName函数
-    const cleanName = cleanFundName(rawName)
-    if (!cleanName || cleanName.length < 2) {
-      console.log(`⚠️ 清理后名称无效: "${rawName}" → "${cleanName}"`)
-      continue
-    }
-    
-    console.log(`尝试搜索基金名称: "${cleanName}" (原始: "${rawName}")`)
-    
-    try {
-      // [ENHANCED] 使用新的模糊匹配函数 - 先搜索候选基金
-      const searchResults = await searchFund(cleanName, 10)
-      const matchedFund = findBestSimilarityMatch(cleanName, searchResults || [], 0.55)
-      
-      if (matchedFund && matchedFund.code) {
-        // 从相邻行提取数值信息（增强版）
-        let amount = '', profit = '', rate = '', costPrice = ''
-        
-        // 检查后续3行的数值
-        for (let j = lineIdx + 1; j < Math.min(lineIdx + 4, lines.length); j++) {
-          const nextLine = lines[j]
-          
-          // 净值/金额格式：5,219.94 或 5219.94 或 1,858.18
-          if (!amount) {
-            const amountMatch = nextLine.match(/(\d{1,3}(?:,\d{3})*\.\d{2,4})(?![%])/)
-            if (amountMatch) amount = amountMatch[1].replace(/,/g, '')
-          }
-          
-          // 盈亏格式：-530.06 或 +123.45 或 -139.70
-          if (!profit) {
-            const profitMatch = nextLine.match(/([+-]\d{1,3}(?:,\d{3})*\.\d{2})(?!\s*%)/)
-            if (profitMatch) profit = profitMatch[1].replace(/,/g, '')
-          }
-          
-          // 收益率格式：-9.22% 或 +5.67% 或 -0.77%
-          if (!rate) {
-            const rateMatch = nextLine.match(/([+-]?\d+\.?\d*)\s*%/)
-            if (rateMatch) rate = rateMatch[1]
-          }
-          
-          // 成本价格式：1.2345 或 2.56
-          if (!costPrice) {
-            const costMatch = nextLine.match(/(\d+\.\d{2,4})(?!\s*%)/)
-            if (costMatch) costPrice = costMatch[1]
-          }
-          
-          // 如果都找到了，停止搜索
-          if (amount && profit && rate) break
-        }
-        
-        extractedFunds.value.push({
-          code: matchedFund.code,
-          name: matchedFund.name,
-          amount: amount || '',
-          profit: profit || '',
-          rate: rate ? rate + '%' : '',
-          costPrice: costPrice || '',
-          shareClass: matchedFund.shareClass || '',
-          selected: true,
-          matchConfidence: matchedFund.confidence || 'similarity'
-        })
-        
-        console.log(`✅ 匹配成功: ${matchedFund.code} - ${matchedFund.name} (置信度: ${matchedFund.confidence})`)
-        console.log(`   金额: ${amount}, 盈亏: ${profit}, 收益率: ${rate}%, 成本价: ${costPrice}`)
-      } else {
-        console.log(`⚠️ 未找到匹配: "${cleanName}"`)
-        
-        // [NEW] 即使未匹配也保留记录（用于手动补全）
-        if (cleanName.length >= 4) {
-          extractedFunds.value.push({
-            code: '',
-            name: cleanName,
-            amount: '',
-            profit: '',
-            rate: '',
-            costPrice: '',
-            shareClass: '',
-            selected: true,
-            matchConfidence: 'none'
-          })
-          console.log(`📝 保留未匹配记录用于手动补全: "${cleanName}"`)
-        }
-      }
-    } catch (error: any) {
-      console.error(`搜索失败 (${cleanName}):`, error)
-    }
-  }
-  
-  importProgress.value = 100
-  console.log(`✅ 纯名称搜索完成，共找到 ${extractedFunds.value.length} 只基金`)
-}
-
-// [WHAT] 处理发现的基金代码（核心解析逻辑）
-async function processFoundCodes(foundCodes: Map<string, { lineIndex: number, context: string }>, lines: string[]) {
-  const fundList: any[] = []
-  const codeMap = new Map<string, number>()
-  
-  for (const [fundCode, info] of foundCodes) {
-    const line = info.context
-    const i = info.lineIndex
-    
-    // 提取基金名称
-    const codeIdx = line.indexOf(fundCode)
-    const beforeCode = codeIdx >= 0 ? line.substring(0, codeIdx) : ''
-    const nameMatch = beforeCode.match(/[\u4e00-\u9fa5]+(?:ETF|QDII|QFII|LOF)?/g)
-    let fundName = nameMatch ? nameMatch.join('') : ''
-    
-    if (fundName.length < 4 && i > 0) {
-      const prevLine = lines[i - 1]
-      if (/[\u4e00-\u9fa5]{4,}/.test(prevLine) && !/(\d{6})/.test(prevLine)) {
-        fundName = prevLine + fundName
-      }
-    }
-    
-    fundName = fundName.replace(/^(基金|名称|我的|持有|近期|交易|排序|连续\d+年跑赢大盘|长期绩优)/, '').trim()
-    if (fundName.length < 2) continue
-    
-    // 提取净值、收益率、盈亏等（与原逻辑一致）
-    const afterCode = codeIdx >= 0 ? line.substring(codeIdx + 6) : ''
-    const navMatch = afterCode.match(/(\d+\.\d{4})/)
-    const nav = navMatch ? navMatch[1] : ''
-    
-    let rate = ''
-    const rateMatch = line.match(/([+-]?\d+\.?\d*)\s*%/)
-    if (rateMatch) rate = rateMatch[1] + '%'
-    
-    let profit = ''
-    const profitMatches = line.match(/([+-]\d+\.?\d*)\s*(?!\s*%)/g)
-    if (profitMatches && profitMatches.length > 0) profit = profitMatches[0].trim()
-    
-    console.log(`提取到信息: 代码=${fundCode}, 名称=${fundName}, 净值=${nav}, 盈亏=${profit}, 收益率=${rate}`)
-    
-    if (codeMap.has(fundCode)) continue
-    
-    // 核心策略：用基金名称搜索
-    const ocrShareMatch = fundName.match(/([A-C])\s*$/)
-    const ocrShareClass = ocrShareMatch ? ocrShareMatch[1] : ''
-    const nameCore = ocrShareClass ? fundName.slice(0, -1) : fundName
-
-    try {
-      let fundInfo = null as any
-      
-      if (nameCore.length >= 4) {
-        const nameResults = await searchFund(nameCore, 20)
-        
-        // 策略1：精确匹配
-        const exactMatches = nameResults.filter((f: any) => 
-          f.name.includes(nameCore) || nameCore.includes(f.name)
-        )
-        
-        if (exactMatches.length > 0) {
-          if (ocrShareClass) {
-            fundInfo = exactMatches.find((f: any) => {
-              const apiShareMatch = f.name.match(/([A-C])\s*$/)
-              return apiShareMatch && apiShareMatch[1] === ocrShareClass
-            })
-          }
-          if (!fundInfo) fundInfo = exactMatches[0]
-          console.log(`通过名称 "${nameCore}" 找到 ${exactMatches.length} 个匹配，选择: ${fundInfo.code} - ${fundInfo.name}`)
-        }
-        
-        // 策略2：模糊匹配
-        if (!fundInfo) {
-          const simplifiedName = nameCore.replace(/(混合|股票|债券|指数|ETF联接|联接|发起式|发起联接)/g, '')
-          if (simplifiedName.length >= 4 && simplifiedName !== nameCore) {
-            const simpleResults = await searchFund(simplifiedName, 10)
-            fundInfo = simpleResults[0] || null
-            console.log(`通过简化名称 "${simplifiedName}" 搜索`)
-          }
-        }
-        
-        // 策略3：用代码搜索（兜底）
-        if (!fundInfo) {
-          try {
-            const codeResults = await searchFund(fundCode, 5)
-            if (codeResults.length > 0) {
-              fundInfo = codeResults[0]
-              console.log(`通过代码 "${fundCode}" 找到: ${fundInfo.name}`)
-            }
-          } catch (e) { /* 忽略 */ }
-        }
-        
-      }  // 关闭 if (nameCore.length >= 4)
-      
-      if (fundInfo) {
-        extractedFunds.value.push({
-          code: fundInfo.code,
-          name: fundInfo.name,
-          amount: nav || '',
-          profit: profit || '',
-          rate: rate || '',
-          shareClass: ocrShareClass || '',
-          selected: true
-        })
-        console.log(`✅ 添加基金: ${fundInfo.code} - ${fundInfo.name}`)
-      } else {
-        console.log(`⚠️ 未找到匹配: ${fundCode} - ${fundName}`)
-        extractedFunds.value.push({
-          code: fundCode,
-          name: fundName,
-          amount: nav || '',
-          profit: profit || '',
-          rate: rate || '',
-          shareClass: ocrShareClass || '',
-          selected: true
-        })
-      }
-    } catch (searchError: any) {
-      console.error(`搜索失败 (${fundCode}):`, searchError)
-    }
-  }  // 关闭 for循环
-  
-  importProgress.value = 100
-  console.log(`识别完成，共找到 ${extractedFunds.value.length} 只基金`)
-}  // 关闭 processFoundCards 函数
-
-
-// [BACKUP] 原始本地OCR识别函数（用于回退）
-async function startOcrImportBackup() {
-  if (!importImageFile.value) return
-  
-  // [NEW] 根据选择的模式调用不同的识别方法
-  if (ocrMode.value === 'ai') {
-    await startAiOcrImport()
-    return
-  }
-  
-  isImporting.value = true
-  importProgress.value = 0
-  extractedFunds.value = []
-  
-  try {
-    const worker = await createWorker('chi_sim+eng', 1, {
-      logger: (m: any) => {
-        if (m.status === 'recognizing text') {
-          importProgress.value = Math.round(m.progress * 100)
-        }
-      }
-    })
-    
-    const { data } = await worker.recognize(importImageFile.value)
-    await worker.terminate()
-    
-    const text = data.text
-    console.log('OCR 原始文本:', text)
-    
-    // [NEW] 预处理：去除汉字之间的空格（Tesseract常把中文拆成单个字）
-    const cleanedText = text.replace(/([\u4e00-\u9fa5])\s+([\u4e00-\u9fa5])/g, '$1$2')
-    console.log('OCR 预处理后文本:', cleanedText)
-    
-    const lines = cleanedText.split('\n').map(line => line.trim()).filter(line => line.length > 0)
-    console.log('分割后的行:', lines)
-    
-    const fundList: any[] = []
-    const codeMap = new Map<string, number>()
-    
-    // 第一步：全量扫描，收集所有6位基金代码
-    // [FIX] 更严格的过滤：排除明显不是基金代码的数字模式
-    const foundCodes = new Map<string, { lineIndex: number, context: string }>()
-    const invalidCodeLines = new Set<number>()  // [NEW] 记录包含无效代码的行
-    
-    // 已知的非基金代码模式（金额、日期、百分比等）
-    // [NOTE] 02xxxx 通常是日期或金额，极少有基金代码以02开头
-    const invalidCodePatterns = [
-      /^0[0-2]\d{4}$/,          // 00xxxx-02xxxx (日期、金额、小数)
-      /^\d{4}[01]\d[0-3]\d$/,  // 日期格式如20240709
-      /^[12]\d{5}$/,           // 100000-299999（通常是金额）
-      /^03\d{4}$/,             // 03xxxx（可能是时间03:xx:xx的误识别）
-      /^004\d{3}$/,            // 004xxx (常见误识别)
-      /^006\d{3}$/,            // 006xxx (常见误识别)
-    ]
-    
-    for (let i = 0; i < lines.length; i++) {
-      const line = lines[i]
-      const codeMatches = line.match(/(?<!\d)(\d{6})(?!\d)/g)
-      if (codeMatches) {
-        for (const code of codeMatches) {
-          // [FIX] 跳过无效代码
-          const isInvalid = invalidCodePatterns.some(p => p.test(code))
-          if (isInvalid) {
-            console.log(`❌ 跳过无效代码: ${code} (行${i}: ${line})`)
-            invalidCodeLines.add(i)  // [NEW] 标记该行有无有效代码
-            continue
-          }
-          
-          // [FIX] 检查该代码前后是否有中文基金名称特征
-          const codeIdx = line.indexOf(code)
-          const beforeCode = codeIdx >= 0 ? line.substring(0, codeIdx) : ''
-          const afterCode = codeIdx >= 0 ? line.substring(codeIdx + 6) : ''
-          
-          // 如果代码前面有"基金"、"联接"、"混合"等关键词，或后面有A/B/C，则认为更可信
-          const hasStrongFundContext = /基金|ETF|QDII|LOF|混合|股票|债券|指数|联接|发起/.test(beforeCode + afterCode) ||
-                                       /[ABC]$/.test(afterCode.trim().substring(0, 3))
-          
-          // [CRITICAL] 对于没有强上下文的代码，需要额外检查
-          if (!hasStrongFundContext) {
-            // 检查是否在金额/数值上下文中（如"市值:¥123,456"）
-            const isInValueContext = /[¥$￥:\s]\s*\d/.test(beforeCode.slice(-5)) || 
-                                     /[,.\d]%/.test(afterCode.slice(0, 5))
-            if (isInValueContext) {
-              console.log(`⚠️ 跳过金额上下文代码: ${code} (行${i})`)
-              continue
-            }
-          }
-          
-          if (!foundCodes.has(code)) {
-            foundCodes.set(code, { lineIndex: i, context: line })
-            console.log(`✅ 发现基金代码: ${code} (行${i}: ${line}, 强上下文=${hasStrongFundContext})`)
-          }
-        }
-      }
-    }
-    console.log(`共发现 ${foundCodes.size} 个唯一基金代码`)
-    
-    // 第二步：处理每个发现的代码
-    for (const [fundCode, info] of foundCodes) {
-      const line = info.context
-      const i = info.lineIndex
-      
-      const codeIdx = line.indexOf(fundCode)
-      const beforeCode = codeIdx >= 0 ? line.substring(0, codeIdx) : ''
-      const nameMatch = beforeCode.match(/[\u4e00-\u9fa5]+(?:ETF|QDII|QFII|LOF)?/g)
-      let fundName = nameMatch ? nameMatch.join('') : ''
-      
-      if (fundName.length < 4 && i > 0) {
-        const prevLine = lines[i - 1]
-        if (/[\u4e00-\u9fa5]{4,}/.test(prevLine) && !/(\d{6})/.test(prevLine)) {
-          fundName = prevLine + fundName
-        }
-      }
-      
-      fundName = fundName.replace(/^(基金|名称|我的|持有|近期|交易|排序|连续\d+年跑赢大盘|长期绩优)/, '').trim()
-      if (fundName.length < 2) continue
-      
-      const afterCode = codeIdx >= 0 ? line.substring(codeIdx + 6) : ''
-      const navMatch = afterCode.match(/(\d+\.\d{4})/)
-      const nav = navMatch ? navMatch[1] : ''
-      
-      let rate = ''
-      const rateMatch = line.match(/([+-]?\d+\.?\d*)\s*%/)
-      if (rateMatch) rate = rateMatch[1] + '%'
-      
-      let profit = ''
-      const profitMatches = line.match(/([+-]\d+\.?\d*)\s*(?!\s*%)/g)
-      if (profitMatches && profitMatches.length > 0) profit = profitMatches[0].trim()
-      
-      console.log(`提取到信息: 代码=${fundCode}, 名称=${fundName}, 净值=${nav}, 盈亏=${profit}, 收益率=${rate}`)
-      
-      if (codeMap.has(fundCode)) continue
-      
-      const ocrShareMatch = fundName.match(/([A-C])\s*$/)
-      const ocrShareClass = ocrShareMatch ? ocrShareMatch[1] : ''
-      const nameCore = ocrShareClass ? fundName.slice(0, -1) : fundName
-      
-      try {
-        let fundInfo = null as any
-        
-        if (nameCore.length >= 4) {
-          const nameResults = await searchFund(nameCore, 20)
-          
-          // [FIX] 放宽匹配条件：不再要求完全包含，优先使用评分最高的结果
-          if (nameResults.length > 0) {
-            if (ocrShareClass) {
-              fundInfo = nameResults.find((f: any) => {
-                const apiShareMatch = f.name.match(/([A-C])\s*$/)
-                return apiShareMatch && apiShareMatch[1] === ocrShareClass
-              })
-            }
-            if (!fundInfo) fundInfo = nameResults[0]  // 直接取最高分
-            console.log(`通过名称 "${nameCore}" 找到 ${nameResults.length} 个候选，选择: ${fundInfo.code} - ${fundInfo.name}`)
-          }
-          
-          if (!fundInfo) {
-            const simplifiedName = nameCore.replace(/(混合|股票|债券|指数|ETF联接|联接|发起式|发起联接)/g, '')
-            if (simplifiedName.length >= 4 && simplifiedName !== nameCore) {
-              const fuzzyResults = await searchFund(simplifiedName, 20)
-              fundInfo = fuzzyResults.find((f: any) => 
-                f.name.includes(nameCore) || nameCore.includes(f.name)
-              )
-              if (fundInfo) {
-                console.log(`通过模糊名称 "${simplifiedName}" 找到: ${fundInfo.code} - ${fundInfo.name}`)
-              }
-            }
-          }
-        }
-        
-        if (!fundInfo) {
-          const codeResults = await searchFund(fundCode, 5)
-          fundInfo = codeResults.find((f: any) => f.code === fundCode)
-          if (fundInfo) {
-            console.log(`通过代码 "${fundCode}" 兜底找到: ${fundInfo.code} - ${fundInfo.name}`)
-          }
-        }
-        
-        if (fundInfo) {
-          fundList.push({
-            code: fundInfo.code,
-            name: fundInfo.name,
-            amount: nav || undefined,
-            profit: profit || undefined,
-            rate: rate || undefined,
-            shareClass: ocrShareClass || '',
-            selected: true
-          })
-          codeMap.set(fundInfo.code, fundList.length - 1)
-          console.log(`✅ 识别到基金: ${fundInfo.code} - ${fundInfo.name}, 净值: ${nav}, 盈亏: ${profit}, 收益率: ${rate}`)
-        } else {
-          fundList.push({
-            code: fundCode,
-            name: fundName,
-            amount: nav || undefined,
-            profit: profit || undefined,
-            rate: rate || undefined,
-            shareClass: ocrShareClass || '',
-            selected: true
-          })
-          codeMap.set(fundCode, fundList.length - 1)
-          console.log(`⚠️ 使用OCR原始数据: ${fundCode} - ${fundName}`)
-        }
-      } catch (err) {
-        console.error(`查询基金 ${fundCode} 失败:`, err)
-      }
-    }
-    
-    // 第三步：扫描未被代码行覆盖的行，用名称搜索兜底（无代码场景）
-    const coveredLines = new Set<number>()
-    for (const [, info] of foundCodes) coveredLines.add(info.lineIndex)
-    
-    for (let i = 0; i < lines.length; i++) {
-      if (coveredLines.has(i)) continue
-      if (invalidCodeLines.has(i)) continue  // [NEW] 跳过包含无效代码的行（避免误识别）
-      
-      const line = lines[i]
-      
-      if (/^(基金|名称|金额|收益|持有|排序|全部|股票|债券|混合|我的|近期|交易|更新|人气|全球|CPO|净值|持有收益|持有收益率|立即刷新|导入|导入选中的基金|本地OCR|AI智能|图片识别)/.test(line)) continue
-      if (/^(HE|es|@|A|zao|<|BE|QV|mHB|co|wo|持有=)/.test(line)) continue
-      if (line.length < 3) continue
-      
-      // [FIX] 放宽条件：只要有中文就尝试提取（不再强制要求有数字）
-      const hasChinese = /[\u4e00-\u9fa5]{2,}/.test(line)
-      const hasNumber = /\d+\.\d{2}/.test(line)
-      
-      // 只要有中文字符就尝试匹配（包括纯名称行）
-      if (hasChinese) {
-        console.log(`📝 扫描到候选行: ${line}`)
-        
-        const nameSegments = line.match(/[\u4e00-\u9fa5]+(?:ETF|QDII|QFII|LOF)?/g)
-        if (!nameSegments || nameSegments.length === 0) continue
-        
-        let fundName = nameSegments.join('')
-        fundName = fundName.replace(/^(基金|名称|我的|持有|近期|交易|排序)/, '').trim()
-        if (fundName.length < 2) continue
-        
-        let shareClass = ''
-        const nameTailMatch = fundName.match(/([\u4e00-\u9fa5])([A-C])$/)
-        if (nameTailMatch) {
-          shareClass = nameTailMatch[2]
-          fundName = fundName.slice(0, -1)
-        }
-        if (!shareClass) {
-          const bracketClassMatch = line.match(/[）)]\s*([A-C])(?:\s|$|\d)/)
-          if (bracketClassMatch) shareClass = bracketClassMatch[1]
-        }
-        if (!shareClass) {
-          const inBracketMatch = line.match(/[（(]\s*([A-C])\s*[)）]/)
-          if (inBracketMatch) shareClass = inBracketMatch[1]
-        }
-        if (!shareClass) {
-          const initMatch = line.match(/发起(?:式|联接)\s*([A-C])/)
-          if (initMatch) shareClass = initMatch[1]
-        }
-        if (!shareClass) {
-          const cnTailClassMatch = line.match(/[\u4e00-\u9fa5]([A-C])\s/)
-          if (cnTailClassMatch) shareClass = cnTailClassMatch[1]
-        }
-        if (!shareClass) {
-          const tailMatch = line.match(/\s([A-C])\s*$/)
-          if (tailMatch) shareClass = tailMatch[1]
-        }
-        console.log(`提取到份额类型: ${shareClass || '(无)'}, 基金名称: ${fundName}`)
-        
-        let amount = ''
-        const amountMatches = line.match(/\d{1,3}(?:,\d{3})+\.\d{1,2}/g)
-        if (amountMatches && amountMatches.length > 0) {
-          amount = amountMatches[0]
-        } else {
-          const simpleAmountMatches = line.match(/(?<![+-])\d{1,6}\.\d{2}/g)
-          if (simpleAmountMatches && simpleAmountMatches.length > 0) {
-            amount = simpleAmountMatches.sort((a, b) => parseFloat(b) - parseFloat(a))[0]
-          }
-        }
-        
-        let rate = ''
-        const rateMatch = line.match(/([+-]?\d+\.?\d*)\s*%/)
-        if (rateMatch) rate = rateMatch[1] + '%'
-        
-        let profit = ''
-        const profitMatches = line.match(/([+-]\d+\.?\d*)\s*(?!\s*%)/g)
-        if (profitMatches && profitMatches.length > 0) profit = profitMatches[0].trim()
-        
-        console.log(`提取到信息: 名称=${fundName}, 份额=${shareClass}, 金额=${amount}, 盈亏=${profit}, 收益率=${rate}`)
-        
-        try {
-          const results = await searchFund(fundName, 10)
-          if (results.length === 0) continue
-          
-          let bestMatch = results[0]
-          let bestScore = -1
-          
-          for (const fund of results) {
-            let score = 0
-            const fundNameLower = fund.name.toLowerCase()
-            const ocrNameLower = fundName.toLowerCase()
-            
-            if (fundNameLower.includes(ocrNameLower) || ocrNameLower.includes(fundNameLower)) score += 10
-            
-            if (shareClass) {
-              if (fundNameLower.endsWith(shareClass.toLowerCase()) || 
-                  fundNameLower.includes(`(${shareClass.toLowerCase()})`) ||
-                  fundNameLower.includes(`（${shareClass}）`)) {
-                score += 20
-              } else {
-                score -= 5
-              }
-            }
-            
-            score += fund.name.length * 0.1
-            
-            console.log(`基金 ${fund.code} - ${fund.name}, 得分: ${score}`)
-            
-            if (score > bestScore) {
-              bestScore = score
-              bestMatch = fund
-            }
-          }
-          
-          if (bestScore < 5) {
-            console.log(`跳过低分匹配: ${fundName} -> ${bestMatch.name} (得分: ${bestScore})`)
-            continue
-          }
-          
-          if (codeMap.has(bestMatch.code)) {
-            const existingIndex = codeMap.get(bestMatch.code)!
-            const existing = fundList[existingIndex]
-            if (amount && !existing.amount) existing.amount = amount
-            if (profit && !existing.profit) existing.profit = profit
-            if (rate && !existing.rate) existing.rate = rate
-            console.log(`更新已有基金: ${bestMatch.code} - ${bestMatch.name}`)
-          } else {
-            fundList.push({
-              code: bestMatch.code,
-              name: bestMatch.name,
-              amount: amount || undefined,
-              profit: profit || undefined,
-              rate: rate || undefined,
-              shareClass: shareClass || '',
-              selected: true
-            })
-            codeMap.set(bestMatch.code, fundList.length - 1)
-            console.log(`识别到基金: ${bestMatch.code} - ${bestMatch.name}, 金额: ${amount}, 盈亏: ${profit}, 收益率: ${rate}`)
-          }
-        } catch (err) {
-          console.error(`查询基金 ${fundName} 失败:`, err)
-        }
-      }
-    }
-    
-    if (fundList.length === 0) {
-      showToast('未识别到基金信息，请确保图片清晰')
-      isImporting.value = false
-      return
-    }
-    
-    extractedFunds.value = fundList
-    showToast(`识别到 ${fundList.length} 只基金`)
-  } catch (err) {
-    console.error('OCR 识别失败:', err)
-    showToast('识别失败，请重试')
-  } finally {
-    isImporting.value = false
-    importProgress.value = 0
-  }
-}
-
-function withOcrTimeout<T>(operation: Promise<T>, timeoutMs: number, message: string): Promise<T> {
-  return Promise.race([
-    operation,
-    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(message)), timeoutMs))
-  ])
-}
-
-async function prepareLocalOcrImage(file: File): Promise<Blob> {
-  if (typeof createImageBitmap !== 'function') return file
-  try {
-    const bitmap = await createImageBitmap(file)
-    const maxPixels = 2_400_000
-    const scale = Math.min(1, Math.sqrt(maxPixels / (bitmap.width * bitmap.height)))
-    if (scale >= 1) return file
-    const canvas = document.createElement('canvas')
-    canvas.width = Math.max(1, Math.round(bitmap.width * scale))
-    canvas.height = Math.max(1, Math.round(bitmap.height * scale))
-    canvas.getContext('2d')?.drawImage(bitmap, 0, 0, canvas.width, canvas.height)
-    bitmap.close()
-    return await new Promise<Blob>((resolve, reject) => canvas.toBlob(blob => blob ? resolve(blob) : reject(new Error('图片预处理失败')), 'image/jpeg', 0.9))
-  } catch {
-    return file
-  }
-}
-
-async function startLocalOcrImport() {
-  if (!importImageFile.value) return
-  isImporting.value = true
-  importProgress.value = 5
-  extractedFunds.value = []
-
-  let worker: any = null
-  let workerPromise: Promise<any> | null = null
-  try {
-    const source = await prepareLocalOcrImage(importImageFile.value)
-    importProgress.value = 12
-    workerPromise = createWorker('chi_sim+eng', 1, {
-      logger: (message: any) => {
-        if (message.status === 'recognizing text') importProgress.value = 15 + Math.round(message.progress * 70)
-      }
-    }) as Promise<any>
-    try {
-      worker = await withOcrTimeout(workerPromise, 45_000, '本地识别引擎启动超时，请改用 AI 智能识别')
-    } catch (error) {
-      void workerPromise.then(lateWorker => lateWorker.terminate()).catch(() => undefined)
-      throw error
-    }
-    await worker.setParameters({ tessedit_pageseg_mode: '6', preserve_interword_spaces: '1' })
-    const { data } = await withOcrTimeout(worker.recognize(source), 75_000, '本地识别超时，请改用 AI 智能识别')
-    importProgress.value = 88
-
-    const drafts = parseLocalHoldingText(data.text).slice(0, 30)
-    let directory: Array<{ code: string; name: string }> = []
-    try {
-      directory = await withOcrTimeout(fetchFundList(), 15_000, '基金目录加载超时')
-    } catch (error) {
-      console.warn('本地 OCR 无法加载基金目录:', error)
-    }
-
-    extractedFunds.value = drafts.map(draft => {
-      const matched = resolveLocalFund(draft.name, directory)
-      return {
-        code: matched?.code || '',
-        name: matched?.name || draft.name,
-        amount: draft.amount || undefined,
-        profit: draft.profit || undefined,
-        rate: draft.rate ? `${draft.rate}%` : undefined,
-        shareClass: matched?.name.match(/([ABC])\s*$/i)?.[1]?.toUpperCase() || '',
-        selected: Boolean(matched?.code),
-        matchConfidence: matched ? 'exact' : 'none'
-      }
-    })
-    importProgress.value = 100
-    const ready = extractedFunds.value.filter(fund => fund.code).length
-    showToast(ready > 0 ? `识别到 ${drafts.length} 条，${ready} 条可导入` : '未识别到可确认的基金代码')
-  } catch (error: any) {
-    console.error('本地 OCR 识别失败:', error)
-    showToast(error?.message || '本地识别失败，请改用 AI 智能识别')
-  } finally {
-    if (worker) await worker.terminate().catch(() => undefined)
-    isImporting.value = false
-    setTimeout(() => { importProgress.value = 0 }, 1000)
-  }
-}
-
-async function startOcrImport() {
-  if (ocrMode.value === 'ai') await startAiOcrImport()
-  else await startLocalOcrImport()
 }
 
 // [WHAT] 切换基金选中状态
@@ -3809,16 +1768,15 @@ async function confirmImportFunds() {
   const newRecords: HoldingRecord[] = []
   
   for (const fund of selected) {
-    // 跳过已持有的基金
+    // Image import never overwrites an existing manually managed holding.
     if (holdingStore.hasHolding(fund.code)) {
       skipCount++
       continue
     }
-    
+
     try {
-      // [NEW] 获取当前净值用于计算份额
       const estimate = await fetchFundEstimate(fund.code)
-      const currentNav = parseFloat(estimate.gsz) || parseFloat(estimate.dwjz) || 1
+      const currentNav = parseFloat(estimate.gsz) || parseFloat(estimate.dwjz) || 0
       
       const basis = deriveHoldingImportBasis(fund, currentNav)
       if (!basis) throw new Error('识别到的金额无法计算持仓')
@@ -3841,7 +1799,7 @@ async function confirmImportFunds() {
         holdingDays: 0,
         createdAt: Date.now()
       }
-      
+
       newRecords.push(record)
     } catch (err: any) {
       failureCount++
@@ -3882,6 +1840,7 @@ async function confirmImportFunds() {
   importImagePreview.value = ''
   importImageFile.value = null
   extractedFunds.value = []
+  jdImportedAdjustments.value = []
 }
 
 // [WHAT] 关闭导入弹窗
@@ -3890,11 +1849,31 @@ function closeImportDialog() {
   importImagePreview.value = ''
   importImageFile.value = null
   extractedFunds.value = []
+  jdImportedAdjustments.value = []
 }
 </script>
 
 <template>
   <div class="holding-page">
+    <DataSourceSelector
+      v-model:show="showDataSourceSelector"
+      :fund-code="dataSourceTargetCode"
+      :fund-name="dataSourceTargetName"
+      @select="applyHoldingDataSource"
+    />
+    <van-popup
+      :show="isJdImporting"
+      class="jd-sync-progress"
+      :close-on-click-overlay="false"
+      :closeable="false"
+      :safe-area-inset-bottom="true"
+    >
+      <van-loading size="28px" color="#1989fa" />
+      <div class="jd-sync-progress-title">京东账户读取</div>
+      <div class="jd-sync-progress-message">{{ jdSyncProgress.message }}</div>
+      <van-progress :percentage="jdSyncProgress.percentage" stroke-width="5" :show-pivot="false" />
+    </van-popup>
+
     <!-- 隐藏的文件输入 -->
     <input
       ref="fileInputRef"
@@ -3924,6 +1903,7 @@ function closeImportDialog() {
           <div class="summary-value" :class="summaryProfitClass">
             {{ holdingStore.summary.totalProfit >= 0 ? '+' : '' }}{{ formatMoney(holdingStore.summary.totalProfit) }}
           </div>
+          <div class="summary-rate" :class="summaryProfitClass">{{ formatPercent(holdingStore.summary.totalProfitRate) }}</div>
         </div>
         <div class="summary-item">
           <div class="summary-label">昨日收益</div>
@@ -4003,22 +1983,33 @@ function closeImportDialog() {
                 <span>{{ holding.name || '加载中...' }}</span>
               </div>
               <div class="fund-meta">
-                <a class="fund-code" :href="getJdFundLink(holding.code)" @click.stop>{{ holding.code }}</a>
-                <span v-if="holding.type" class="fund-type"> · {{ holding.type }}</span>
+                <a class="fund-code" :href="getJdFundLink(holding.code)" @click.stop.prevent="openJdFundDetail(holding.code)">{{ holding.code }}</a>
+                <button
+                  v-if="holding.type"
+                  type="button"
+                  class="fund-type alipay-fund-link"
+                  title="在支付宝中查看基金"
+                  @click.stop="openAlipayFundDetail(holding.code)"
+                > · {{ holding.type }}</button>
                 <span :class="['fund-tag', getStatusTagClass(holding)]">{{ getStatusTag(holding) }}</span>
                 <template v-for="(tag, idx) in getPendingTags(holding)" :key="idx">
-                  <span :class="['fund-tag', 'tag-pending', tag.type === 'add' ? 'tag-pending-add' : 'tag-pending-reduce']">{{ tag.label }}</span>
+                  <span :class="['fund-tag', 'tag-pending', tag.type === 'add' ? 'tag-pending-add' : tag.type === 'reduce' ? 'tag-pending-reduce' : 'tag-pending-convert']">{{ tag.label }}</span>
+                </template>
+                <template v-for="(tag, idx) in getSyncedTags(holding)" :key="`jd-${idx}`">
+                  <span :title="tag.title" :class="['fund-tag', 'tag-synced', tag.type === 'add' ? 'tag-synced-add' : tag.type === 'reduce' ? 'tag-synced-reduce' : 'tag-synced-convert']">{{ tag.label }}</span>
                 </template>
               </div>
-              <div class="fund-diff-info" v-if="hasDiffData(holding)">
-                <span class="diff-label">估值</span>
-                <span :class="['diff-value', getEstimateChangeClass(holding)]">{{ getDisplayEstimateChange(holding) }}</span>
-                <span class="diff-separator">|</span>
-                <span class="diff-label">{{ getRealChangeLabel(holding) }}</span>
-                <span :class="['diff-value', getRealChangeClass(holding)]">{{ getDisplayRealChange(holding) || '--' }}</span>
-                <span class="diff-separator">|</span>
-                <span class="diff-label">{{ getDiffLabel(holding) }}</span>
-                <span :class="['diff-value', getDiffClass(holding)]">{{ getDisplayDiff(holding) || '待计算' }}</span>
+              <div class="fund-diff-info">
+                <button type="button" class="estimate-source-button" title="切换估值来源" @click.stop="openDataSourceSelector(holding.code, holding.name)">估值 <van-icon name="arrow-down" /></button>
+                <template v-if="hasDiffData(holding)">
+                  <span :class="['diff-value', getEstimateChangeClass(holding)]">{{ getDisplayEstimateChange(holding) }}</span>
+                  <span class="diff-separator">|</span>
+                  <span class="diff-label">{{ getRealChangeLabel(holding) }}</span>
+                  <span :class="['diff-value', getRealChangeClass(holding)]">{{ getDisplayRealChange(holding) || '--' }}</span>
+                  <span class="diff-separator">|</span>
+                  <span class="diff-label">{{ getDiffLabel(holding) }}</span>
+                  <span :class="['diff-value', getDiffClass(holding)]">{{ getDisplayDiff(holding) || '待计算' }}</span>
+                </template>
               </div>
             </div>
             <div class="col-right">
@@ -4052,18 +2043,17 @@ function closeImportDialog() {
 
     <div class="holding-floating-actions" aria-label="持仓操作">
       <div class="import-menu-wrapper" ref="ocrMenuRef">
-        <button type="button" class="floating-action-button floating-import-button" title="图片导入" aria-label="图片导入" @click="triggerOcrMenu">
+        <button type="button" class="floating-action-button floating-import-button" title="导入持仓" aria-label="导入持仓" @click="triggerOcrMenu">
           <van-icon name="scan" size="21" />
         </button>
         <transition name="ocr-menu-fade">
           <div v-if="showOcrMenu" class="ocr-dropdown-menu">
-            <div v-for="option in ocrOptions" :key="option.value" class="ocr-menu-item" @click.stop="selectOcrMode(option.value)">
+            <div v-for="option in importOptions" :key="option.value" class="ocr-menu-item" @click.stop="selectImportOption(option.value)">
               <van-icon :name="option.icon" size="18" class="menu-item-icon" />
               <div class="menu-item-content">
                 <span class="menu-item-label">{{ option.label }}</span>
                 <span class="menu-item-desc">{{ option.desc }}</span>
               </div>
-              <van-icon v-if="ocrMode === option.value" name="success" size="16" class="menu-item-check" color="#1989fa" />
             </div>
           </div>
         </transition>
@@ -4300,7 +2290,7 @@ function closeImportDialog() {
     >
       <div class="trade-dialog">
         <div class="dialog-header">
-          <span>{{ tradeMode === 'add' ? '加仓' : '减仓' }}</span>
+          <span>{{ tradeMode === 'add' ? '加仓' : tradeMode === 'reduce' ? '减仓' : '转换' }}</span>
           <van-icon name="cross" @click="showTradeDialog = false" />
         </div>
 
@@ -4394,7 +2384,7 @@ function closeImportDialog() {
           </template>
 
           <!-- 减仓模式表单 -->
-          <template v-else>
+          <template v-else-if="tradeMode === 'reduce'">
             <!-- 减仓份额 -->
             <van-field
               v-model="reduceTradeForm.shares"
@@ -4466,6 +2456,30 @@ function closeImportDialog() {
               </span>
             </div>
           </template>
+
+          <template v-else>
+            <van-field v-model="convertTradeForm.shares" type="number" label="转换份额 *" placeholder="请输入转出份额" />
+            <van-field v-model="convertTradeForm.targetKeyword" label="转入基金 *" placeholder="输入基金名称或代码搜索" @update:model-value="searchConvertFund" />
+            <div v-if="convertSearchResults.length" class="convert-search-results">
+              <button v-for="fund in convertSearchResults" :key="fund.code" type="button" class="convert-search-item" @click="selectConvertFund(fund)">
+                <span>{{ fund.name }}</span><small>{{ fund.code }}</small>
+              </button>
+            </div>
+            <div v-if="convertTradeForm.targetCode" class="trade-preview">
+              <div class="preview-row"><span>转入基金</span><span class="preview-value">{{ convertTradeForm.targetName }} ({{ convertTradeForm.targetCode }})</span></div>
+              <div class="preview-row"><span>预计转出</span><span class="preview-value">{{ convertTradeForm.shares || '0' }} 份</span></div>
+            </div>
+            <van-field v-model="convertTradeForm.tradeDate" label="转换日期 *" readonly>
+              <template #input><input v-model="convertTradeForm.tradeDate" type="date" :max="todayStr" class="date-input-inline" /></template>
+            </van-field>
+            <div class="trade-time-slot">
+              <label class="time-slot-label">交易时段</label>
+              <div class="time-slot-buttons">
+                <button class="time-slot-btn" :class="{ active: convertTradeForm.tradeTimeSlot === 'before' }" @click="convertTradeForm.tradeTimeSlot = 'before'">15:00前</button>
+                <button class="time-slot-btn" :class="{ active: convertTradeForm.tradeTimeSlot === 'after' }" @click="convertTradeForm.tradeTimeSlot = 'after'">15:00后</button>
+              </div>
+            </div>
+          </template>
         </div>
 
         <!-- 待确认调仓记录 -->
@@ -4484,14 +2498,16 @@ function closeImportDialog() {
               <div class="pending-info">
                 <div class="pending-row">
                   <span class="pending-type" :class="item.type">
-                    {{ item.type === 'add' ? '加仓' : '减仓' }}
+                    {{ item.type === 'add' ? '加仓' : item.type === 'reduce' ? '减仓' : '转换' }}
                   </span>
                   <span class="pending-date">净值结算起始日 {{ item.confirmDate }}</span>
                 </div>
                 <div class="pending-detail">
                   {{ item.timeSlot === 'before' ? '15:00前' : '15:00后' }} |
                   {{ item.type === 'add' ? '金额' : '份额' }} {{ item.type === 'add' ? formatMoney(item.amount) : item.shares.toFixed(2) }} |
-                  {{ item.type === 'add' ? '预计新增份额' : '扣减成本' }} {{ item.type === 'add' ? item.shares.toFixed(2) : formatMoney(item.amount) }}
+                  <template v-if="item.type === 'add'">预计新增份额 {{ item.shares.toFixed(2) }}</template>
+                  <template v-else-if="item.type === 'reduce'">扣减成本 {{ formatMoney(item.amount) }}</template>
+                  <template v-else>转入 {{ item.targetName }} {{ item.targetShares?.toFixed(2) || '--' }} 份</template>
                 </div>
               </div>
               <van-button
@@ -4502,6 +2518,28 @@ function closeImportDialog() {
               >
                 取消
               </van-button>
+            </div>
+          </div>
+        </div>
+
+        <div class="synced-adjustments" v-if="currentSyncedAdjustments.length > 0">
+          <div class="pending-title synced-title">
+            <van-icon name="records-o" />
+            <span>京东已同步调仓（{{ currentSyncedAdjustments.length }}）</span>
+            <span class="pending-tip">仅记录，不修改持仓</span>
+          </div>
+          <div class="pending-list">
+            <div v-for="item in currentSyncedAdjustments" :key="`synced-${item.id}`" class="pending-item synced-item">
+              <div class="pending-info">
+                <div class="pending-row">
+                  <span class="pending-type" :class="item.type">
+                    {{ item.type === 'add' ? '买入' : item.type === 'reduce' ? '卖出' : '转换' }}
+                  </span>
+                  <span class="pending-date">{{ formatSyncedTradeTime(item) }}</span>
+                  <span v-if="item.status" class="synced-status">{{ item.status }}</span>
+                </div>
+                <div class="pending-detail">{{ getSyncedTradeDetail(item) }}</div>
+              </div>
             </div>
           </div>
         </div>
@@ -4523,6 +2561,13 @@ function closeImportDialog() {
             >
               <van-icon name="minus" /> 减仓
             </button>
+            <button
+              class="mode-btn mode-convert"
+              :class="{ active: tradeMode === 'convert' }"
+              @click="tradeMode = 'convert'"
+            >
+              <van-icon name="exchange" /> 转换
+            </button>
           </div>
           
           <div class="trade-action-buttons">
@@ -4530,7 +2575,7 @@ function closeImportDialog() {
             <van-button 
               block 
               type="primary" 
-              @click="tradeMode === 'add' ? confirmAddTrade() : confirmReduceTrade()"
+              @click="tradeMode === 'add' ? confirmAddTrade() : tradeMode === 'reduce' ? confirmReduceTrade() : confirmConvertTrade()"
             >
               确定
             </van-button>
@@ -4690,9 +2735,10 @@ function closeImportDialog() {
             v-if="!isImporting && importImagePreview" 
             block 
             type="primary" 
-            @click="startOcrImport"
+            icon="scan"
+            @click="startAiOcrImport"
           >
-            {{ ocrMode === 'ai' ? '🚀 AI智能识别' : '📷 本地OCR识别' }}
+            AI 智能识别
           </van-button>
           <van-button 
             v-if="extractedFunds.length > 0 && !isImporting" 
@@ -4722,6 +2768,32 @@ function closeImportDialog() {
 
 .holding-global-refresh {
   min-height: calc(100vh - var(--holding-tabbar-height) - env(safe-area-inset-top, 0px));
+}
+
+.jd-sync-progress {
+  width: min(280px, calc(100vw - 48px));
+  box-sizing: border-box;
+  padding: 24px;
+  border-radius: 8px;
+  text-align: center;
+}
+
+.jd-sync-progress :deep(.van-loading) {
+  margin: 0 auto 12px;
+}
+
+.jd-sync-progress-title {
+  color: var(--text-primary);
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.jd-sync-progress-message {
+  min-height: 20px;
+  margin: 8px 0 14px;
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 20px;
 }
 
 /* 与自选页 .top-header 对齐，避免在页面容器上重复叠加安全区。 */
@@ -4847,8 +2919,9 @@ function closeImportDialog() {
 }
 
 .holding-item {
-  display: flex;
-  justify-content: space-between;
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(174px, 52%);
+  gap: 8px;
   align-items: flex-start;
   padding: 8px;
   background: var(--bg-secondary);
@@ -4856,9 +2929,7 @@ function closeImportDialog() {
 }
 
 .col-name {
-  flex: 1;
   min-width: 0;
-  max-width: 44%;
   overflow: hidden;
 }
 
@@ -4875,6 +2946,8 @@ function closeImportDialog() {
   display: flex;
   align-items: center;
   gap: 4px;
+  flex-wrap: wrap;
+  min-height: 17px;
 }
 
 .col-name .fund-code {
@@ -4885,6 +2958,20 @@ function closeImportDialog() {
 .col-name .fund-type {
   font-size: 11px;
   color: var(--text-secondary);
+}
+
+.col-name .alipay-fund-link {
+  margin: 0;
+  padding: 0;
+  border: 0;
+  background: transparent;
+  font-family: inherit;
+  line-height: inherit;
+  cursor: pointer;
+}
+
+.col-name .alipay-fund-link:active {
+  color: var(--color-primary);
 }
 
 .col-name .fund-tag {
@@ -4924,6 +3011,20 @@ function closeImportDialog() {
   color: #1db82c;
 }
 
+.col-name .tag-pending-convert {
+  background: rgba(25, 137, 250, 0.14);
+  color: #1989fa;
+}
+
+.col-name .tag-synced {
+  border: 1px solid currentColor;
+  background: transparent;
+}
+
+.col-name .tag-synced-add { color: #c83b4b; }
+.col-name .tag-synced-reduce { color: #12845a; }
+.col-name .tag-synced-convert { color: #2176c7; }
+
 .col-name .tag {
   font-size: 10px;
   padding: 1px 4px;
@@ -4939,7 +3040,7 @@ function closeImportDialog() {
 
 .col-right {
   display: grid;
-  grid-template-columns: 62px 62px 62px;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   align-items: center;
   gap: 3px;
   flex-shrink: 0;
@@ -5016,14 +3117,30 @@ function closeImportDialog() {
   font-size: 11px;
   font-family: -apple-system, 'SF Mono', 'Roboto Mono', monospace;
   font-variant-numeric: tabular-nums;
-  white-space: nowrap;
-  flex-wrap: nowrap;
+  white-space: normal;
+  flex-wrap: wrap;
 }
 
 .diff-label {
   color: var(--text-secondary);
   font-size: 10px;
 }
+
+.estimate-source-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 1px;
+  min-height: 20px;
+  padding: 0 5px;
+  color: #1d8eb6;
+  font-size: 11px;
+  line-height: 18px;
+  background: color-mix(in srgb, #1d8eb6 9%, transparent);
+  border: 1px solid color-mix(in srgb, #1d8eb6 62%, transparent);
+  border-radius: 4px;
+}
+
+.estimate-source-button :deep(.van-icon) { font-size: 10px; }
 
 .diff-value {
   font-weight: 500;
@@ -5287,6 +3404,11 @@ function closeImportDialog() {
   background: rgba(29, 184, 44, 0.1);
 }
 
+.pending-type.convert {
+  color: #1989fa;
+  background: rgba(25, 137, 250, 0.1);
+}
+
 .pending-date {
   font-size: 12px;
   color: var(--text-secondary);
@@ -5296,6 +3418,52 @@ function closeImportDialog() {
   font-size: 12px;
   color: var(--text-tertiary);
   line-height: 1.4;
+}
+
+.synced-adjustments {
+  margin: 0 16px 12px;
+  padding: 12px;
+  background: rgba(25, 137, 250, 0.06);
+  border: 1px solid rgba(25, 137, 250, 0.2);
+  border-radius: 8px;
+  max-height: 210px;
+  overflow-y: auto;
+}
+
+.synced-title {
+  color: #1989fa;
+}
+
+.synced-item {
+  align-items: flex-start;
+  border: 1px solid var(--border-color);
+}
+
+.synced-status {
+  margin-left: auto;
+  max-width: 42%;
+  overflow: hidden;
+  color: var(--text-tertiary);
+  font-size: 11px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+@media (max-width: 480px) {
+  .pending-title,
+  .pending-row {
+    flex-wrap: wrap;
+  }
+
+  .pending-tip {
+    width: 100%;
+    margin-left: 24px;
+  }
+
+  .synced-status {
+    margin-left: 0;
+    max-width: 100%;
+  }
 }
 
 /* 底部操作栏 */
@@ -5310,7 +3478,8 @@ function closeImportDialog() {
 }
 
 .trade-mode-switch {
-  display: flex;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 10px;
   margin-bottom: 12px;
 }
@@ -5340,6 +3509,34 @@ function closeImportDialog() {
 .mode-reduce.active {
   background: linear-gradient(135deg, #1db82c, #52c41a);
 }
+
+.mode-convert.active {
+  background: #1989fa;
+}
+
+.convert-search-results {
+  margin: -8px 16px 10px;
+  border: 1px solid var(--border-color);
+  border-radius: 6px;
+  overflow: hidden;
+}
+
+.convert-search-item {
+  width: 100%;
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 9px 12px;
+  border: 0;
+  border-bottom: 1px solid var(--border-color);
+  color: var(--text-primary);
+  background: var(--bg-primary);
+  font: inherit;
+  text-align: left;
+}
+
+.convert-search-item:last-child { border-bottom: 0; }
+.convert-search-item small { color: var(--text-secondary); flex: 0 0 auto; }
 
 .mode-btn:active {
   transform: scale(0.97);
@@ -5595,6 +3792,18 @@ function closeImportDialog() {
   width: 100%;
   display: block;
   object-fit: contain;
+}
+
+.jd-cookie-content {
+  display: grid;
+  gap: 14px;
+  padding: 18px 16px;
+}
+
+.jd-cookie-privacy {
+  color: var(--text-secondary);
+  font-size: 12px;
+  line-height: 1.6;
 }
 
 .ocr-processing {

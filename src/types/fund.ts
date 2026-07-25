@@ -54,17 +54,20 @@ export interface FundEstimate {
  * 估值数据源枚举
  * [WHY] 支持多个数据源切换，提高估值准确度
  */
-export type DataSource = 'fundgz' | 'sina_ds2' | 'sina_ds3'
+export type DataSource = 'tiantian' | 'sina' | 'eastmoney' | 'fundgz' | 'sina_ds2' | 'sina_ds3'
 
 /** 数据源配置映射 */
 export const DATA_SOURCE_CONFIG: Record<DataSource, { id: number; name: string; description: string }> = {
-  fundgz: { id: 1, name: '天天基金', description: '东方财富主数据源' },
-  sina_ds2: { id: 2, name: '新浪A', description: '新浪财经 growthrate 口径' },
-  sina_ds3: { id: 3, name: '新浪B', description: '新浪财经 growthrate2 口径' }
+  tiantian: { id: 1, name: '天天基金', description: 'FundValuationLast 实时估值' },
+  sina: { id: 2, name: '新浪财经', description: '基金盘中估值' },
+  eastmoney: { id: 3, name: '东方财富', description: '最新已公布净值' },
+  fundgz: { id: 1, name: '天天基金', description: '旧版来源标识' },
+  sina_ds2: { id: 2, name: '新浪财经', description: '旧版来源标识' },
+  sina_ds3: { id: 2, name: '新浪财经', description: '旧版来源标识' }
 } as const
 
 /** 所有数据源列表 */
-export const ALL_DATA_SOURCES: DataSource[] = ['fundgz', 'sina_ds2', 'sina_ds3']
+export const ALL_DATA_SOURCES: DataSource[] = ['tiantian', 'sina', 'eastmoney']
 
 /**
  * 带数据源标记的估值数据（扩展版）
@@ -73,6 +76,12 @@ export const ALL_DATA_SOURCES: DataSource[] = ['fundgz', 'sina_ds2', 'sina_ds3']
 export interface FundEstimateWithSource extends FundEstimate {
   /** 数据来源 */
   source: DataSource
+  /** 估值可用于盘中价格，官方净值只用于对照和盘后展示。 */
+  kind?: 'estimate' | 'official_nav'
+  /** 上游数据的新鲜度由后端根据交易日和时间戳判定。 */
+  available?: boolean
+  /** 后端返回的来源说明，供选择器显示。 */
+  note?: string
 }
 
 /**
@@ -88,6 +97,8 @@ export interface MultiSourceEstimate {
   activeSource: DataSource
   /** 最佳数据源（智能选源结果） */
   bestSource?: DataSource
+  /** 推荐原因，避免用涨跌幅中位数伪造“最准”结论。 */
+  recommendationReason?: string
   /** 是否今日最准 */
   isTodayBest?: boolean
   /** 是否昨日最准 */
@@ -244,6 +255,10 @@ export interface WatchlistItem {
   lastValue?: string
   /** 是否加载中 */
   loading?: boolean
+  /** Published official NAV paired with realChange. */
+  officialValue?: string
+  /** Trading date for officialValue. */
+  officialValueDate?: string
   /** 当日真实涨跌幅（盘后基金机构公布） */
   realChange?: number
   /** 真实涨跌幅日期 */
@@ -307,8 +322,8 @@ export interface PendingAdjustment {
   code: string
   /** 基金名称 */
   name: string
-  /** 调仓类型：add=加仓，reduce=减仓 */
-  type: 'add' | 'reduce'
+  /** 调仓类型：add=加仓，reduce=减仓，convert=转换 */
+  type: 'add' | 'reduce' | 'convert'
   /** 交易日期（YYYY-MM-DD） */
   tradeDate: string
   /** 交易时段：before=15:00前，after=15:00后 */
@@ -323,10 +338,48 @@ export interface PendingAdjustment {
   fee: number
   /** 交易时参考净值 */
   nav: number
+  /** 转换目标基金代码 */
+  targetCode?: string
+  /** 转换目标基金名称 */
+  targetName?: string
+  /** 转入基金的预计份额 */
+  targetShares?: number
   /** 状态 */
   status: 'pending' | 'confirmed'
   /** 创建时间 */
   createdAt: number
+}
+
+/** 已从第三方账户同步的真实调仓记录，只做审计展示，不会再次改变持仓。 */
+export interface SyncedAdjustment {
+  id: string
+  source: 'jd'
+  code: string
+  name: string
+  type: 'add' | 'reduce' | 'convert'
+  tradeDate: string
+  /** Exact JD order time when the endpoint provides it. */
+  tradeTime?: string
+  shares?: number
+  amount?: number
+  targetCode?: string
+  targetName?: string
+  targetShares?: number
+  /** Third-party order status, for example paid or completed. */
+  status?: string
+  syncedAt: number
+}
+
+/** JD account-level values used only for display, never for position math. */
+export interface JdSyncedSummary {
+  source: 'jd'
+  yesterdayProfit: number
+  yesterdayBaseValue: number
+  /** Date reported by JD for the income rows, when available. */
+  profitDate?: string
+  /** Beijing calendar date on which the user manually synchronized. */
+  syncedOn: string
+  syncedAt: number
 }
 
 

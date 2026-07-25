@@ -39,10 +39,16 @@ export function addCalendarDays(dateString: string, days: number): string {
   return value.toISOString().slice(0, 10)
 }
 
-export function getSettlementNavStartDate(tradeDate: string, _timeSlot: 'before' | 'after'): string {
-  // Keep adjustments pending through the trade date. The first official NAV
-  // published for a later trading day performs the actual position update.
-  return addCalendarDays(tradeDate, 1)
+export function getSettlementNavStartDate(tradeDate: string, timeSlot: 'before' | 'after'): string {
+  // A pre-close order is included in the next session. Orders submitted after
+  // 15:00 wait through that next session and first participate one session later.
+  return addCalendarDays(tradeDate, timeSlot === 'before' ? 1 : 2)
+}
+
+export function getAdjustmentConfirmationAt(tradeDate: string, timeSlot: 'before' | 'after'): number {
+  const confirmationDate = addCalendarDays(tradeDate, 1)
+  const hour = timeSlot === 'before' ? '12:00:00' : '15:00:00'
+  return Date.parse(`${confirmationDate}T${hour}+08:00`)
 }
 
 export function findSettlementNav(

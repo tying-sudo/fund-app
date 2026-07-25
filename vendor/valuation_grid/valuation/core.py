@@ -13,6 +13,8 @@ from .providers import get_holdings, get_quotes, get_etf_realtime_change, get_fu
 # === 配置 ===
 DATA_DIR = Path(__file__).parent.parent / "data"
 STATE_FILE = DATA_DIR / "state.json"
+DEFAULT_STATE_FILE = Path(__file__).parent.parent / "default_state.json"
+STATE_BACKUP_DIR = DATA_DIR / "state-backups"
 _VALUATION_BATCH_MAX_WORKERS = 8
 _VALUATION_BATCH_TIMEOUT_SECONDS = 45
 
@@ -85,11 +87,9 @@ def flush_intraday_cache() -> None:
 
 
 def _set_nav_result(result: dict, entry: dict, note: str) -> dict:
-    # Official NAV is a settled value, rather than an intraday estimate.  Keep
-    # the same confidence contract across the direct NAV and live-source
-    # fallback paths so the UI never presents a valid settlement as 0%.
-    result["confidence"] = 1.0
-    result["calibrated_confidence"] = 1.0
+    # A settled NAV replaces the displayed change, but not the estimation
+    # confidence.  Confidence remains the original coverage/staleness score
+    # and is calibrated from the fund's historical deviations below.
     result["estimation_change"] = round(float(entry["change"]), 4)
     result["_source"] = "nav"
     result["_nav_date"] = entry["date"]
@@ -411,23 +411,83 @@ def _empty_state() -> dict:
         "sectors": []
     }
 
+
+def _read_state_file(path: Path) -> Optional[dict]:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            state = json.load(f)
+        if not isinstance(state, dict) or not isinstance(state.get("sectors"), list):
+            return None
+        return state
+    except Exception:
+        return None
+
+
+def _seed_state() -> dict:
+    state = _read_state_file(DEFAULT_STATE_FILE)
+    if state is None:
+        return _empty_state()
+    # The seed's timestamp is historical. A recovered runtime state gets a
+    # fresh revision when it is atomically persisted below.
+    state.pop("updated_at", None)
+    return state
+
+
+def _fund_count(state: Optional[dict]) -> int:
+    if not isinstance(state, dict):
+        return 0
+    return sum(
+        len(sector.get("funds", []))
+        for sector in state.get("sectors", [])
+        if isinstance(sector, dict) and isinstance(sector.get("funds"), list)
+    )
+
+
+def _backup_state(state: dict) -> bool:
+    try:
+        STATE_BACKUP_DIR.mkdir(parents=True, exist_ok=True)
+        stamp = beijing_now().strftime("%Y%m%dT%H%M%S%f")
+        backup_file = STATE_BACKUP_DIR / f"state-before-delete-{stamp}.json"
+        with open(backup_file, "w", encoding="utf-8") as f:
+            json.dump(state, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
+
+
 def load_state() -> dict:
     _ensure_data_dir()
-    if not STATE_FILE.exists():
-        return _empty_state()
-    try:
-        with open(STATE_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    except:
-        return _empty_state()
+    current = _read_state_file(STATE_FILE)
+    if current is not None:
+        return current
 
-def save_state(state: dict) -> bool:
+    # A missing or malformed runtime file must not silently erase the tracked
+    # board catalogue during a deployment or service restart.
+    seeded = _seed_state()
+    if seeded.get("sectors"):
+        save_state(seeded)
+    return seeded
+
+
+def save_state(state: dict, expected_updated_at: Optional[str] = None) -> bool:
     _ensure_data_dir()
-    state["updated_at"] = beijing_now().strftime("%Y-%m-%d %H:%M:%S")
-    state.setdefault("version", 1)
 
     with _state_lock:
         try:
+            current = _read_state_file(STATE_FILE)
+            if expected_updated_at is not None:
+                current_updated_at = current.get("updated_at") if current else None
+                if current_updated_at != expected_updated_at:
+                    return False
+
+            # Keep a server-side recovery point before a valid editor deletes
+            # sectors or funds. Routine additions do not create backups.
+            if current is not None and _fund_count(state) < _fund_count(current):
+                if not _backup_state(current):
+                    return False
+
+            state["updated_at"] = beijing_now().strftime("%Y-%m-%d %H:%M:%S.%f")
+            state.setdefault("version", 1)
             tmp_file = STATE_FILE.with_suffix(".tmp")
             with open(tmp_file, "w", encoding="utf-8") as f:
                 json.dump(state, f, ensure_ascii=False, indent=2)
@@ -493,10 +553,8 @@ def _try_nav_fallback(result: dict, fund_code: str) -> dict:
         return result
 
     result["estimation_change"] = round(entry["change"], 4)
-    # A published NAV is not an estimate.  It is safe to render it at full
-    # confidence even when the holdings-through calculation was unavailable.
-    result["confidence"] = 1.0
-    result["calibrated_confidence"] = 1.0
+    # Keep the original confidence calculation intact. A NAV fallback supplies
+    # a settled change only; it does not create holdings coverage or history.
     result["_source"] = "nav"
     # 标记净值日期，前端据此显示"X月X日净值"
     result["_nav_date"] = entry["date"]

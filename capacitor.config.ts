@@ -18,7 +18,10 @@ const config: CapacitorConfig = {
   },
   android: {
     // [WHAT] 允许混合内容（HTTP + HTTPS）
-    allowMixedContent: true
+    allowMixedContent: true,
+    // Cookie is supplied only to the native JD importer. Never let Capacitor
+    // write bridge arguments, including that Cookie, to Android logcat.
+    loggingBehavior: 'none'
   }
 }
 

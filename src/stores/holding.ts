@@ -11,16 +11,22 @@
 
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import type { HoldingRecord, HoldingSummary, FundEstimate, PendingAdjustment } from '@/types/fund'
+import type { HoldingRecord, HoldingSummary, FundEstimate, JdSyncedSummary, PendingAdjustment, SyncedAdjustment } from '@/types/fund'
 import {
   getHoldings,
   upsertHolding as storageUpsertHolding,
   removeHolding as storageRemoveHolding,
   getPendingAdjustments,
-  savePendingAdjustments
+  savePendingAdjustments,
+  getJdSyncedAdjustments,
+  saveJdSyncedAdjustments,
+  getJdSyncedSummary,
+  saveJdSyncedSummary
 } from '@/utils/storage'
 
-import { fetchFundEstimateFast, fetchNetValueHistoryFast, fetchRealDayChange } from '@/api/fundFast'
+import { fetchFundEstimateFast, fetchNetValueHistoryFast, fetchRealDayChange, fetchValuationEstimateBySource } from '@/api/fundFast'
+import type { FundDailyReturnPoint, FundRealDayChange } from '@/api/fundFast'
+import { useFundStore } from './fund'
 import { getFundTypes } from '@/api/fund'
 import { persistCache } from '@/api/tiantianApi'
 import { fetchLatestValuationSettlement, rememberValuationSettlement } from '@/api/valuationGrid'
@@ -28,6 +34,7 @@ import { fetchLatestValuationSettlement, rememberValuationSettlement } from '@/a
 // 新增模块导入
 import {
   calculateHoldingProfit,
+  calculateOfficialHoldingProfit,
   hasUsableCurrentEstimate,
   hasUsableEstimateChange,
   getValuationComparisonState,
@@ -102,6 +109,8 @@ export const useHoldingStore = defineStore('holding', () => {
   
   /** 待确认调仓记录（加仓/减仓先记录，官方净值更新后确认） */
   const pendingAdjustments = ref<PendingAdjustment[]>([])
+  const syncedAdjustments = ref<SyncedAdjustment[]>([])
+  const jdSyncedSummary = ref<JdSyncedSummary | null>(null)
 
   
   /** 是否正在刷新 */
@@ -120,6 +129,8 @@ export const useHoldingStore = defineStore('holding', () => {
   let holdingsInitializationPromise: Promise<void> | null = null
   let holdingsInitialized = false
   const pendingSettlementLocks = new Set<string>()
+  let refreshPromise: Promise<void> | null = null
+  let refreshQueued = false
 
   /**
    * 写入防抖延迟（毫秒）
@@ -293,8 +304,13 @@ export const useHoldingStore = defineStore('holding', () => {
     const totalProfitRate = totalCost > 0 ? round((totalProfit / totalCost) * 100, PRECISION.PERCENT) : 0
     const todayBaseValue = totalValue - todayProfit
     const todayProfitRate = todayBaseValue > 0 ? round((todayProfit / todayBaseValue) * 100, PRECISION.PERCENT) : 0
-    const yesterdayProfitRate = yesterdayBaseValue > 0
-      ? round((yesterdayProfit / yesterdayBaseValue) * 100, PRECISION.PERCENT)
+    const currentJdSummary = jdSyncedSummary.value?.syncedOn === getTodayStr()
+      ? jdSyncedSummary.value
+      : null
+    const displayedYesterdayProfit = currentJdSummary?.yesterdayProfit ?? yesterdayProfit
+    const displayedYesterdayBaseValue = currentJdSummary?.yesterdayBaseValue ?? yesterdayBaseValue
+    const yesterdayProfitRate = displayedYesterdayBaseValue > 0
+      ? round((displayedYesterdayProfit / displayedYesterdayBaseValue) * 100, PRECISION.PERCENT)
       : 0
 
     return {
@@ -303,7 +319,7 @@ export const useHoldingStore = defineStore('holding', () => {
       totalProfit: round(totalProfit, PRECISION.AMOUNT),
       totalProfitRate,
       todayProfit: round(todayProfit, PRECISION.AMOUNT),
-      yesterdayProfit: round(yesterdayProfit, PRECISION.AMOUNT),
+      yesterdayProfit: round(displayedYesterdayProfit, PRECISION.AMOUNT),
       yesterdayProfitRate,
       todayProfitRate
     }
@@ -345,16 +361,15 @@ export const useHoldingStore = defineStore('holding', () => {
       const records = getHoldings()
       // 同时恢复待确认调仓记录
       pendingAdjustments.value = getPendingAdjustments()
-      logger.info('INIT', 'LOAD', `从本地加载 ${records.length} 条持仓记录，${pendingAdjustments.value.length} 条待确认调仓`)
+      syncedAdjustments.value = getJdSyncedAdjustments()
+      jdSyncedSummary.value = getJdSyncedSummary()
+      logger.info('INIT', 'LOAD', `从本地加载 ${records.length} 条持仓记录，${pendingAdjustments.value.length} 条待确认调仓，${syncedAdjustments.value.length} 条京东同步记录`)
 
       
       // [WHAT] 先从 fund-list.json 批量获取基金类型
-      const codes = records.map((r) => r.code)
-      const typeMap = await getFundTypes(codes).catch(() => new Map<string, string>())
-      
       holdings.value = records.map((r) => ({
         ...r,
-        type: r.type || typeMap.get(r.code) || '',
+        type: r.type || '',
         loading: true
       }))
       
@@ -373,8 +388,17 @@ export const useHoldingStore = defineStore('holding', () => {
           `缓存恢复: ${cacheHitCount}/${records.length} 只基金`)
         
         // 后台刷新最新估值（不阻塞UI渲染）
-        refreshEstimates()
+        void refreshEstimates()
       }
+
+      void getFundTypes(records.map((record) => record.code))
+        .then((typeMap) => {
+          holdings.value = holdings.value.map((holding) => ({
+            ...holding,
+            type: holding.type || typeMap.get(holding.code) || ''
+          }))
+        })
+        .catch(() => undefined)
 
       const duration = Math.round(performance.now() - startTime)
       holdingsInitialized = true
@@ -396,12 +420,31 @@ export const useHoldingStore = defineStore('holding', () => {
    * [OPT] 流式更新：每只基金加载完立即更新UI，不等待全部完成
    * [NEW] 使用新的计算引擎和完整日志记录
    */
-  async function refreshEstimates() {
+  function refreshEstimates(): Promise<void> {
+    // An add/import can happen while the page's background refresh is still
+    // running. Queue one complete pass so the newly added fund is not skipped.
+    if (refreshPromise) {
+      refreshQueued = true
+      return Promise.resolve()
+    }
+
+    refreshPromise = (async () => {
+      do {
+        refreshQueued = false
+        await refreshEstimatesOnce()
+      } while (refreshQueued)
+    })().finally(() => {
+      refreshPromise = null
+    })
+
+    return refreshPromise
+  }
+
+  async function refreshEstimatesOnce() {
     if (holdings.value.length === 0) {
       isRefreshing.value = false
       return
     }
-    if (isRefreshing.value) return
 
     updateHoldingDays()
     isRefreshing.value = true
@@ -419,10 +462,22 @@ export const useHoldingStore = defineStore('holding', () => {
         const fundStart = performance.now()
         
         try {
-          const [data, realData] = await Promise.all([
-            fetchFundEstimateFast(code),
-            fetchRealDayChange(code).catch(() => null)
+          const selectedSource = useFundStore().getFundDataSource(code)
+          const isNamedSource = selectedSource === 'tiantian' || selectedSource === 'sina' || selectedSource === 'eastmoney'
+          const estimateRequest = isNamedSource
+            ? fetchValuationEstimateBySource(code, selectedSource).catch(() => fetchFundEstimateFast(code))
+            : fetchFundEstimateFast(code)
+          const [estimateResult, realResult] = await Promise.allSettled([
+            estimateRequest,
+            fetchRealDayChange(code)
           ])
+          const realData = realResult.status === 'fulfilled' ? realResult.value : null
+          if (realData) {
+            hydrateHoldingYesterdayProfit(code, realData)
+          }
+          if (estimateResult.status !== 'fulfilled') throw estimateResult.reason
+
+          const data = estimateResult.value
 
           // A single atomic update prevents the previous official NAV from
           // briefly replacing the same-day estimate while refresh is running.
@@ -431,7 +486,9 @@ export const useHoldingStore = defineStore('holding', () => {
             data,
             realData?.changeRate,
             realData?.date,
-            realData?.nav
+            realData?.nav,
+            realData?.previous,
+            realData?.isCurrentPublication
           )
           if (realData) {
             await confirmPendingAdjustments(code, realData.date)
@@ -471,6 +528,32 @@ export const useHoldingStore = defineStore('holding', () => {
       const totalDuration = Math.round(performance.now() - startTime)
       
       logger.logRefreshComplete(codes.length, successCount, failCount, totalDuration)
+    }
+  }
+
+  /**
+   * Keep the asset card's yesterday result independent from a live estimate.
+   * This covers a holding that was deleted and then added back while a refresh
+   * is in flight or when the estimate provider temporarily has no quote.
+   */
+  function hydrateHoldingYesterdayProfit(code: string, dailyReturn: FundRealDayChange) {
+    const index = holdings.value.findIndex((item) => item.code === code)
+    if (index === -1) return
+
+    const holding = holdings.value[index]
+    const previousPoint = dailyReturn.previous || (
+      dailyReturn.date < getTodayStr()
+        ? { nav: dailyReturn.nav, changeRate: dailyReturn.changeRate }
+        : null
+    )
+    const profit = calculateOfficialHoldingProfit(previousPoint, holding.shares)
+    if (!profit) return
+
+    holdings.value[index] = {
+      ...holding,
+      previousProfit: profit.profit,
+      previousProfitRate: profit.profitRate,
+      previousBaseValue: profit.baseValue
     }
   }
 
@@ -523,7 +606,9 @@ export const useHoldingStore = defineStore('holding', () => {
     data: FundEstimate, 
     realChange?: number | null, 
     realChangeDate?: string | null,
-    realNav?: number | null
+    realNav?: number | null,
+    previousReal?: FundDailyReturnPoint | null,
+    realChangeIsCurrentPublication?: boolean
   ) {
     const index = holdings.value.findIndex((h) => h.code === code)
     if (index === -1) return
@@ -563,6 +648,7 @@ export const useHoldingStore = defineStore('holding', () => {
       realChange: effectiveRealChange,
       realChangeDate: effectiveRealDate,
       realNav,
+      realChangeIsCurrentPublication,
       now
     }
 
@@ -577,7 +663,7 @@ export const useHoldingStore = defineStore('holding', () => {
     // The all-market snapshot contains an already-published NAV. It is useful
     // for pricing, but must never replace the captured intraday estimate in
     // the "估值 | 昨" comparison.
-    const incomingIsOfficialSnapshot = estimate.source === 'market_snapshot'
+    const incomingIsOfficialSnapshot = estimate.source === 'market_snapshot' || estimate.kind === 'official_nav'
     const incomingComparison = getValuationComparisonState({
       realChange: effectiveRealChange,
       realChangeDate: effectiveRealDate,
@@ -610,6 +696,7 @@ export const useHoldingStore = defineStore('holding', () => {
       fundName: holding.name,
       realChange: effectiveRealChange,
       realChangeDate: effectiveRealDate,
+      isCurrentPublication: realChangeIsCurrentPublication,
       now
     })
     const officialChange = Number(effectiveRealChange)
@@ -624,15 +711,13 @@ export const useHoldingStore = defineStore('holding', () => {
       ? officialNav / officialDenominator
       : fallbackBaseNav
     const isPreviousOfficial = Boolean(effectiveRealDate) && effectiveRealDate! < today
-    const previousBaseValue = isPreviousOfficial && Number.isFinite(officialBaseNav) && officialBaseNav > 0
-      ? round(officialBaseNav * result.effectiveShares, PRECISION.AMOUNT)
-      : holding.previousBaseValue
-    const previousProfit = isPreviousOfficial && previousBaseValue !== undefined && Number.isFinite(officialChange)
-      ? round(previousBaseValue * officialChange / 100, PRECISION.AMOUNT)
-      : holding.previousProfit
-    const previousProfitRate = isPreviousOfficial && Number.isFinite(officialChange)
-      ? officialChange
-      : holding.previousProfitRate
+    const legacyPrevious = isPreviousOfficial && Number.isFinite(officialBaseNav) && officialBaseNav > 0
+      ? { nav: Number(officialNav) || officialBaseNav * officialDenominator, changeRate: officialChange }
+      : null
+    const previousOfficialProfit = calculateOfficialHoldingProfit(previousReal || legacyPrevious, result.effectiveShares)
+    const previousBaseValue = previousOfficialProfit?.baseValue ?? holding.previousBaseValue
+    const previousProfit = previousOfficialProfit?.profit ?? holding.previousProfit
+    const previousProfitRate = previousOfficialProfit?.profitRate ?? holding.previousProfitRate
 
     if (comparison.hasActualDiff && hasUsableEstimateChange(displayEstimateChange) && effectiveRealDate) {
       rememberValuationSettlement(code, {
@@ -645,12 +730,12 @@ export const useHoldingStore = defineStore('holding', () => {
     
     // 构建今日涨跌幅显示值
     let displayTodayChange: string
-    if (hasOfficialNavToday && effectiveRealChange !== undefined) {
+    if (useDelayedQdiiPublishedChange && effectiveRealChange !== undefined) {
+      displayTodayChange = effectiveRealChange.toFixed(2)
+    } else if (hasOfficialNavToday && effectiveRealChange !== undefined) {
       displayTodayChange = effectiveRealChange.toFixed(2)
     } else if (hasCurrentEstimate) {
       displayTodayChange = estimate.gszzl || '--'
-    } else if (useDelayedQdiiPublishedChange && effectiveRealChange !== undefined) {
-      displayTodayChange = effectiveRealChange.toFixed(2)
     } else if (trading) {
       // 盘中：优先显示估值
       displayTodayChange = '--'
@@ -816,6 +901,38 @@ export const useHoldingStore = defineStore('holding', () => {
     })
   }
 
+  /** Persist JD audit data without changing local position inputs or estimates. */
+  async function syncJdData(
+    adjustments: SyncedAdjustment[],
+    summary?: JdSyncedSummary
+  ): Promise<{ adjustments: number; updatedAdjustments: number; summary: boolean }> {
+    const adjustmentsById = new Map(syncedAdjustments.value.map((item) => [item.id, item]))
+    let adjustmentCount = 0
+    for (const adjustment of adjustments) {
+      const previous = adjustmentsById.get(adjustment.id)
+      if (!previous || JSON.stringify(previous) !== JSON.stringify(adjustment)) {
+        adjustmentsById.set(adjustment.id, adjustment)
+        adjustmentCount++
+      }
+    }
+    if (adjustmentCount > 0) {
+      syncedAdjustments.value = [...adjustmentsById.values()]
+        .sort((left, right) => (right.tradeTime || right.tradeDate).localeCompare(left.tradeTime || left.tradeDate) || right.syncedAt - left.syncedAt)
+        .slice(0, 300)
+      saveJdSyncedAdjustments(syncedAdjustments.value)
+    }
+
+    if (summary) {
+      jdSyncedSummary.value = summary
+      saveJdSyncedSummary(summary)
+    }
+
+    logger.info('JD_SYNC', 'COMPLETE', `JD audit sync: ${adjustments.length} records, ${adjustmentCount} updated`, {
+      data: { adjustments: adjustments.length, updatedAdjustments: adjustmentCount, summary: Boolean(summary) }
+    })
+    return { adjustments: adjustments.length, updatedAdjustments: adjustmentCount, summary: Boolean(summary) }
+  }
+
   /**
    * 删除持仓
    * [COMPATIBLE] 保持原有 API 不变
@@ -900,8 +1017,8 @@ export const useHoldingStore = defineStore('holding', () => {
     savePendingAdjustments(pendingAdjustments.value)
     logger.info(
       'PENDING',
-      record.type === 'add' ? 'ADD_RECORD' : 'REDUCE_RECORD',
-      `${record.code} ${record.type === 'add' ? '加仓' : '减仓'} 待确认，确认日=${record.confirmDate}`,
+      record.type === 'add' ? 'ADD_RECORD' : record.type === 'reduce' ? 'REDUCE_RECORD' : 'CONVERT_RECORD',
+      `${record.code} ${record.type === 'add' ? '加仓' : record.type === 'reduce' ? '减仓' : '转换'} 待确认，确认日=${record.confirmDate}`,
       { code: record.code, name: record.name, shares: record.shares, amount: record.amount }
     )
   }
@@ -954,6 +1071,43 @@ export const useHoldingStore = defineStore('holding', () => {
         }
         await addOrUpdateHolding(updatedRecord)
       }
+    } else if (pending.type === 'convert' && pending.targetCode && pending.targetName && pending.targetShares && pending.targetShares > 0) {
+      const currentShares = holding.shares || 0
+      const remainingShares = currentShares - pending.shares
+      if (remainingShares <= 0.0001) {
+        await removeHolding(pending.code)
+      } else {
+        const remainingAmount = Math.max(0, (holding.amount || 0) - pending.amount)
+        const costPrice = remainingAmount / remainingShares
+        await addOrUpdateHolding({
+          ...holding,
+          amount: round(remainingAmount, PRECISION.AMOUNT),
+          shares: round(remainingShares, 4),
+          buyNetValue: round(costPrice, PRECISION.RATE),
+          costUnitPrice: round(costPrice, PRECISION.RATE),
+          costPrice: round(costPrice, PRECISION.RATE)
+        })
+      }
+
+      const target = holdings.value.find((item) => item.code === pending.targetCode)
+      const targetAmount = (target?.amount || 0) + pending.amount
+      const targetShares = (target?.shares || 0) + pending.targetShares
+      const targetCost = targetShares > 0 ? targetAmount / targetShares : settlementNav
+      await addOrUpdateHolding({
+        ...(target || {}),
+        code: pending.targetCode,
+        name: pending.targetName,
+        type: target?.type || '',
+        shareClass: target?.shareClass || 'A',
+        amount: round(targetAmount, PRECISION.AMOUNT),
+        shares: round(targetShares, 4),
+        buyNetValue: round(targetCost, PRECISION.RATE),
+        costUnitPrice: round(targetCost, PRECISION.RATE),
+        costPrice: round(targetCost, PRECISION.RATE),
+        buyDate: target?.buyDate || pending.tradeDate,
+        holdingDays: target?.holdingDays || 0,
+        createdAt: target?.createdAt || Date.now()
+      })
     }
 
     pending.status = 'confirmed'
@@ -1064,6 +1218,8 @@ export const useHoldingStore = defineStore('holding', () => {
     // State
     holdings,
     pendingAdjustments,
+    syncedAdjustments,
+    jdSyncedSummary,
     isRefreshing,
     // Getters
     summary,
@@ -1075,6 +1231,7 @@ export const useHoldingStore = defineStore('holding', () => {
     refreshEstimates,
     addOrUpdateHolding,
     addHoldingDirect,
+    syncJdData,
     removeHolding,
     hasHolding,
     getHoldingByCode,

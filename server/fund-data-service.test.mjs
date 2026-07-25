@@ -11,6 +11,7 @@ import {
   parseFundHoldingsHtml,
   parseFundHoldingPeriodsHtml,
   parseSinaEstimatePayload,
+  selectFundDailyReturns,
   selectVerifiedOverseasMarket
 } from './fund-data-service.mjs'
 import { getFundEstimateMarketState } from './cache.mjs'
@@ -70,6 +71,59 @@ test('normalizes Eastmoney NAV history', () => {
     changePercent: -1.23, purchaseStatus: '开放申购', redemptionStatus: '开放赎回',
     dividend: null, navType: '1'
   })
+})
+
+test('keeps the prior NAV return stable until Beijing midnight', () => {
+  const items = [
+    { date: '2026-07-22', nav: 1.03, changePercent: 2.00 },
+    { date: '2026-07-21', nav: 1.01, changePercent: 1.00 },
+    { date: '2026-07-18', nav: 1.00, changePercent: -0.50 }
+  ]
+
+  const beforePublication = selectFundDailyReturns(items.slice(1), '2026-07-22')
+  assert.equal(beforePublication.latest.date, '2026-07-21')
+  assert.equal(beforePublication.current, null)
+  assert.equal(beforePublication.previous.date, '2026-07-21')
+
+  const afterPublication = selectFundDailyReturns(items, '2026-07-22')
+  assert.equal(afterPublication.current.date, '2026-07-22')
+  assert.equal(afterPublication.previous.date, '2026-07-21')
+
+  const afterMidnight = selectFundDailyReturns(items, '2026-07-23')
+  assert.equal(afterMidnight.current, null)
+  assert.equal(afterMidnight.previous.date, '2026-07-22')
+})
+
+test('keeps the latest trading-day return through a weekend', () => {
+  const items = [
+    { date: '2026-07-24', nav: 1.03, changePercent: 2.00 },
+    { date: '2026-07-23', nav: 1.01, changePercent: 1.00 }
+  ]
+  assert.equal(selectFundDailyReturns(items, '2026-07-25').previous.date, '2026-07-24')
+  assert.equal(selectFundDailyReturns(items, '2026-07-26').previous.date, '2026-07-24')
+})
+
+test('attributes a newly published delayed QDII return to the publication day', () => {
+  const beforePublication = [
+    { date: '2026-07-20', nav: 5.3418, changePercent: 1.09 },
+    { date: '2026-07-17', nav: 5.2841, changePercent: -3.97 }
+  ]
+  const afterPublication = [
+    { date: '2026-07-21', nav: 5.5828, changePercent: 4.51 },
+    ...beforePublication
+  ]
+
+  const before = selectFundDailyReturns(beforePublication, '2026-07-22', { delayedSettlement: true })
+  assert.equal(before.current, null)
+  assert.equal(before.previous.date, '2026-07-20')
+
+  const after = selectFundDailyReturns(afterPublication, '2026-07-22', { delayedSettlement: true })
+  assert.equal(after.current.date, '2026-07-21')
+  assert.equal(after.previous.date, '2026-07-20')
+
+  const afterMidnight = selectFundDailyReturns(afterPublication, '2026-07-23', { delayedSettlement: true })
+  assert.equal(afterMidnight.current, null)
+  assert.equal(afterMidnight.previous.date, '2026-07-21')
 })
 
 test('parses F10 holdings with market prefixes and report date', () => {

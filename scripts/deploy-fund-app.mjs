@@ -12,6 +12,7 @@ const password = process.env.DEPLOY_SSH_PASSWORD
 const privateKeyPath = process.env.DEPLOY_SSH_PRIVATE_KEY
 const sourceRoot = process.cwd()
 const webRoot = '/opt/fund-app'
+const webNext = `${webRoot}.next`
 const proxyRoot = '/opt/fund-proxy'
 const downloadRoot = '/opt/fund-downloads'
 const builderRoot = '/opt/fund-app-builder'
@@ -19,6 +20,9 @@ const builderNext = `${builderRoot}.next`
 const npmRegistry = 'https://registry.npmmirror.com'
 const apkPath = process.env.DEPLOY_APK_PATH
 const backendOnly = process.env.DEPLOY_BACKEND_ONLY === 'true'
+const skipMarketIndices = process.env.DEPLOY_SKIP_MARKET_INDICES === 'true'
+const releaseStamp = new Date().toISOString().replace(/[-:]/g, '').replace(/\..+$/, '')
+const webPrevious = `${webRoot}.previous-${releaseStamp}`
 
 async function readEnvironmentValue(name) {
   for (const file of ['.env.production.local', '.env.local']) {
@@ -347,14 +351,19 @@ try {
   const sftp = await getSftp(client)
   const autoReleaseInstalled = (await exec(client, 'if [ -x /usr/local/sbin/fund-app-auto-release ]; then printf 1; else printf 0; fi')).trim() === '1'
   if (autoReleaseInstalled) await syncApkBuilderSource(client, sftp)
-  if (!backendOnly) await uploadTree(client, sftp, join(sourceRoot, 'dist'), webRoot, new Set())
+  if (!backendOnly) {
+    await exec(client, `rm -rf ${webNext}; install -d -m 0755 ${webNext}`)
+    await uploadTree(client, sftp, join(sourceRoot, 'dist'), webNext, new Set())
+  }
   // Runtime cache and release metadata are managed on the host. Uploading the
   // local data directory here would overwrite live snapshots during a web-only
   // deployment.
   await uploadTree(client, sftp, join(sourceRoot, 'server'), proxyRoot, new Set(['node_modules', 'logs', 'data', '.env', '.env.local', '.env.production.local']))
   // This is a curated fallback, not a runtime snapshot. Keep the default index
   // watchlist available when an upstream quote provider is temporarily down.
-  await upload(sftp, join(sourceRoot, 'server', 'data', 'market-indices.json'), posix.join(proxyRoot, 'data', 'market-indices.json'))
+  if (!skipMarketIndices) {
+    await upload(sftp, join(sourceRoot, 'server', 'data', 'market-indices.json'), posix.join(proxyRoot, 'data', 'market-indices.json'))
+  }
   await configureMarketDatabase(client)
   if (zhipuApiKey) {
     await exec(client, `printf %s ${base64(`ZHIPU_API_KEY=${zhipuApiKey}\n`)} | base64 -d > /etc/fund-proxy.env; chmod 600 /etc/fund-proxy.env`)
@@ -367,10 +376,17 @@ try {
     await exec(client, `mv ${remoteTemp} ${remoteApk}; ln -sfn ${apkRelease.apkFileName} ${downloadRoot}/fund-app-latest.apk; printf %s ${base64(JSON.stringify(apkRelease.manifest))} | base64 -d > ${proxyRoot}/data/app-version.json`)
   }
 
-  await exec(client, `chown -R fundproxy:fundproxy ${webRoot} ${proxyRoot} ${downloadRoot} && chmod -R a+rX ${downloadRoot} && cd ${proxyRoot} && npm ci --omit=dev --no-audit --no-fund --registry=${npmRegistry}`)
+  const ownershipTargets = backendOnly
+    ? `${proxyRoot} ${downloadRoot}`
+    : `${webNext} ${proxyRoot} ${downloadRoot}`
+  await exec(client, `chown -R fundproxy:fundproxy ${ownershipTargets} && chmod -R a+rX ${downloadRoot} && cd ${proxyRoot} && npm ci --omit=dev --no-audit --no-fund --registry=${npmRegistry}`)
   await exec(client, `printf %s ${base64(fundProxyUnit)} | base64 -d > /etc/systemd/system/fund-proxy.service; printf %s ${base64(nginxSite)} | base64 -d > /etc/nginx/sites-available/fund-app; ln -sf /etc/nginx/sites-available/fund-app /etc/nginx/sites-enabled/fund-app; systemctl daemon-reload; systemctl enable fund-proxy; systemctl restart fund-proxy; nginx -t; systemctl enable --now nginx; systemctl reload nginx`)
 
   const health = (await waitForHealth(client)).trim()
+  if (!backendOnly) {
+    await exec(client, `test -s ${webNext}/index.html; if [ -d ${webRoot} ]; then mv ${webRoot} ${webPrevious}; fi; mv ${webNext} ${webRoot}`)
+    console.log(`Static rollback: ${webPrevious}`)
+  }
   if (apkRelease) {
     const version = (await exec(client, 'curl --fail --silent --show-error http://127.0.0.1/api/app/version')).trim()
     await exec(client, 'curl --fail --silent --show-error --head http://127.0.0.1/downloads/fund-app-latest.apk >/dev/null')

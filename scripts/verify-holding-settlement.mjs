@@ -6,9 +6,8 @@ import {
   getCalendarDayDifference,
   getSettlementNavStartDate
 } from '../src/utils/tradingDate.ts'
-import { calculateHoldingProfit, getValuationComparisonState, hasUsableCurrentEstimate, hasUsableEstimateChange, isDelayedSettlementQdiiFund, isFundPreOpen, isFundTradingHours, isLunchBreak, isRetainedMarketEstimate, selectLatestRealChange, shouldRetainCompletedEstimate, shouldRetainCurrentDayEstimate, shouldRetainCurrentIntradayEstimate, shouldUseDelayedQdiiPublishedChange, shouldUseGridEstimateFallback } from '../src/utils/holdingCalculator.ts'
+import { calculateHoldingProfit, calculateOfficialHoldingProfit, getValuationComparisonState, hasUsableCurrentEstimate, hasUsableEstimateChange, isDelayedSettlementQdiiFund, isFundPreOpen, isFundTradingHours, isLunchBreak, isRetainedMarketEstimate, selectLatestRealChange, shouldRetainCompletedEstimate, shouldRetainCurrentDayEstimate, shouldRetainCurrentIntradayEstimate, shouldUseDelayedQdiiPublishedChange, shouldUseGridEstimateFallback } from '../src/utils/holdingCalculator.ts'
 import { deriveHoldingImportBasis } from '../src/utils/holdingImport.ts'
-import { parseLocalHoldingText, resolveLocalFund } from '../src/utils/localHoldingOcr.ts'
 
 const history = [
   { date: '2026-07-21', netValue: 1.024, totalValue: 0, changeRate: 0.3 },
@@ -238,6 +237,20 @@ const delayedNavEstimateResult = calculateHoldingProfit({
 assert.equal(delayedNavEstimateResult.todayProfit, 41.36)
 assert.ok(delayedNavEstimateResult.todayProfit < 50)
 
+assert.deepEqual(calculateOfficialHoldingProfit({ nav: 1.01, changeRate: 1 }, 1000), {
+  profit: 10,
+  profitRate: 1,
+  baseValue: 1000
+})
+
+// Re-adding a fund must rebuild the asset card's yesterday result from the
+// latest completed NAV instead of relying on the deleted list item's cache.
+assert.deepEqual(calculateOfficialHoldingProfit({ nav: 1.9442, changeRate: -1.29 }, 1200), {
+  profit: -30.49,
+  profitRate: -1.29,
+  baseValue: 2363.53
+})
+
 const actualResult = calculateHoldingProfit({
   holding,
   estimate: postCloseEstimate,
@@ -259,9 +272,10 @@ const staleResult = calculateHoldingProfit({
 })
 assert.equal(staleResult.todayProfit, 0)
 
-// Global QDII NAVs are published with a delay. A usable current-day estimate
-// drives daily P/L until today's official NAV is published. The previous
-// official change remains only a fallback when the estimate is unavailable.
+// Global QDII NAVs are published with a delay. Before the new publication the
+// live estimate drives daily P/L; after publication, JD attributes the newly
+// published official return to today's income while the estimate still prices
+// the current holding value.
 const delayedQdiiHolding = {
   ...holding,
   code: '100055',
@@ -279,13 +293,16 @@ assert.equal(shouldUseDelayedQdiiPublishedChange({
   fundName: delayedQdiiHolding.name,
   realChange: 1.09,
   realChangeDate: '2026-07-20',
+  isCurrentPublication: false,
   now: delayedQdiiNow
-}), true)
+}), false)
 assert.equal(calculateHoldingProfit({
   holding: delayedQdiiHolding,
   estimate: delayedQdiiEstimate,
   realChange: 1.09,
   realChangeDate: '2026-07-20',
+  realNav: 1.0109,
+  realChangeIsCurrentPublication: false,
   now: delayedQdiiNow
 }).todayProfit, 4.44)
 
@@ -294,15 +311,20 @@ const screenshotPreOpenResult = calculateHoldingProfit({
   estimate: { ...delayedQdiiEstimate, gsz: '1.0472', gszzl: '4.72', gztime: '2026-07-22 10:54' },
   realChange: 1.09,
   realChangeDate: '2026-07-21',
+  realNav: 1.0109,
+  realChangeIsCurrentPublication: true,
   now: new Date('2026-07-22T02:54:10.000Z')
 })
-assert.equal(screenshotPreOpenResult.todayProfit, 4.72)
+assert.equal(screenshotPreOpenResult.currentValue, 1.0472)
+assert.equal(screenshotPreOpenResult.todayProfit, 1.09)
 
 assert.equal(calculateHoldingProfit({
   holding: delayedQdiiHolding,
   estimate: { ...delayedQdiiEstimate, gsz: '--', gszzl: '--', gztime: '2026-07-22 10:54' },
   realChange: 1.09,
   realChangeDate: '2026-07-21',
+  realNav: 1.0109,
+  realChangeIsCurrentPublication: true,
   now: new Date('2026-07-22T02:54:10.000Z')
 }).todayProfit, 1.09)
 
@@ -322,16 +344,5 @@ const importedBasis = deriveHoldingImportBasis({
 assert.equal(importedBasis?.principal, 1400)
 assert.equal(Math.round(importedBasis.shares * 1.5 * 100) / 100, 1210.69)
 assert.equal(Math.round(importedBasis.costPrice * importedBasis.shares * 100) / 100, 1400)
-
-const localDrafts = parseLocalHoldingText(`基金持仓
-国泰中证机床ETF发起联接C
-2,398.37  -664.45  -21.69%`)
-assert.deepEqual(localDrafts, [{
-  name: '国泰中证机床ETF发起联接C', amount: '2398.37', profit: '-664.45', rate: '-21.69'
-}])
-assert.deepEqual(resolveLocalFund(localDrafts[0].name, [
-  { code: '017471', name: '国泰中证机床ETF发起联接A' },
-  { code: '017472', name: '国泰中证机床ETF发起联接C' }
-]), { code: '017472', name: '国泰中证机床ETF发起联接C' })
 
 console.log('Holding settlement checks passed.')

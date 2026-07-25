@@ -274,6 +274,42 @@ export function parseFundHistoryPayload(payload, code) {
   })).filter(item => item.date && item.nav !== null)
 }
 
+function previousWeekday(date) {
+  const value = new Date(`${date}T12:00:00Z`)
+  if (Number.isNaN(value.getTime())) return null
+  do {
+    value.setUTCDate(value.getUTCDate() - 1)
+  } while (value.getUTCDay() === 0 || value.getUTCDay() === 6)
+  return value.toISOString().slice(0, 10)
+}
+
+export function selectFundDailyReturns(items, marketDate, { delayedSettlement = false } = {}) {
+  const eligible = (Array.isArray(items) ? items : [])
+    .filter(item => item?.date && item.date <= marketDate && Number.isFinite(Number(item.nav)))
+    .sort((left, right) => right.date.localeCompare(left.date))
+
+  const latest = eligible[0] || null
+  const valuationCurrent = eligible.find(item => item.date === marketDate) || null
+  // Global QDII NAVs are normally published on the following Beijing workday.
+  // JD attributes that newly published return to the publication day, not to
+  // the NAV date. Keep the preceding NAV return as yesterday's income.
+  const delayedCurrent = delayedSettlement && !valuationCurrent &&
+    latest?.date === previousWeekday(marketDate)
+      ? latest
+      : null
+  const current = valuationCurrent || delayedCurrent
+  const previous = delayedCurrent
+    ? eligible.find(item => item.date < delayedCurrent.date) || null
+    : eligible.find(item => item.date < marketDate) || null
+
+  return {
+    marketDate,
+    latest,
+    current,
+    previous
+  }
+}
+
 function historyTtlMs() {
   const market = getBeijingMarketState()
   if (market.isOpen) return 30 * 60 * 1000
@@ -337,6 +373,23 @@ export async function getFundHistory(code, limit = 30) {
       return { ...persisted, items: persisted.items.slice(0, boundedLimit), cache: 'stale_disk', stale: true, error: error.message }
     }
     throw error
+  }
+}
+
+export async function getFundDailyReturns(code) {
+  const marketDate = getBeijingMarketState().date
+  const history = await getFundHistory(code, 10)
+  const profile = getFundProfile(code)
+  const market = getFundEstimateMarketState(profile || {}).market
+  return {
+    code,
+    name: history.name || getFundProfile(code)?.name || '',
+    source: history.source || 'eastmoney_lsjz',
+    updatedAt: history.updatedAt || history.cachedAt || null,
+    stale: Boolean(history.stale),
+    ...selectFundDailyReturns(history.items, marketDate, {
+      delayedSettlement: market === 'us' || market === 'overseas'
+    })
   }
 }
 
@@ -818,64 +871,137 @@ export async function getReliableFundEstimates(codes, now = new Date()) {
   return results
 }
 
-export async function getFundEstimateSources(code, now = new Date()) {
-  const primary = await fetchFundEstimates([code], now)
-  const profile = getFundProfile(code)
-  const sources = {}
-  if (primary[code]) sources[primary[code].source || 'fundgz'] = decorateEstimate(code, primary[code])
-  if (!profile?.snapshot?.isMoneyMarket) {
-    try {
-      const sina = await getSinaEstimateSources(code, now)
-      const market = getFundEstimateMarketState(profile || {}, now)
-      for (const key of ['sina_ds2', 'sina_ds3']) {
-        const item = sina[key]
-        if (!item) continue
-        const eligible = profile?.valuationType === 'hybrid_qdii'
-          ? isEstimateEligibleForMarket(item, market)
-          : isSameMarketDate(item.baseDate, market.date)
-        sources[key] = {
-          fundcode: code,
-          name: profile?.name || '',
-          dwjz: Number(profile?.snapshot?.previousNav || profile?.snapshot?.nav || sina.actualNav || 0).toFixed(4),
-          gsz: item.gsz,
-          gszzl: item.gszzl,
-          gztime: `${item.baseDate} ${item.minTime}`.trim(),
-          source: key,
-          realtime: Boolean(market.isOpen && eligible),
-          stale: !eligible,
-          frozen: Boolean(eligible && !market.isOpen),
-          market: market.market,
-          marketDate: item.baseDate,
-          confidence: 0.75,
-          valuationType: profile?.valuationType,
-          valuationMethod: key
-        }
-      }
-    } catch {
-      // Diagnostics remain useful with the sources that are available.
-    }
+function toIsoDate(value) {
+  const text = String(value || '')
+  const matched = text.match(/(\d{4})[-/]?(\d{2})[-/]?(\d{2})/)
+  return matched ? `${matched[1]}-${matched[2]}-${matched[3]}` : ''
+}
+
+/** Eastmoney pingzhongdata is a published NAV series, never a synthetic intraday estimate. */
+export function parseEastmoneyLatestNav(source, code, profile = {}) {
+  const matched = String(source || '').match(/var\s+Data_netWorthTrend\s*=\s*(\[[\s\S]*?\]);/)
+  if (!matched?.[1]) return null
+  let points
+  try {
+    points = JSON.parse(matched[1])
+  } catch {
+    return null
   }
+  const pointValue = item => Array.isArray(item) ? item[1] : item?.y ?? item?.value
+  const pointChange = item => Array.isArray(item) ? item[2] : item?.equityReturn ?? item?.change
+  const pointDate = item => Array.isArray(item) ? item[3] : item?.date ?? item?.x
+  const point = Array.isArray(points) ? [...points].reverse().find(item => numberOrNull(pointValue(item)) !== null) : null
+  if (!point) return null
+  const nav = numberOrNull(pointValue(point))
+  const change = numberOrNull(pointChange(point))
+  const timestamp = Array.isArray(point) ? point[0] : point?.x
+  const explicitDate = pointDate(point)
+  const date = (typeof explicitDate === 'string' ? toIsoDate(explicitDate) : '') || new Date(Number(timestamp)).toISOString().slice(0, 10)
+  if (nav === null || !date) return null
+  return {
+    fundcode: code,
+    name: profile?.name || '',
+    dwjz: nav.toFixed(4),
+    gsz: nav.toFixed(4),
+    gszzl: change === null ? '--' : change.toFixed(2),
+    gztime: `${date} 15:00`,
+    source: 'eastmoney',
+    kind: 'official_nav',
+    realtime: false,
+    stale: false,
+    available: true,
+    note: '东方财富最新已公布净值',
+    fundType: profile?.type || ''
+  }
+}
+
+async function getTiantianEstimateSource(code, profile, now) {
+  const response = await fetchUpstream(`https://fundcomapi.tiantianfunds.com/mm/newCore/FundValuationLast?FCODES=${code}&FIELDS=FCODE,SHORTNAME,GSZZL,GZTIME,GSZ,NAV,PDATE`, {
+    headers: { ...DEFAULT_HEADERS, Referer: 'https://fund.eastmoney.com/' },
+    timeoutMs: 6_000,
+    retries: 1,
+    dedupeKey: `fund:tiantian-source:${code}`
+  })
+  const item = (await response.json())?.data?.find(row => String(row?.FCODE) === code)
+  if (!item) return null
+  const estimateNav = numberOrNull(item.GSZ)
+  const officialNav = numberOrNull(item.NAV)
+  const change = numberOrNull(item.GSZZL)
+  const date = toIsoDate(item.GZTIME) || toIsoDate(item.PDATE)
+  const isRealtime = estimateNav !== null && change !== null && Boolean(item.GZTIME)
+  const nav = estimateNav ?? officialNav
+  if (nav === null || !date) return null
+  return {
+    fundcode: code,
+    name: item.SHORTNAME || profile?.name || '',
+    dwjz: (officialNav ?? nav).toFixed(4),
+    gsz: nav.toFixed(4),
+    gszzl: change === null ? '--' : change.toFixed(2),
+    gztime: `${date}${item.GZTIME ? ` ${String(item.GZTIME).match(/\d{2}:\d{2}(?::\d{2})?/)?.[0] || ''}` : ' 15:00'}`.trim(),
+    source: 'tiantian',
+    kind: isRealtime ? 'estimate' : 'official_nav',
+    realtime: isRealtime,
+    stale: !isRealtime && getFundEstimateMarketState(profile || {}, now).isOpen,
+    available: true,
+    note: isRealtime ? '天天基金盘中估值' : '天天基金最新已公布净值',
+    fundType: profile?.type || ''
+  }
+}
+
+async function getSinaEstimateSource(code, profile, now) {
   const market = getFundEstimateMarketState(profile || {}, now)
-  if (profile?.valuationType === 'hybrid_qdii' && market.isOpen) {
-    try {
-      const holdingsEstimate = await getQdiiHoldingsEstimate(code, profile, now)
-      if (holdingsEstimate) sources.holdings_weighted = decorateEstimate(code, holdingsEstimate)
-    } catch {
-      // Diagnostics remain useful with the sources that are available.
-    }
+  const sina = await getSinaEstimateSources(code, now)
+  const item = sina.sina_ds2
+  if (!item) return null
+  const eligible = profile?.valuationType === 'hybrid_qdii'
+    ? isEstimateEligibleForMarket(item, market)
+    : isSameMarketDate(item.baseDate, market.date)
+  return {
+    fundcode: code,
+    name: profile?.name || '',
+    dwjz: Number(profile?.snapshot?.previousNav || profile?.snapshot?.nav || sina.actualNav || 0).toFixed(4),
+    gsz: item.gsz,
+    gszzl: item.gszzl,
+    gztime: `${item.baseDate} ${item.minTime}`.trim(),
+    source: 'sina',
+    kind: 'estimate',
+    realtime: Boolean(market.isOpen && eligible),
+    stale: !eligible,
+    available: Boolean(eligible),
+    note: '新浪财经基金盘中估值',
+    fundType: profile?.type || ''
   }
-  const persisted = profile?.valuationType === 'hybrid_qdii' ? getPersistedFundEstimate(code, market) : null
-  if (persisted && !sources[persisted.source]) sources[persisted.source] = decorateEstimate(code, persisted)
-  const hasPublishedSnapshot = sources.market_snapshot && !sources.market_snapshot.pending &&
-    numberOrNull(sources.market_snapshot.gszzl) !== null
-  const preferredOrder = hasPublishedSnapshot
-    ? ['market_snapshot', 'fundgz', 'holdings_weighted', 'sina_ds2', 'sina_ds3']
-    : market.isOpen
-      ? ['fundgz', 'holdings_weighted', 'sina_ds2', 'sina_ds3', 'market_snapshot']
-      : ['sina_ds2', 'sina_ds3', 'holdings_weighted', 'fundgz', 'market_snapshot']
-  const recommended = preferredOrder.find(source => sources[source] && !sources[source].stale && numberOrNull(sources[source].gszzl) !== null)
-    || preferredOrder.find(source => sources[source])
-    || Object.keys(sources)[0]
-    || null
-  return { code, profile, recommended, sources }
+}
+
+async function getEastmoneyNavSource(code, profile) {
+  const response = await fetchUpstream(`https://fund.eastmoney.com/pingzhongdata/${code}.js`, {
+    headers: DEFAULT_HEADERS,
+    timeoutMs: 8_000,
+    retries: 1,
+    dedupeKey: `fund:eastmoney-nav:${code}`
+  })
+  return parseEastmoneyLatestNav(await response.text(), code, profile)
+}
+
+/**
+ * The selector exposes three independently named provider contracts. Sina A/B
+ * used to be shown as separate sources despite sharing one upstream response;
+ * they are intentionally collapsed to one source here.
+ */
+export async function getFundEstimateSources(code, now = new Date()) {
+  if (!codeIsValid(code)) throw new Error('基金代码必须是6位数字')
+  const profile = getFundProfile(code) || {}
+  const settled = await Promise.allSettled([
+    getTiantianEstimateSource(code, profile, now),
+    profile.snapshot?.isMoneyMarket ? Promise.resolve(null) : getSinaEstimateSource(code, profile, now),
+    getEastmoneyNavSource(code, profile)
+  ])
+  const [tiantian, sina, eastmoney] = settled.map(result => result.status === 'fulfilled' ? result.value : null)
+  const sources = { tiantian, sina, eastmoney }
+  const live = [tiantian, sina].filter(item => item?.kind === 'estimate' && item.available && !item.stale)
+  const recommended = live[0]?.source || eastmoney?.source || tiantian?.source || sina?.source || null
+  const recommendationReason = live.length
+    ? '优先使用当前交易日可用的盘中估值'
+    : eastmoney ? '盘中估值不可用，显示最新已公布净值作参考' : '暂无可用估值数据'
+  return { code, profile, recommended, recommendationReason, sources }
 }

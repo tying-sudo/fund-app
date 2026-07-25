@@ -4,7 +4,9 @@
 const STORAGE_KEYS = {
   WATCHLIST: 'fund_watchlist',
   HOLDINGS: 'fund_holdings',
-  PENDING_ADJUSTMENTS: 'fund_pending_adjustments'
+  PENDING_ADJUSTMENTS: 'fund_pending_adjustments',
+  JD_SYNCED_ADJUSTMENTS: 'fund_jd_synced_adjustments',
+  JD_SYNCED_SUMMARY: 'fund_jd_synced_summary'
 } as const
 
 
@@ -79,7 +81,7 @@ export function isInWatchlist(code: string): boolean {
 
 // ========== 持仓数据 ==========
 
-import type { HoldingRecord, PendingAdjustment } from '@/types/fund'
+import type { HoldingRecord, JdSyncedSummary, PendingAdjustment, SyncedAdjustment } from '@/types/fund'
 
 
 /**
@@ -201,5 +203,23 @@ export function removePendingAdjustment(id: string): void {
   const list = getPendingAdjustments()
   const filtered = list.filter((i) => i.id !== id)
   savePendingAdjustments(filtered)
+}
+
+// ========== 第三方同步调仓记录 ==========
+
+export function getJdSyncedAdjustments(): SyncedAdjustment[] {
+  return getItem<SyncedAdjustment[]>(STORAGE_KEYS.JD_SYNCED_ADJUSTMENTS, [])
+}
+
+export function saveJdSyncedAdjustments(list: SyncedAdjustment[]): void {
+  setItem(STORAGE_KEYS.JD_SYNCED_ADJUSTMENTS, list)
+}
+
+export function getJdSyncedSummary(): JdSyncedSummary | null {
+  return getItem<JdSyncedSummary | null>(STORAGE_KEYS.JD_SYNCED_SUMMARY, null)
+}
+
+export function saveJdSyncedSummary(summary: JdSyncedSummary): void {
+  setItem(STORAGE_KEYS.JD_SYNCED_SUMMARY, summary)
 }
 

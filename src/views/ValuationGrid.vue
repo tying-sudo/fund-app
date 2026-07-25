@@ -1,10 +1,12 @@
 <script setup lang="ts">
 import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, onMounted, reactive, ref, watch } from 'vue'
-import { showConfirmDialog, showToast } from 'vant'
+import { closeToast, showConfirmDialog, showLoadingToast, showToast } from 'vant'
 import { useRouter } from 'vue-router'
 import Sortable from 'sortablejs'
 import { useHoldingStore } from '@/stores/holding'
 import { getJdFundLink } from '@/utils/format'
+import { importJdHoldings } from '@/utils/jdHoldings'
+import { buildGridJdImportPayload } from '@/utils/gridJdImport'
 import { mergeStrategyOrder, sortByStrategyOrder } from '@/utils/gridStrategyOrder'
 import {
   calculateGridConversionTransferIn,
@@ -22,6 +24,7 @@ import {
   fetchGridHistory,
   fetchGridPosition,
   fetchGridPositions,
+  importGridJdTransactions,
   fetchGridSignals,
   fetchGridState,
   fetchGridValuations,
@@ -99,6 +102,7 @@ const portfolioBudget = ref<GridPortfolioBudget>({})
 const strategyLoadedAt = ref(0)
 const positionEditorOpen = ref(false)
 const positionSaving = ref(false)
+const jdImporting = ref(false)
 const tradeImageInput = ref<HTMLInputElement | null>(null)
 const tradeImportOpen = ref(false)
 const tradeImportRecognizing = ref(false)
@@ -940,6 +944,69 @@ function importExistingHolding(code: string) {
   positionForm.nav = costNav > 0 ? costNav.toFixed(4) : ''
   positionForm.note = '导入自现有持仓'
   positionForm.maxPosition = String(Math.max(5000, Math.ceil(Number(holding.amount || 0) / 100) * 100))
+}
+
+async function importJdGridTransactions() {
+  if (jdImporting.value) return
+  jdImporting.value = true
+  try {
+    const jdResult = await importJdHoldings({
+      onProgress: (progress) => showLoadingToast({ message: progress.message, forbidClick: true, duration: 0 })
+    })
+    // The audit list may intentionally retain incomplete JD rows for the
+    // holding page. The grid must certify against the full native timeline.
+    const payload = buildGridJdImportPayload(jdResult.items, jdResult.timelineAdjustments)
+    if (!payload.current_holding_codes.length) {
+      closeToast()
+      showToast('京东账户暂无当前持仓基金')
+      return
+    }
+    showLoadingToast({ message: '正在导入网格买卖批次...', forbidClick: true, duration: 0 })
+    const imported = await importGridJdTransactions(payload)
+    closeToast()
+    await refreshStrategy(true)
+    const details = [
+      imported.imported ? `导入 ${imported.imported} 笔` : '',
+      imported.partial ? `部分匹配 ${imported.partial} 笔` : '',
+      imported.skipped ? `跳过 ${imported.skipped} 笔` : ''
+    ].filter(Boolean).join('，')
+    const skippedReasons = Object.entries(imported.results
+      .filter((item) => item.status === 'skipped' && item.reason)
+      .reduce<Record<string, number>>((counts, item) => {
+        counts[item.reason!] = (counts[item.reason!] || 0) + 1
+        return counts
+      }, {}))
+      .map(([reason, count]) => `${gridJdSkipReason(reason)} ${count}笔`)
+      .join('，')
+    showToast(details
+      ? `京东网格同步完成：${details}${skippedReasons ? `（${skippedReasons}）` : ''}`
+      : '京东网格没有可导入的买卖批次')
+    if (imported.imported || imported.partial) positionEditorOpen.value = false
+  } catch (error) {
+    closeToast()
+    showToast(error instanceof Error ? error.message : '京东网格导入失败')
+  } finally {
+    jdImporting.value = false
+  }
+}
+
+function gridJdSkipReason(reason: string): string {
+  return {
+    duplicate: '已导入',
+    missing_buy_value: '缺少买入金额/净值',
+    missing_sell_shares: '缺少卖出份额',
+    no_matching_batches: '没有可匹配买入批次',
+    not_current_holding: '非当前持仓',
+    existing_grid_position: '已有网格持仓',
+    invalid_adjustment: '无效交易记录',
+    invalid_trade_date: '交易日期无效',
+    missing_conversion_source: '缺少转换转出数据',
+    missing_conversion_target: '缺少转换转入数据',
+    missing_current_cycle_transaction: '缺少本轮建仓真实交易记录',
+    missing_snapshot_cost: '缺少当前持仓成本/份额',
+    missing_snapshot_trade_date: '缺少真实交易日期',
+    missing_snapshot_value: '缺少当前持仓数据'
+  }[reason] || reason
 }
 
 function addBuyRow() {
@@ -1951,6 +2018,7 @@ onBeforeUnmount(() => {
         <div class="dialog-title">
           <span>录入持仓</span>
           <span class="dialog-actions">
+            <button class="icon-button quiet jd-import-button" type="button" title="登录京东导入真实买卖批次" aria-label="登录京东导入真实买卖批次" :disabled="jdImporting" @click="importJdGridTransactions"><van-icon :name="jdImporting ? 'loading' : 'shop-o'" /></button>
             <button class="icon-button quiet" type="button" title="从交易截图导入" aria-label="从交易截图导入" @click="triggerTradeImageImport"><van-icon name="photo-o" /></button>
             <van-icon name="cross" role="button" tabindex="0" aria-label="关闭" @click="positionEditorOpen = false" />
           </span>

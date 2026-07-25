@@ -27,6 +27,7 @@ import {
 } from './cache.mjs'
 import {
   getFundEstimateSources,
+  getFundDailyReturns,
   getFundHistory,
   getFundHoldings,
   getFundProfile,
@@ -173,6 +174,16 @@ app.get('/api/funds/:code/nav-history', async (req, res) => {
   if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: '基金代码必须是6位数字' })
   try {
     res.json({ data: await getFundHistory(code, req.query.limit) })
+  } catch (error) {
+    res.status(502).json({ error: error.message })
+  }
+})
+
+app.get('/api/funds/:code/daily-returns', async (req, res) => {
+  const { code } = req.params
+  if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: '基金代码必须是6位数字' })
+  try {
+    res.json({ data: await getFundDailyReturns(code) })
   } catch (error) {
     res.status(502).json({ error: error.message })
   }

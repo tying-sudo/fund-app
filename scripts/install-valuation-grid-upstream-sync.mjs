@@ -91,10 +91,10 @@ run_pending_release() {
 is_runtime_path() {
   case "$1" in
     # Confidence calibration and signal history are explicitly upstream-owned.
-    # The production holdings list is user-owned runtime state and must never
-    # be imported from the upstream author's data/positions.json.
+    # Board selections and holdings are user-owned runtime state and must
+    # never be imported from the upstream author's data directory.
     data/confidence_deviations.json|data/signal_history.json) return 1 ;;
-    data/positions.json) return 0 ;;
+    data/state.json|data/positions.json) return 0 ;;
     .git/*|.upstream-commit|__pycache__/*|*.pyc|data/*|cache/*|.venv/*|.venv-next/*|.venv-previous/*) return 0 ;;
     *) return 1 ;;
   esac

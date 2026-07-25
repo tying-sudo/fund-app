@@ -29,6 +29,8 @@ export interface CalcContext {
   realChangeDate?: string | null
   /** 官方盘后公布的今日净值（比估算更准） */
   realNav?: number | null
+  /** 官方收益是否在当前北京时间自然日发布/到账 */
+  realChangeIsCurrentPublication?: boolean
   now?: Date
 }
 
@@ -118,22 +120,25 @@ export function isDelayedSettlementQdiiFund(fundName?: string | null): boolean {
 }
 
 /**
- * A delayed QDII's latest published change is only a fallback when no usable
- * current-day estimate exists. A current estimate remains the daily P/L source
- * until the fund company publishes today's NAV.
+ * Delayed global QDII NAVs belong to the Beijing publication day for daily P/L.
+ * The explicit publication flag prevents an older cached NAV from replacing a
+ * live estimate before the next official return is released.
  */
 export function shouldUseDelayedQdiiPublishedChange({
   fundName,
   realChange,
   realChangeDate,
+  isCurrentPublication,
   now
 }: {
   fundName?: string | null
   realChange?: number | string | null
   realChangeDate?: string | null
+  isCurrentPublication?: boolean
   now?: Date
 }): boolean {
   if (!isDelayedSettlementQdiiFund(fundName) || !hasUsableEstimateChange(realChange)) return false
+  if (isCurrentPublication !== undefined) return isCurrentPublication
 
   const realDate = normalizeMarketDate(realChangeDate)
   const today = getTodayStr(now)
@@ -470,7 +475,7 @@ export function isValidRealChangeDate(
  * [FIX] 优先使用 costPrice × shares 计算成本，不再依赖 holding.amount 的歧义含义
  */
 export function calculateHoldingProfit(context: CalcContext): CalculationResult {
-  const { holding, estimate, realChange, realChangeDate, realNav, now } = context
+  const { holding, estimate, realChange, realChangeDate, realNav, realChangeIsCurrentPublication, now } = context
   
   // 解析基础数据
   const estimateValue = parseFloat(estimate.gsz) || 0
@@ -522,6 +527,7 @@ export function calculateHoldingProfit(context: CalcContext): CalculationResult 
     fundName: holding.name,
     realChange: effectiveRealChange,
     realChangeDate,
+    isCurrentPublication: realChangeIsCurrentPublication,
     now
   })
   // An older official NAV remains useful as history, but it cannot price
@@ -546,13 +552,19 @@ export function calculateHoldingProfit(context: CalcContext): CalculationResult 
   // make the card add prior-session profit to the current day's profit.
   //       非交易时段有官方净值时，用官方净值 + 真实涨跌幅重算，与第三方APP对齐
   let todayProfit = 0
-  if (!hasRealNavToday && hasCurrentEstimate && currentValue > 0 && Number.isFinite(estimateChange) && estimateDenominator > 0) {
+  if (!hasRealNavToday && useDelayedQdiiPublishedChange && effectiveRealChange !== undefined) {
+    const officialProfit = calculateOfficialHoldingProfit(
+      realNav ? { nav: realNav, changeRate: Number(effectiveRealChange) } : null,
+      effectiveShares
+    )
+    todayProfit = officialProfit?.profit ?? (
+      lastValue > 0 ? lastValue * effectiveShares * (effectiveRealChange / 100) : 0
+    )
+  } else if (!hasRealNavToday && hasCurrentEstimate && currentValue > 0 && Number.isFinite(estimateChange) && estimateDenominator > 0) {
     todayProfit = effectiveShares * currentValue * (estimateChange / 100) / estimateDenominator
   } else if (!hasRealNavToday && hasCurrentEstimate && currentValue > 0 && lastValue > 0) {
     // Only use the NAV gap when the provider did not give a usable daily rate.
     todayProfit = effectiveShares * (currentValue - lastValue)
-  } else if (!hasRealNavToday && useDelayedQdiiPublishedChange && effectiveRealChange !== undefined && lastValue > 0) {
-    todayProfit = lastValue * effectiveShares * (effectiveRealChange / 100)
   } else if (dateCheck.isToday && effectiveRealChange !== undefined && lastValue > 0) {
     // 兜底：用真实涨跌幅计算
     todayProfit = lastValue * effectiveShares * (effectiveRealChange / 100)
@@ -593,6 +605,27 @@ export function calculateHoldingProfit(context: CalcContext): CalculationResult 
     profitRate,
     todayProfit: round(todayProfit, PRECISION.AMOUNT),
     effectiveShares: round(effectiveShares, 4)
+  }
+}
+
+export function calculateOfficialHoldingProfit(
+  point: { nav: number; changeRate: number } | null | undefined,
+  shares: number
+): { profit: number; profitRate: number; baseValue: number } | null {
+  const nav = Number(point?.nav)
+  const changeRate = Number(point?.changeRate)
+  const effectiveShares = Number(shares)
+  const denominator = 1 + changeRate / 100
+  if (!Number.isFinite(nav) || nav <= 0 || !Number.isFinite(changeRate) ||
+      !Number.isFinite(effectiveShares) || effectiveShares <= 0 || denominator <= 0) {
+    return null
+  }
+
+  const baseValue = nav * effectiveShares / denominator
+  return {
+    profit: round(baseValue * changeRate / 100, PRECISION.AMOUNT),
+    profitRate: round(changeRate, PRECISION.PERCENT),
+    baseValue: round(baseValue, PRECISION.AMOUNT)
   }
 }
 

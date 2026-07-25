@@ -95,6 +95,21 @@ export interface GridMutationResult {
   signal_error?: string
 }
 
+export interface GridJdImportResult {
+  success: boolean
+  imported: number
+  skipped: number
+  partial: number
+  results: Array<{
+    ledger_id?: string
+    id?: string
+    code?: string
+    action?: 'buy' | 'sell' | 'seed'
+    status: 'imported' | 'partial' | 'skipped'
+    reason?: string
+  }>
+}
+
 export interface GridStrategyParams {
   dip_buy_threshold?: number
   consecutive_dip_trigger?: number
@@ -298,6 +313,34 @@ export function fetchGridPositions() {
   return request<{ funds?: Record<string, GridPosition> }>('/v1/positions')
 }
 
+export function importGridJdTransactions(input: {
+  current_holding_codes: string[]
+  current_holdings: Array<{
+    code: string
+    name: string
+    amount?: string
+    shares?: string
+    costPrice?: string
+  }>
+  adjustments: Array<{
+    id: string
+    code: string
+    type: 'add' | 'reduce' | 'convert'
+    tradeDate: string
+    tradeTime?: string
+    shares?: string
+    amount?: string
+    targetCode?: string
+    targetShares?: string
+  }>
+}) {
+  return request<GridJdImportResult>('/v1/positions/jd-import', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(input)
+  })
+}
+
 export function fetchGridPosition(fundCode: string) {
   return request<GridPosition>(`/v1/position/${encodeURIComponent(fundCode)}`)
 }
@@ -353,7 +396,10 @@ export function deleteGridSellRecord(fundCode: string, sellRecordId: string) {
 }
 
 export function removeGridPosition(fundCode: string) {
-  return request<{ success: boolean }>(`/v1/position/${encodeURIComponent(fundCode)}`, { method: 'DELETE' })
+  const code = encodeURIComponent(fundCode)
+  // The deployed grid requires the displayed fund key as an explicit delete
+  // confirmation. Keeping it in the URL is compatible with older servers.
+  return request<{ success: boolean }>(`/v1/position/${code}?confirm=${code}`, { method: 'DELETE' })
 }
 
 export function renameGridPosition(fundCode: string, owner: string) {

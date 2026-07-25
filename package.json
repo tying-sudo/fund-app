@@ -1,7 +1,7 @@
 {
   "name": "fund-app",
   "private": true,
-  "version": "1.0.58",
+  "version": "1.0.91",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -10,6 +10,8 @@
     "build": "vite build",
     "test:holding": "node --experimental-strip-types scripts/verify-holding-settlement.mjs",
     "test:grid-trade-import": "node --experimental-strip-types --test src/utils/gridTradeImport.test.ts",
+    "test:grid-jd-import": "node --experimental-strip-types --test src/utils/gridJdImport.test.ts",
+    "test:jd-holdings": "node --experimental-strip-types --test src/utils/jdHoldings.test.ts",
     "test:grid-strategy-order": "node --experimental-strip-types --test src/utils/gridStrategyOrder.test.ts",
     "preview": "vite preview",
     "update-funds": "node scripts/fetch-fund-list.mjs",
@@ -27,7 +29,6 @@
     "lightweight-charts": "^5.1.0",
     "pinia": "^3.0.0",
     "sortablejs": "^1.15.7",
-    "tesseract.js": "^7.0.0",
     "vant": "^4.9.0",
     "vue": "^3.5.24",
     "vue-router": "^4.5.0"

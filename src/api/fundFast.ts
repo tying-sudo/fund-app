@@ -615,6 +615,53 @@ export async function fetchFundEstimateWithSource(
   return fetchFundEstimateFast(code)
 }
 
+export interface ValuationSourceBundle {
+  code: string
+  sources: Partial<Record<'tiantian' | 'sina' | 'eastmoney', FundEstimateWithSource>>
+  recommended: DataSource | null
+  recommendationReason: string
+}
+
+const valuationSourceRequests = new Map<string, Promise<ValuationSourceBundle>>()
+
+/** The selector always reads one backend snapshot so source values share one freshness policy. */
+export async function fetchValuationSourceBundle(code: string): Promise<ValuationSourceBundle> {
+  const key = `valuation-sources:${code}`
+  const cached = cache.get<ValuationSourceBundle>(key)
+  if (cached) return cached
+  const pending = valuationSourceRequests.get(code)
+  if (pending) return pending
+
+  const request = (async () => {
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 8_000)
+    try {
+      const response = await fetch(`${API_BASE_URL}/api/fund-estimate-sources?code=${encodeURIComponent(code)}`, { signal: controller.signal })
+      if (!response.ok) throw new Error(`HTTP ${response.status}`)
+      const payload = await response.json() as { data?: ValuationSourceBundle }
+      if (!payload.data) throw new Error('估值来源数据为空')
+      const result = {
+        ...payload.data,
+        sources: Object.fromEntries(Object.entries(payload.data.sources || {}).filter(([, value]) => Boolean(value)))
+      } as ValuationSourceBundle
+      cache.set(key, result, 15_000)
+      return result
+    } finally {
+      clearTimeout(timer)
+      valuationSourceRequests.delete(code)
+    }
+  })()
+  valuationSourceRequests.set(code, request)
+  return request
+}
+
+export async function fetchValuationEstimateBySource(code: string, source: DataSource): Promise<FundEstimateWithSource> {
+  const bundle = await fetchValuationSourceBundle(code)
+  const item = bundle.sources[source as 'tiantian' | 'sina' | 'eastmoney']
+  if (!item?.available || item.gszzl === '--') throw new Error(`${source} 暂无可用估值`)
+  return item
+}
+
 /**
  * 从主接口获取估值（JSONP）
  * [FIX] 移除onload中的清理逻辑，完全依赖超时机制
@@ -1124,23 +1171,81 @@ function getMarketAwareTtl(): number {
  *       如果失败，再使用 pingzhongdata 接口作为兜底
  * [WHAT] 盘后使用更短缓存时间，确保能获取到最新公布的真实涨跌幅
  */
-export async function fetchRealDayChange(code: string): Promise<{ nav: number; changeRate: number; date: string } | null> {
+export interface FundDailyReturnPoint {
+  nav: number
+  changeRate: number
+  date: string
+}
+
+export interface FundRealDayChange extends FundDailyReturnPoint {
+  previous: FundDailyReturnPoint | null
+  /** The backend attributed this official return to the current Beijing day. */
+  isCurrentPublication: boolean
+}
+
+function normalizeDailyReturnPoint(item: any): FundDailyReturnPoint | null {
+  const nav = Number(item?.nav ?? item?.netValue)
+  const changeRate = Number(item?.changePercent ?? item?.changeRate)
+  const date = String(item?.date || '').replace(/\//g, '-')
+  if (!date || !Number.isFinite(nav) || nav <= 0 || !Number.isFinite(changeRate)) return null
+  return { nav, changeRate, date }
+}
+
+export async function fetchRealDayChange(code: string): Promise<FundRealDayChange | null> {
   const cacheKey = `realchange_${code}`
   const ttl = getMarketAwareTtl()
-  const cached = cache.get<{ nav: number; changeRate: number; date: string }>(cacheKey)
+  const cached = cache.get<FundRealDayChange>(cacheKey)
   if (cached !== null && cached !== undefined) return cached
 
   // [WHAT] 使用北京时间（UTC+8）
   const today = getBeijingDateString()
 
   try {
+    try {
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), 5000)
+      const response = await fetch(`${API_BASE_URL}/api/funds/${code}/daily-returns`, { signal: controller.signal })
+      clearTimeout(timer)
+      if (response.ok) {
+        const payload = await response.json()
+        const latest = normalizeDailyReturnPoint(payload?.data?.latest)
+        if (latest) {
+          const current = normalizeDailyReturnPoint(payload?.data?.current)
+          const result: FundRealDayChange = {
+            ...latest,
+            previous: normalizeDailyReturnPoint(payload?.data?.previous),
+            isCurrentPublication: Boolean(current && current.date === latest.date)
+          }
+          cache.set(cacheKey, result, ttl)
+          return result
+        }
+      }
+    } catch {
+      // Keep legacy routes available while backend and APK roll out.
+    }
+
+    let fallbackHistory: NetValueRecord[] | null = null
+    const getFallbackHistory = async () => {
+      if (!fallbackHistory) fallbackHistory = await fetchNetValueHistoryFast(code, 5)
+      return fallbackHistory
+    }
+    const getPreviousPoint = async () => {
+      const history = await getFallbackHistory()
+      const previous = history.find(item => item.date < today)
+      return previous ? normalizeDailyReturnPoint(previous) : null
+    }
+
     // [WHAT] 盘后优先使用 lsjz 接口获取当天真实净值
     if (isAfterMarketClose() || isBeforeMarketOpen()) {
       const realNav = await fetchTodayRealNav(code)
       if (realNav && realNav.date === today) {
         // [FIX] 静默调试日志
         // console.log(`[真实涨跌幅] ${code}: nav=${realNav.nav}, ${realNav.changeRate}% (日期: ${realNav.date})`)
-        const result = { nav: realNav.nav, changeRate: realNav.changeRate, date: realNav.date }
+        const result: FundRealDayChange = {
+          ...realNav,
+          previous: await getPreviousPoint(),
+          isCurrentPublication: true
+        }
         cache.set(cacheKey, result, ttl)
         return result
       }
@@ -1149,7 +1254,7 @@ export async function fetchRealDayChange(code: string): Promise<{ nav: number; c
     }
 
     // [WHAT] 兜底：从历史净值中取最新一条的 changeRate
-    const history = await fetchNetValueHistoryFast(code, 5)
+    const history = await getFallbackHistory()
     if (history.length === 0) return null
 
     const latest = history[0]!
@@ -1157,7 +1262,13 @@ export async function fetchRealDayChange(code: string): Promise<{ nav: number; c
     const val = latest.changeRate
     if (val === undefined || val === null || isNaN(val)) return null
 
-    const result = { nav: latest.netValue, changeRate: val, date: latest.date }
+    const result: FundRealDayChange = {
+      nav: latest.netValue,
+      changeRate: val,
+      date: latest.date,
+      previous: await getPreviousPoint(),
+      isCurrentPublication: latest.date === today
+    }
     cache.set(cacheKey, result, ttl)
     return result
   } catch {

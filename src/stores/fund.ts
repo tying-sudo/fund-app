@@ -9,11 +9,11 @@ import {
   fetchFundEstimateFast, 
   fetchRealDayChange, 
   calculatePeriodReturns,
-  fetchFundEstimateBySource,
-  fetchSourceComparison,
-  fetchSinaEstimate
+  fetchValuationEstimateBySource,
+  fetchValuationSourceBundle,
+  fetchSourceComparison
 } from '@/api/fundFast'
-import { getFundTypes } from '@/api/fund'
+import { getFundDirectoryEntries, getFundTypes } from '@/api/fund'
 import {
   getWatchlist,
   saveWatchlist,
@@ -24,8 +24,34 @@ import {
   saveWatchlistOrder
 } from '@/utils/storage'
 import { useSettingsStore } from './settings'
-import { getTodayStr, getValuationComparisonState, hasUsableEstimateChange, isEstimateDateToday, isRetainedMarketEstimate, selectLatestRealChange, shouldRetainCurrentIntradayEstimate } from '@/utils/holdingCalculator'
+import { getTodayStr, getValuationComparisonState, hasUsableEstimateChange, isEstimateDateToday, isRetainedMarketEstimate, shouldRetainCurrentIntradayEstimate } from '@/utils/holdingCalculator'
 import { fetchLatestValuationSettlement, rememberValuationSettlement } from '@/api/valuationGrid'
+import { resolveWatchlistSnapshot } from '@/utils/watchlistSnapshot'
+import { createInitialWatchlistItem, resolveWatchlistName } from '@/utils/watchlistIdentity'
+
+const VALUATION_SOURCE_STORAGE_KEY = 'fund-app:valuation-source:v1'
+const NAMED_VALUATION_SOURCES = new Set<DataSource>(['tiantian', 'sina', 'eastmoney'])
+
+function restoreFundDataSources(): Map<string, DataSource> {
+  try {
+    const saved = JSON.parse(localStorage.getItem(VALUATION_SOURCE_STORAGE_KEY) || '{}') as Record<string, unknown>
+    return new Map(Object.entries(saved).flatMap(([code, source]) => (
+      /^\d{6}$/.test(code) && typeof source === 'string' && NAMED_VALUATION_SOURCES.has(source as DataSource)
+        ? [[code, source as DataSource] as const]
+        : []
+    )))
+  } catch {
+    return new Map()
+  }
+}
+
+function persistFundDataSources(sources: Map<string, DataSource>) {
+  try {
+    localStorage.setItem(VALUATION_SOURCE_STORAGE_KEY, JSON.stringify(Object.fromEntries(sources)))
+  } catch {
+    // Source selection remains usable for the current session when storage is unavailable.
+  }
+}
 
 export const useFundStore = defineStore('fund', () => {
   // ========== State ==========
@@ -55,14 +81,9 @@ export const useFundStore = defineStore('fund', () => {
    */
     async function initWatchlist() {
     const codes = getWatchlist()
-    // [WHAT] 先从 fund-list.json 批量获取基金类型
-    const typeMap = await getFundTypes(codes).catch(() => new Map<string, string>())
-    watchlist.value = codes.map((code) => ({
-      code,
-      name: '',
-      type: typeMap.get(code) || '',
-      loading: true
-    }))
+    // 自选仅持久化代码，启动时从基金清单回填名称和类型。
+    const directory = await getFundDirectoryEntries(codes)
+    watchlist.value = codes.map((code) => createInitialWatchlistItem(code, directory.get(code)))
     // [WHAT] 初始化后立即刷新估值
     if (codes.length > 0) {
       refreshEstimates()
@@ -149,7 +170,12 @@ export const useFundStore = defineStore('fund', () => {
         try {
       // [WHAT] 并发请求所有基金估值 + 真实涨跌幅
       const [estimateResults, realChangeResults] = await Promise.all([
-        Promise.all(codes.map(code => fetchFundEstimateFast(code).catch(() => null))),
+        Promise.all(codes.map(code => {
+          const source = getFundDataSource(code)
+          return source === 'tiantian'
+            ? fetchFundEstimateFast(code).catch(() => null)
+            : fetchValuationEstimateBySource(code, source).catch(() => null)
+        })),
         Promise.all(codes.map(code => fetchRealDayChange(code).catch(() => null)))
       ])
       
@@ -240,7 +266,7 @@ export const useFundStore = defineStore('fund', () => {
     const ds = getFundDataSource(code)
     
     try {
-      if (ds === 'fundgz') {
+      if (ds === 'tiantian') {
         const [data, realChange] = await Promise.all([
           fetchFundEstimateFast(code),
           fetchRealDayChange(code).catch(() => null)
@@ -248,7 +274,7 @@ export const useFundStore = defineStore('fund', () => {
         updateFundData(code, data, realChange ?? undefined)
       } else {
         const [data, realChange] = await Promise.all([
-          fetchFundEstimateBySource(code, ds),
+          fetchValuationEstimateBySource(code, ds),
           fetchRealDayChange(code).catch(() => null)
         ])
         
@@ -265,7 +291,7 @@ export const useFundStore = defineStore('fund', () => {
     } catch (err) {
       console.error(`[Store] ${code} 刷新失败:`, err)
       // 降级
-      if (ds !== 'fundgz') {
+      if (ds !== 'tiantian') {
         try {
           const fallback = await fetchFundEstimateFast(code)
           updateFundData(code, fallback)
@@ -287,11 +313,14 @@ export const useFundStore = defineStore('fund', () => {
     const index = watchlist.value.findIndex((item) => item.code === code)
     if (index > -1) {
       // [WHAT] 保留已有的 type 和 realChange，避免丢失
+      const existingName = watchlist.value[index].name
       const existingType = watchlist.value[index].type || ''
       const existingRealChange = watchlist.value[index].realChange
       const existingRealChangeDate = watchlist.value[index].realChangeDate
       const existingEstimateChange = watchlist.value[index].estimateChange
       const existingEstimateTime = watchlist.value[index].estimateTime
+      const existingOfficialValue = watchlist.value[index].officialValue
+      const existingOfficialValueDate = watchlist.value[index].officialValueDate
       
       // [WHAT] 处理真实涨跌幅数据
       let realChange: number | undefined
@@ -307,14 +336,17 @@ export const useFundStore = defineStore('fund', () => {
         realChangeDate = existingRealChangeDate
       }
 
-      const latestReal = selectLatestRealChange({
+      const snapshot = resolveWatchlistSnapshot({
+        estimate: data,
         incomingChange: realChange,
         incomingDate: realChangeDate,
         cachedChange: existingRealChange,
-        cachedDate: existingRealChangeDate
+        cachedDate: existingRealChangeDate,
+        cachedOfficialValue: existingOfficialValue,
+        cachedOfficialValueDate: existingOfficialValueDate
       })
-      realChange = latestReal.change
-      realChangeDate = latestReal.date
+      realChange = snapshot.realChange
+      realChangeDate = snapshot.realChangeDate
 
       const retainCachedIntradayEstimate = shouldRetainCurrentIntradayEstimate({
         incomingEstimateChange: data.gszzl,
@@ -389,13 +421,15 @@ export const useFundStore = defineStore('fund', () => {
       
       watchlist.value[index] = {
         code: data.fundcode,
-        name: data.name,
+        name: resolveWatchlistName(data.name, existingName),
         type: existingType,
         estimateValue,
         estimateChange,
         estimateTime: displayEstimateTime,
         lastValue: data.dwjz,
         loading: false,
+        officialValue: snapshot.officialValue,
+        officialValueDate: snapshot.officialValueDate,
         realChange,
         realChangeDate,
         isRealChangeToday: comparison.isCurrentReal
@@ -469,7 +503,7 @@ export const useFundStore = defineStore('fund', () => {
   // ========== 多数据源功能（新增） ==========
   
   /** 每只基金的数据源设置（默认 fundgz） */
-  const fundDataSources = ref<Map<string, DataSource>>(new Map())
+  const fundDataSources = ref<Map<string, DataSource>>(restoreFundDataSources())
   
   /** 全局自动选源开关 */
   const autoSelectSource = ref(false)
@@ -478,7 +512,7 @@ export const useFundStore = defineStore('fund', () => {
    * 获取某只基金的数据源
    */
   function getFundDataSource(code: string): DataSource {
-    return fundDataSources.value.get(code) || 'fundgz'
+    return fundDataSources.value.get(code) || 'tiantian'
   }
 
   /**
@@ -489,7 +523,10 @@ export const useFundStore = defineStore('fund', () => {
    * [FIX] 返回 Promise，允许调用方 await 刷新完成
    */
   function setFundDataSource(code: string, source: DataSource): Promise<void> {
-    fundDataSources.value.set(code, source)
+    const next = new Map(fundDataSources.value)
+    next.set(code, source)
+    fundDataSources.value = next
+    persistFundDataSources(next)
     
     // 更新 watchlist 中的数据源标记
     const item = watchlist.value.find(f => f.code === code)
@@ -509,7 +546,7 @@ export const useFundStore = defineStore('fund', () => {
     const ds = source || getFundDataSource(code)
     
     try {
-      if (ds === 'fundgz') {
+      if (ds === 'tiantian') {
         // 天天基金：保持原有逻辑
         const [data, realChange] = await Promise.all([
           fetchFundEstimateFast(code),
@@ -519,7 +556,7 @@ export const useFundStore = defineStore('fund', () => {
       } else {
         // 新浪数据源
         const [data, realChange] = await Promise.all([
-          fetchFundEstimateBySource(code, ds),
+          fetchValuationEstimateBySource(code, ds),
           fetchRealDayChange(code).catch(() => null)
         ])
         
@@ -545,7 +582,7 @@ export const useFundStore = defineStore('fund', () => {
     } catch (err) {
       console.error(`[Store] ${code} 刷新失败(${ds}):`, err)
       // 降级到天天基金
-      if (ds !== 'fundgz') {
+      if (ds !== 'tiantian') {
         try {
           const fallbackData = await fetchFundEstimateFast(code)
           updateFundData(code, fallbackData)
@@ -600,44 +637,18 @@ export const useFundStore = defineStore('fund', () => {
   async function getAllSourcesForFund(code: string): Promise<{
     sources: Partial<Record<DataSource, { gszzl: string; gsz: string; gztime: string }>>
     activeSource: DataSource
+    recommended: DataSource | null
+    recommendationReason: string
   }> {
-    // 并行请求3个数据源
-    const [fundgzResult, sina2Result, sina3Result] = await Promise.allSettled([
-      fetchFundEstimateFast(code).catch(() => null),
-      fetchSinaEstimate(code, 'sina_ds2').catch(() => null),
-      fetchSinaEstimate(code, 'sina_ds3').catch(() => null)
-    ])
-
-    const sources: Partial<Record<DataSource, { gszzl: string; gsz: string; gztime: string }>> = {}
-    
-    if (fundgzResult.status === 'fulfilled' && fundgzResult.value) {
-      sources.fundgz = {
-        gszzl: fundgzResult.value.gszzl,
-        gsz: fundgzResult.value.gsz,
-        gztime: fundgzResult.value.gztime
-      }
-    }
-    
-    if (sina2Result.status === 'fulfilled' && sina2Result.value) {
-      sources.sina_ds2 = {
-        gszzl: sina2Result.value.gszzl,
-        gsz: sina2Result.value.gsz,
-        gztime: sina2Result.value.gztime
-      }
-    }
-    
-    if (sina3Result.status === 'fulfilled' && sina3Result.value) {
-      sources.sina_ds3 = {
-        gszzl: sina3Result.value.gszzl,
-        gsz: sina3Result.value.gsz,
-        gztime: sina3Result.value.gztime
-      }
-    }
-    
+    const bundle = await fetchValuationSourceBundle(code)
     return {
-      sources,
-      activeSource: getFundDataSource(code)
+      sources: bundle.sources as Partial<Record<DataSource, { gszzl: string; gsz: string; gztime: string }>>,
+      activeSource: getFundDataSource(code),
+      recommended: bundle.recommended,
+      recommendationReason: bundle.recommendationReason
     }
+
+    // 并行请求3个数据源
   }
 
   /**

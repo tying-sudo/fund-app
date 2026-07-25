@@ -1500,6 +1500,7 @@
                         const error = new Error(
                             `${label}失败（HTTP ${res.status}${detail ? `: ${detail.slice(0, 120)}` : ''}）`
                         );
+                        error.status = res.status;
                         error.retryable = RETRYABLE_API_STATUS.has(res.status);
                         throw error;
                     }
@@ -1592,13 +1593,21 @@
 
         async function saveState() {
             try {
-                await fetchJson(`${API_BASE}/v1/state`, {
+                const result = await fetchJson(`${API_BASE}/v1/state`, {
                     method: 'POST',
                     headers: { 'Content-Type': 'application/json' },
                     body: JSON.stringify(state)
                 }, '保存状态');
+                if (result?.state && Array.isArray(result.state.sectors)) {
+                    state = result.state;
+                }
                 writeDashboardCache();
             } catch (e) {
+                if (e?.status === 409) {
+                    await loadState();
+                    showStatus('板块数据已在其他设备更新，已刷新', 'error');
+                    return;
+                }
                 showStatus('保存失败: ' + e.message, 'error');
             }
         }
@@ -2382,7 +2391,8 @@
             const displayCode = fundCode.includes('__') ? fundCode.replace('__', ' [') + ']' : fundCode;
             if (!confirm(`确定将 ${displayCode} 从低频网格移除？（会删除所有持仓记录）`)) return;
             try {
-                await fetchJson(`${API_BASE}/v1/position/${encodeURIComponent(fundCode)}`, { method: 'DELETE' }, '移除持仓');
+                const code = encodeURIComponent(fundCode);
+                await fetchJson(`${API_BASE}/v1/position/${code}?confirm=${code}`, { method: 'DELETE' }, '移除持仓');
                 showStatus(`已移除 ${displayCode}`, 'success');
                 loadStrategyPanel();
             } catch (e) {

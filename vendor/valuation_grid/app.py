@@ -2,10 +2,12 @@
 app.py - API入口：/state + /valuation + /fund/name + /position + /strategy
 """
 import os
+import re
+import math
 import threading
 import time
 from contextlib import asynccontextmanager
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -33,6 +35,7 @@ from positions import (
     add_watch_fund,
     confirm_buy_nav,
     auto_fill_nav,
+    import_jd_grid_transactions,
     PositionDataError,
 )
 from skills.export_image import export_all_sector_images
@@ -143,10 +146,17 @@ def post_state(state: StateModel):
     if not valid:
         raise HTTPException(status_code=400, detail=msg)
 
-    if save_state(state_dict):
-        return {"success": True, "message": "保存成功"}
-    else:
-        raise HTTPException(status_code=500, detail="保存失败")
+    # The browser retains a dashboard cache. Requiring the revision returned
+    # by GET /v1/state prevents a stale tab from replacing the whole board
+    # catalogue after another device or a recovery operation has updated it.
+    expected_updated_at = state_dict.get("updated_at")
+    current_updated_at = load_state().get("updated_at")
+    if not expected_updated_at or expected_updated_at != current_updated_at:
+        raise HTTPException(status_code=409, detail="板块数据已更新，请刷新后重试")
+
+    if not save_state(state_dict, expected_updated_at=expected_updated_at):
+        raise HTTPException(status_code=409, detail="板块数据已更新，请刷新后重试")
+    return {"success": True, "message": "保存成功", "state": state_dict}
 
 # ============================================================
 # 基金信息 API
@@ -430,6 +440,243 @@ class SellFifoRequest(BaseModel):
     total_sell_shares: float
     sell_nav: Optional[float] = None
     sell_date: Optional[str] = None
+
+
+class JdGridAdjustment(BaseModel):
+    id: str
+    code: str
+    name: Optional[str] = None
+    type: str
+    tradeDate: str
+    tradeTime: Optional[str] = None
+    shares: Optional[str] = None
+    amount: Optional[str] = None
+    targetCode: Optional[str] = None
+    targetName: Optional[str] = None
+    targetShares: Optional[str] = None
+
+
+class JdGridHolding(BaseModel):
+    code: str
+    name: str = ""
+    amount: Optional[str] = None
+    shares: Optional[str] = None
+    costPrice: Optional[str] = None
+    costAmount: Optional[str] = None
+    profit: Optional[str] = None
+    profitDate: Optional[str] = None
+    acquiredDate: Optional[str] = None
+
+
+class JdGridImportRequest(BaseModel):
+    current_holding_codes: List[str]
+    current_holdings: List[JdGridHolding] = []
+    adjustments: List[JdGridAdjustment]
+
+
+def _jd_positive_number(value) -> Optional[float]:
+    """Extract JD numeric strings such as `1,234.56元` and `800份`."""
+    text = str(value or "").replace(",", "").replace("，", "").strip()
+    matched = re.search(r"[+-]?(?:\d+(?:\.\d+)?|\.\d+)", text)
+    if not matched:
+        return None
+    try:
+        number = float(matched.group(0))
+    except ValueError:
+        return None
+    return number if number > 0 else None
+
+
+def _jd_nav_on_date(code: str, trade_date: str, cache: dict) -> Optional[float]:
+    cache_key = (code, trade_date)
+    if cache_key in cache:
+        return cache[cache_key]
+    try:
+        from valuation.providers import get_fund_nav_history
+        trade_day = datetime.strptime(trade_date, "%Y-%m-%d").date()
+        calendar_days = max(0, (date.today() - trade_day).days)
+        # Estimate trading days, add a margin for holidays, and cap the request
+        # at a decade of published history used by the JD transaction reader.
+        history_days = min(3000, max(90, calendar_days * 5 // 7 + 90))
+        history = get_fund_nav_history(code, history_days)
+        nav = next((
+            _jd_positive_number(item.get("nav"))
+            for item in history
+            if item.get("date") == trade_date and _jd_positive_number(item.get("nav"))
+        ), None)
+    except Exception:
+        nav = None
+    cache[cache_key] = nav
+    return nav
+
+
+def _jd_import_leg(ledger_id: str, code: str, action: str, trade_date: str,
+                   trade_time: Optional[str], shares_value, amount_value: Optional[float],
+                   nav_cache: dict, note: str, name: str = "") -> Optional[dict]:
+    shares = _jd_positive_number(shares_value)
+    amount = _jd_positive_number(amount_value)
+    nav = amount / shares if amount and shares else _jd_nav_on_date(code, trade_date, nav_cache)
+    if action == "buy":
+        if not amount and shares and nav:
+            amount = shares * nav
+        if not amount or not nav:
+            return None
+    elif not shares:
+        if amount and nav:
+            shares = amount / nav
+        if not shares:
+            return None
+    return {
+        "ledger_id": ledger_id,
+        "code": code,
+        "action": action,
+        "trade_date": trade_date,
+        "trade_time": trade_time or "",
+        "shares": round(shares, 4) if shares else None,
+        "amount": round(amount, 4) if amount else None,
+        "nav": round(nav, 6) if nav else None,
+        "note": note,
+        "name": name.strip(),
+    }
+
+
+def _jd_timeline_matches_current_holding(legs: list, expected_shares: Optional[float]) -> bool:
+    """Accept a JD fund only when its real timeline reconciles to the cookie snapshot."""
+    if not expected_shares or expected_shares <= 0:
+        return False
+    balance = 0.0
+    has_buy = False
+    for leg in legs:
+        shares = _jd_positive_number(leg.get("shares"))
+        if not shares:
+            return False
+        if leg.get("action") == "buy":
+            balance += shares
+            has_buy = True
+        elif leg.get("action") == "sell":
+            balance -= shares
+    tolerance = max(0.02, expected_shares * 0.001)
+    return has_buy and balance > 0 and abs(balance - expected_shares) <= tolerance
+
+
+@app.post("/v1/positions/jd-import")
+def import_jd_positions(req: JdGridImportRequest):
+    """Import the JD audit stream as idempotent grid batches for current holdings only."""
+    current_codes = {code.strip() for code in req.current_holding_codes if isinstance(code, str) and code.strip().isdigit() and len(code.strip()) == 6}
+    if not current_codes:
+        raise HTTPException(status_code=400, detail="当前京东持仓不能为空")
+
+    nav_cache = {}
+    legs = []
+    rejected = []
+    candidate_codes = set()
+    invalid_candidate_codes = set()
+    for adjustment in req.adjustments:
+        code = adjustment.code.strip()
+        trade_date = adjustment.tradeDate.strip()
+        if not code.isdigit() or len(code) != 6 or adjustment.type not in {"add", "reduce", "convert"}:
+            rejected.append({"id": adjustment.id, "status": "skipped", "reason": "invalid_adjustment"})
+            continue
+        try:
+            datetime.strptime(trade_date, "%Y-%m-%d")
+        except ValueError:
+            rejected.append({"id": adjustment.id, "status": "skipped", "reason": "invalid_trade_date"})
+            continue
+
+        if adjustment.type == "add":
+            if code not in current_codes:
+                rejected.append({"id": adjustment.id, "code": code, "status": "skipped", "reason": "not_current_holding"})
+                continue
+            candidate_codes.add(code)
+            leg = _jd_import_leg(f"jd:{adjustment.id}:source", code, "buy", trade_date, adjustment.tradeTime,
+                                 adjustment.shares, adjustment.amount, nav_cache, "京东导入·买入")
+            if leg:
+                legs.append(leg)
+            else:
+                rejected.append({"id": adjustment.id, "code": code, "status": "skipped", "reason": "missing_buy_value"})
+                invalid_candidate_codes.add(code)
+            continue
+
+        if adjustment.type == "reduce":
+            if code not in current_codes:
+                rejected.append({"id": adjustment.id, "code": code, "status": "skipped", "reason": "not_current_holding"})
+                continue
+            candidate_codes.add(code)
+            leg = _jd_import_leg(f"jd:{adjustment.id}:source", code, "sell", trade_date, adjustment.tradeTime,
+                                 adjustment.shares, adjustment.amount, nav_cache, "京东导入·卖出")
+            if leg:
+                legs.append(leg)
+            else:
+                rejected.append({"id": adjustment.id, "code": code, "status": "skipped", "reason": "missing_sell_shares"})
+                invalid_candidate_codes.add(code)
+            continue
+
+        if code in current_codes:
+            candidate_codes.add(code)
+            source_leg = _jd_import_leg(f"jd:{adjustment.id}:source", code, "sell", trade_date, adjustment.tradeTime,
+                                        adjustment.shares, adjustment.amount, nav_cache, "京东导入·转换转出")
+            if source_leg:
+                legs.append(source_leg)
+            else:
+                rejected.append({"id": adjustment.id, "code": code, "status": "skipped", "reason": "missing_conversion_source"})
+                invalid_candidate_codes.add(code)
+        target_code = (adjustment.targetCode or "").strip()
+        if target_code in current_codes:
+            candidate_codes.add(target_code)
+            source_amount = _jd_positive_number(adjustment.amount)
+            if not source_amount:
+                source_shares = _jd_positive_number(adjustment.shares)
+                source_nav = _jd_nav_on_date(code, trade_date, nav_cache)
+                source_amount = source_shares * source_nav if source_shares and source_nav else None
+            target_leg = _jd_import_leg(f"jd:{adjustment.id}:target", target_code, "buy", trade_date, adjustment.tradeTime,
+                                        adjustment.targetShares, source_amount, nav_cache, "京东导入·转换转入")
+            if target_leg:
+                legs.append(target_leg)
+            else:
+                rejected.append({"id": adjustment.id, "code": target_code, "status": "skipped", "reason": "missing_conversion_target"})
+                invalid_candidate_codes.add(target_code)
+        elif code not in current_codes:
+            rejected.append({"id": adjustment.id, "status": "skipped", "reason": "not_current_holding"})
+
+    expected_shares = {
+        holding.code.strip(): _jd_positive_number(holding.shares)
+        for holding in req.current_holdings
+        if holding.code and holding.code.strip() in current_codes
+    }
+    verified_legs = []
+    for code in sorted(current_codes):
+        fund_legs = [leg for leg in legs if leg["code"] == code]
+        # A snapshot-only fund has no actual timeline to validate. Preserve the
+        # concise missing-cycle result below. A candidate with a missing value
+        # or an unreconciled share balance is unsafe as a whole and must never
+        # leave its otherwise-valid legs in the grid.
+        if not fund_legs and code not in candidate_codes:
+            continue
+        if code in invalid_candidate_codes or not _jd_timeline_matches_current_holding(fund_legs, expected_shares.get(code)):
+            rejected.append({"id": f"jd:timeline:{code}", "code": code, "status": "skipped", "reason": "unverified_current_timeline"})
+            continue
+        for leg in fund_legs:
+            leg["timeline_verified"] = True
+            verified_legs.append(leg)
+    legs = verified_legs
+    holding_names = {holding.code.strip(): holding.name.strip() for holding in req.current_holdings}
+    for leg in legs:
+        if not leg.get("name"):
+            leg["name"] = holding_names.get(leg["code"], "")
+
+    # The grid is an auditable reconstruction of the current holding cycle.
+    # Never synthesize a batch from a cost snapshot when JD did not return the
+    # actual opening transaction and its date.
+    covered_codes = {leg["code"] for leg in legs if leg["action"] == "buy"}
+    for code in sorted(current_codes - covered_codes):
+        if code in candidate_codes:
+            continue
+        rejected.append({"id": f"jd:cycle:{code}", "code": code, "status": "skipped", "reason": "missing_current_cycle_transaction"})
+
+    result = import_jd_grid_transactions(legs)
+    result["results"] = rejected + result["results"]
+    result["skipped"] += len(rejected)
+    return result
 
 
 @app.post("/v1/position/{fund_code}/sell-fifo")
