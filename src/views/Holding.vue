@@ -17,6 +17,7 @@ import { showConfirmDialog, showToast, showLoadingToast, closeToast, showDialog 
 import { formatMoney, formatPercent, getChangeStatus, getJdFundLink } from '@/utils/format'
 import MarketIndexBoard from '@/components/MarketIndexBoard.vue'
 import DataSourceSelector from '@/components/DataSourceSelector.vue'
+import JdCookieImportDialog from '@/components/JdCookieImportDialog.vue'
 import { DATA_SOURCE_CONFIG, type DataSource, type FundInfo, type HoldingRecord, type FundShareClass, type FundFeeInfo, type PendingAdjustment, type SyncedAdjustment } from '@/types/fund'
 
 import { getTodayStr, getValuationComparisonState, isEstimateDateToday, isTradingHours as isBeijingTradingHours, PRECISION, round } from '@/utils/holdingCalculator'
@@ -24,7 +25,7 @@ import { getAdjustmentConfirmationAt, getSettlementNavStartDate } from '@/utils/
 import { deriveHoldingImportBasis, parseHoldingImportNumber } from '@/utils/holdingImport'
 import { openAlipayFundDetail } from '@/utils/alipayFund'
 import { openJdFundDetail } from '@/utils/jdFund'
-import { hasReachedJdConfirmationWindow, importJdHoldings, type JdSyncProgress } from '@/utils/jdHoldings'
+import { hasReachedJdConfirmationWindow, importJdHoldingsWithCookie, type JdSyncProgress } from '@/utils/jdHoldings'
 
 // 集成风控系统和日志模块
 import { getRiskController } from '@/utils/riskControl'
@@ -1287,6 +1288,7 @@ function goToDetail(code: string) {
 
 const showImportDialog = ref(false)
 const isJdImporting = ref(false)
+const showJdCookieDialog = ref(false)
 const importImagePreview = ref('')
 const importImageFile = ref<File | null>(null)
 const isImporting = ref(false)
@@ -1410,7 +1412,7 @@ const ocrMenuRef = ref<HTMLElement | null>(null)  // 菜单ref用于点击外部
 
 // [NEW] OCR选项列表
 const importOptions = [
-  { value: 'jd' as const, label: '京东账户读取', icon: 'balance-o', desc: '登录后读取当前持仓、本轮建仓调仓记录与昨日收益' },
+  { value: 'jd' as const, label: '京东 Cookie 读取', icon: 'balance-o', desc: '读取当前持仓、本轮建仓调仓记录与昨日收益' },
   { value: 'ai' as const, label: 'AI 智能识别', icon: 'scan', desc: '识别持仓截图' }
 ]
 
@@ -1424,7 +1426,7 @@ function triggerOcrMenu(event: Event) {
 async function selectImportOption(mode: 'jd' | 'ai') {
   showOcrMenu.value = false
   if (mode === 'jd') {
-    await importJdAccount()
+    showJdCookieDialog.value = true
   } else {
     fileInputRef.value?.click()
   }
@@ -1549,13 +1551,13 @@ function extractFundDataFromAI(result: any): any[] {
     })
 }
 
-async function importJdAccount() {
+async function importJdHoldings(cookie: string) {
   if (isJdImporting.value) return
   isJdImporting.value = true
   updateJdSyncProgress({ stage: 'reading_holdings', message: '正在读取京东当前持仓...' })
   showLoadingToast({ message: '正在读取京东当前持仓...', forbidClick: true, duration: 0 })
   try {
-    const result = await importJdHoldings({ onProgress: updateJdSyncProgress })
+    const result = await importJdHoldingsWithCookie(cookie, { onProgress: updateJdSyncProgress })
     const syncedAt = Date.now()
     jdImportedAdjustments.value = result.adjustments.map((item) => ({
       ...item,
@@ -1861,6 +1863,7 @@ function closeImportDialog() {
       :fund-name="dataSourceTargetName"
       @select="applyHoldingDataSource"
     />
+    <JdCookieImportDialog v-model:show="showJdCookieDialog" title="京东 Cookie 读取" @confirm="importJdHoldings" />
     <van-popup
       :show="isJdImporting"
       class="jd-sync-progress"
@@ -1869,7 +1872,7 @@ function closeImportDialog() {
       :safe-area-inset-bottom="true"
     >
       <van-loading size="28px" color="#1989fa" />
-      <div class="jd-sync-progress-title">京东账户读取</div>
+      <div class="jd-sync-progress-title">京东 Cookie 读取</div>
       <div class="jd-sync-progress-message">{{ jdSyncProgress.message }}</div>
       <van-progress :percentage="jdSyncProgress.percentage" stroke-width="5" :show-pivot="false" />
     </van-popup>

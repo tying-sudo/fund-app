@@ -5,8 +5,9 @@ import { useRouter } from 'vue-router'
 import Sortable from 'sortablejs'
 import { useHoldingStore } from '@/stores/holding'
 import { getJdFundLink } from '@/utils/format'
-import { importJdHoldings } from '@/utils/jdHoldings'
+import { importJdHoldingsWithCookie } from '@/utils/jdHoldings'
 import { buildGridJdImportPayload } from '@/utils/gridJdImport'
+import JdCookieImportDialog from '@/components/JdCookieImportDialog.vue'
 import { mergeStrategyOrder, sortByStrategyOrder } from '@/utils/gridStrategyOrder'
 import {
   calculateGridConversionTransferIn,
@@ -103,6 +104,7 @@ const strategyLoadedAt = ref(0)
 const positionEditorOpen = ref(false)
 const positionSaving = ref(false)
 const jdImporting = ref(false)
+const showJdCookieDialog = ref(false)
 const tradeImageInput = ref<HTMLInputElement | null>(null)
 const tradeImportOpen = ref(false)
 const tradeImportRecognizing = ref(false)
@@ -946,15 +948,20 @@ function importExistingHolding(code: string) {
   positionForm.maxPosition = String(Math.max(5000, Math.ceil(Number(holding.amount || 0) / 100) * 100))
 }
 
-async function importJdGridTransactions() {
+function openJdGridCookieImport() {
+  if (!jdImporting.value) showJdCookieDialog.value = true
+}
+
+async function importJdGridTransactions(cookie: string) {
   if (jdImporting.value) return
   jdImporting.value = true
+  showLoadingToast({ message: '正在读取京东当前持仓...', forbidClick: true, duration: 0 })
   try {
-    const jdResult = await importJdHoldings({
+    const jdResult = await importJdHoldingsWithCookie(cookie, {
       onProgress: (progress) => showLoadingToast({ message: progress.message, forbidClick: true, duration: 0 })
     })
     // The audit list may intentionally retain incomplete JD rows for the
-    // holding page. The grid must certify against the full native timeline.
+    // holding page. The grid must certify against the full Cookie timeline.
     const payload = buildGridJdImportPayload(jdResult.items, jdResult.timelineAdjustments)
     if (!payload.current_holding_codes.length) {
       closeToast()
@@ -1731,6 +1738,7 @@ onBeforeUnmount(() => {
 
 <template>
   <main class="grid-native-page" :class="{ 'strategy-source-page': !isValuation }">
+    <JdCookieImportDialog v-model:show="showJdCookieDialog" title="京东 Cookie 导入网格批次" @confirm="importJdGridTransactions" />
     <input ref="tradeImageInput" class="visually-hidden" type="file" accept="image/png,image/jpeg,image/webp" multiple @change="handleTradeImages">
     <van-pull-refresh v-model="pullRefreshing" class="grid-pull-refresh" @refresh="onPullRefresh">
       <header class="grid-header">
@@ -2018,7 +2026,7 @@ onBeforeUnmount(() => {
         <div class="dialog-title">
           <span>录入持仓</span>
           <span class="dialog-actions">
-            <button class="icon-button quiet jd-import-button" type="button" title="登录京东导入真实买卖批次" aria-label="登录京东导入真实买卖批次" :disabled="jdImporting" @click="importJdGridTransactions"><van-icon :name="jdImporting ? 'loading' : 'shop-o'" /></button>
+            <button class="icon-button quiet jd-import-button" type="button" title="输入京东 Cookie 导入真实买卖批次" aria-label="输入京东 Cookie 导入真实买卖批次" :disabled="jdImporting" @click="openJdGridCookieImport"><van-icon :name="jdImporting ? 'loading' : 'shop-o'" /></button>
             <button class="icon-button quiet" type="button" title="从交易截图导入" aria-label="从交易截图导入" @click="triggerTradeImageImport"><van-icon name="photo-o" /></button>
             <van-icon name="cross" role="button" tabindex="0" aria-label="关闭" @click="positionEditorOpen = false" />
           </span>

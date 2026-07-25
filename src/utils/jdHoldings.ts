@@ -53,7 +53,7 @@ export interface JdSyncProgress {
 }
 
 interface NativeJdHoldingsPlugin {
-  importHoldings(): Promise<{ items?: JdHoldingItem[]; adjustments?: JdAdjustmentItem[] }>
+  importHoldingsWithCookie(options: { cookie: string }): Promise<{ items?: JdHoldingItem[]; adjustments?: JdAdjustmentItem[] }>
   addListener(eventName: 'syncProgress', listenerFunc: (event: JdSyncProgress) => void): Promise<PluginListenerHandle>
 }
 
@@ -283,18 +283,26 @@ export function normalizeJdImportResult(value: unknown): JdImportResult {
   }
 }
 
-/** Opens the isolated native JD sign-in flow and returns only normalized fund data. */
-export async function importJdHoldings(options: { onProgress?: (progress: JdSyncProgress) => void } = {}): Promise<JdImportResult> {
+export function normalizeJdCookie(value: unknown): string | null {
+  const cookie = String(value ?? '').trim().replace(/^cookie\s*:\s*/i, '')
+  if (cookie.length < 3 || cookie.length > 16_384 || !cookie.includes('=') || /[\r\n]/.test(cookie)) return null
+  return cookie
+}
+
+/** Sends a one-time user-supplied cookie only to JD's fixed holdings endpoints. */
+export async function importJdHoldingsWithCookie(cookie: string, options: { onProgress?: (progress: JdSyncProgress) => void } = {}): Promise<JdImportResult> {
   if (Capacitor.getPlatform() !== 'android') {
-    throw new Error('京东账户读取仅支持 Android App')
+    throw new Error('京东 Cookie 读取仅支持 Android App')
   }
-  // Remove credentials saved by versions that exposed a Cookie text box.
-  try { localStorage.removeItem('fund-app:jd-cookie:v1') } catch { /* storage can be unavailable */ }
+  const normalizedCookie = normalizeJdCookie(cookie)
+  if (!normalizedCookie) {
+    throw new Error('请输入有效的京东 Cookie')
+  }
   const listener = options.onProgress
     ? await JdHoldings.addListener('syncProgress', options.onProgress)
     : undefined
   try {
-    return normalizeJdImportResult(await JdHoldings.importHoldings())
+    return normalizeJdImportResult(await JdHoldings.importHoldingsWithCookie({ cookie: normalizedCookie }))
   } finally {
     await listener?.remove()
   }
