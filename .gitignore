@@ -65,6 +65,7 @@ android/app/src/main/java/com/fundapp/*
 !android/app/src/main/java/com/fundapp/realtime/
 android/app/src/main/java/com/fundapp/realtime/*
 !android/app/src/main/java/com/fundapp/realtime/MainActivity.java
+!android/app/src/main/java/com/fundapp/realtime/JdFundPlugin.java
 !android/app/src/main/java/com/fundapp/realtime/JdHoldingsPlugin.java
 
 # Local package/download caches and release artifacts

@@ -24,7 +24,7 @@ import { getTodayStr, getValuationComparisonState, isEstimateDateToday, isTradin
 import { getAdjustmentConfirmationAt, getSettlementNavStartDate } from '@/utils/tradingDate'
 import { buildJdHoldingSnapshot, deriveHoldingImportBasis, parseHoldingImportNumber } from '@/utils/holdingImport'
 import { openAlipayFundDetail } from '@/utils/alipayFund'
-import { openJdFundDetail } from '@/utils/jdFund'
+import { buildJdFundTradeScheme, openJdFundDetail, openJdFundTrade, type JdFundTradeAction } from '@/utils/jdFund'
 import { filterRecentJdAdjustments, hasReachedJdConfirmationWindow, importJdHoldingsWithCookie, isJdAdjustmentRecent, type JdHoldingItem, type JdSyncProgress } from '@/utils/jdHoldings'
 
 // 集成风控系统和日志模块
@@ -43,6 +43,11 @@ let confirmationClockTimer: ReturnType<typeof setInterval> | null = null
 const showDataSourceSelector = ref(false)
 const dataSourceTargetCode = ref('')
 const dataSourceTargetName = ref('')
+const jdTradeActions: ReadonlyArray<{ value: JdFundTradeAction, label: string }> = [
+  { value: 'buy', label: '买入' },
+  { value: 'sell', label: '卖出' },
+  { value: 'convert', label: '转换' }
+]
 
 function openDataSourceSelector(code: string, name: string) {
   dataSourceTargetCode.value = code
@@ -2104,7 +2109,7 @@ function closeImportDialog() {
     <div class="holding-list-container">
       <template v-if="holdingStore.holdings.length > 0">
         <van-swipe-cell v-for="holding in filteredHoldings" :key="holding.code">
-          <div class="holding-item" @click="goToDetail(holding.code)">
+          <div class="holding-item" :style="{ '--holding-fund-name-size': getFundNameStyle(holding.name).fontSize }" @click="goToDetail(holding.code)">
             <div class="col-name">
               <div class="fund-name" :style="getFundNameStyle(holding.name)">
                 <span>{{ holding.name || '加载中...' }}</span>
@@ -2127,16 +2132,27 @@ function closeImportDialog() {
                 </template>
               </div>
               <div class="fund-diff-info">
-                <button type="button" class="estimate-source-button" title="切换估值来源" @click.stop="openDataSourceSelector(holding.code, holding.name)">估值 <van-icon name="arrow-down" /></button>
-                <template v-if="hasDiffData(holding)">
-                  <span :class="['diff-value', getEstimateChangeClass(holding)]">{{ getDisplayEstimateChange(holding) }}</span>
-                  <span class="diff-separator">|</span>
-                  <span class="diff-label">{{ getRealChangeLabel(holding) }}</span>
-                  <span :class="['diff-value', getRealChangeClass(holding)]">{{ getDisplayRealChange(holding) || '--' }}</span>
-                  <span class="diff-separator">|</span>
-                  <span class="diff-label">{{ getDiffLabel(holding) }}</span>
-                  <span :class="['diff-value', getDiffClass(holding)]">{{ getDisplayDiff(holding) || '待计算' }}</span>
-                </template>
+                <div class="valuation-action-row">
+                  <a
+                    v-for="action in jdTradeActions"
+                    :key="action.value"
+                    :class="['jd-trade-link', `jd-trade-${action.value}`]"
+                    :href="buildJdFundTradeScheme(holding.code, action.value)"
+                    @click.stop.prevent="openJdFundTrade(holding.code, action.value)"
+                  >{{ action.label }}</a>
+                </div>
+                <div class="valuation-diff-row">
+                  <button type="button" class="estimate-source-button estimate-source-inline-button" title="切换估值来源" @click.stop="openDataSourceSelector(holding.code, holding.name)">估 <van-icon name="arrow-down" /></button>
+                  <template v-if="hasDiffData(holding)">
+                    <span :class="['diff-value', getEstimateChangeClass(holding)]">{{ getDisplayEstimateChange(holding) }}</span>
+                    <span class="diff-separator">|</span>
+                    <span class="diff-label">{{ getRealChangeLabel(holding) }}</span>
+                    <span :class="['diff-value', getRealChangeClass(holding)]">{{ getDisplayRealChange(holding) || '--' }}</span>
+                    <span class="diff-separator">|</span>
+                    <span class="diff-label">{{ getDiffLabel(holding) }}</span>
+                    <span :class="['diff-value', getDiffClass(holding)]">{{ getDisplayDiff(holding) || '待计算' }}</span>
+                  </template>
+                </div>
               </div>
             </div>
             <div class="col-right">
@@ -3269,15 +3285,67 @@ function closeImportDialog() {
 
 /* 估值、真实涨跌幅、实差信息 */
 .fund-diff-info {
-  display: flex;
-  align-items: center;
+  display: grid;
   gap: 2px;
   margin-top: 2px;
   font-size: 11px;
   font-family: -apple-system, 'SF Mono', 'Roboto Mono', monospace;
   font-variant-numeric: tabular-nums;
-  white-space: normal;
-  flex-wrap: wrap;
+  min-width: 0;
+}
+
+.valuation-action-row,
+.valuation-diff-row {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+  gap: 2px;
+  white-space: nowrap;
+}
+
+.valuation-action-row {
+  justify-content: center;
+  gap: 8px;
+  padding-left: 8px;
+}
+
+.valuation-diff-row {
+  overflow: hidden;
+}
+
+.jd-trade-link {
+  display: inline-flex;
+  flex: 0 0 42px;
+  box-sizing: border-box;
+  min-height: 26px;
+  align-items: center;
+  justify-content: center;
+  padding: 0 7px;
+  border-radius: 4px;
+  font-family: inherit;
+  font-size: calc(var(--holding-fund-name-size, 14px) - 2px);
+  font-weight: 600;
+  line-height: 1;
+  text-decoration: none;
+}
+
+.jd-trade-buy {
+  color: #d83b4a;
+  background: rgba(216, 59, 74, .12);
+}
+
+.jd-trade-sell {
+  color: #16845b;
+  background: rgba(22, 132, 91, .12);
+}
+
+.jd-trade-convert {
+  color: #2574bd;
+  background: rgba(37, 116, 189, .12);
+}
+
+.jd-trade-link:active {
+  opacity: .7;
 }
 
 .diff-label {
@@ -3287,6 +3355,7 @@ function closeImportDialog() {
 
 .estimate-source-button {
   display: inline-flex;
+  flex: 0 0 auto;
   align-items: center;
   gap: 1px;
   min-height: 20px;
@@ -3301,12 +3370,21 @@ function closeImportDialog() {
 
 .estimate-source-button :deep(.van-icon) { font-size: 10px; }
 
+.estimate-source-inline-button {
+  min-height: 18px;
+  padding: 0 3px;
+  font-size: 10px;
+  line-height: 16px;
+}
+
 .diff-value {
+  flex: 0 0 auto;
   font-weight: 500;
   font-size: 9px;
 }
 
 .diff-separator {
+  flex: 0 0 auto;
   color: var(--border-color);
   margin: 0 1px;
   font-size: 9px;

@@ -2,6 +2,19 @@
 
 Append material implementation and release milestones here. This log does not contain credentials, private keys, or environment values.
 
+## 2026-07-26
+
+- Built Android `1.0.113 (114)` for the holding valuation layout and source-dialog refinements. The APK reports package `com.fundapp.realtime`, carries valid v1/v2 signatures, is `6,816,341` bytes, and has SHA-256 `a7799d4b94522836ce0d83303d9d2d3117fa94261f7bf25c4170228cb4851f90`.
+- APK-only publication was intentionally stopped before any remote write: the reachable deployment host rejected the locally available key, and its presented host identity differs from the saved record. Restore the approved deployment credential and verify the host identity before rerunning `scripts/publish-apk-update.mjs`.
+- Public verification remains unchanged at `1.0.112 (113)` with `fund-app-1.0.112-113.apk`, `6,815,703` bytes, and SHA-256 `89d9fc93629684e08ef1dde57b881f2eee59bf53b966212b6f8f35e4ceaa762d`.
+- After the dedicated deployment key was installed for `root@10.0.10.20`, published Android `1.0.113 (114)` through the APK-only atomic release path. Public `/api/app/version` reports `available=true`, `fund-app-1.0.113-114.apk`, and the matching SHA-256. The HTTPS download is `6,816,341` bytes with SHA-256 `a7799d4b94522836ce0d83303d9d2d3117fa94261f7bf25c4170228cb4851f90`, matching the local signed APK.
+- Captured the JD Finance action routes instead of inferring them: buy uses `/finance/fund/fundtrade/index/` with `itemId=1 + fundCode`; sell uses `/fund/newfundtrade/redeem/`; conversion uses that same redeem route with `curType=transfer&hideTabFlag=1`. `Holding.vue` now displays the valuation actions separately from its estimate/yesterday/difference values and routes all three actions through the existing JD Finance native scheme. `JdFundPlugin.java` is now included in the app-owned Android sources, so those native routes persist across builds. TypeScript checks, the captured-URL unit tests, Vite, Capacitor Android sync, and the JDK 21 debug APK build pass locally.
+- Published Android `1.0.114 (115)` through the APK-only atomic release path. Public `/api/app/version` reports `available=true` with `fund-app-1.0.114-115.apk`; the independently downloaded HTTPS APK is `6,817,519` bytes with SHA-256 `78127f050d15418b8b3dab13e4d4e4e304739236562770392422489c48a80855`, matching the signed local artifact and release metadata. Rollback manifest: `/opt/fund-proxy/data/app-version.json.previous-20260726T110837`.
+- The captured JD Finance buy route for `100055` uses product ID `107138`, rather than the generic `1 + fundCode` pattern. The web route now resolves that explicit exception and passes it to the Android bridge; the bridge validates and uses the same ID, including its compatibility fallback.
+- The holding-row buy, sell, and conversion tags now center slightly right with wider spacing. Their font size tracks the row's actual fund-name size minus `2px`, while each keeps a `42px` by `26px` CSS click area. At a 360px mobile viewport, a `12px` fund name produced `10px` action tags.
+- Verification passed: JD deep-link tests (4/4), `vue-tsc --noEmit`, Vite production build, Capacitor Android sync, JDK 21 Android assembly, `git diff --check`, and APK package/version plus v1/v2 signature checks. Published backend-only Android `1.0.115 (116)`.
+- Public verification passed: `/api/app/version` reports `available=true`, preserves `minimumVersion` at `1.0.106`, and serves `fund-app-1.0.115-116.apk`; the independently downloaded HTTPS APK is `6,817,806` bytes with SHA-256 `551d29f478d63503c296c92bf7fe9ae513f942f262965ed9ea18ca42bd071c74`, matching the signed local artifact and release metadata. Rollback manifest: `/opt/fund-proxy/data/app-version.json.previous-20260726T122127`.
+
 ## 2026-07-25
 
 - Replaced the JD account-login surfaces on the holdings and grid pages with one shared Cookie entry dialog. It stores the submitted Cookie only in the device's browser/WebView storage, restores it when either dialog is opened again, and provides a delete action; the Cookie is never sent to this application's backend.
@@ -488,3 +501,9 @@ Append material implementation and release milestones here. This log does not co
 - If the modern page transport is temporarily rejected, the holding importer falls back to the h5 snapshot reader used by the existing grid Cookie path. Native rejection messages now remain Chinese in the holding popup instead of being hidden by Capacitor's Java exception prefix.
 - Verification passed: JD holding tests 12/12, grid JD payload tests 7/7, holding settlement verification, `vue-tsc --noEmit`, Vite production build, Capacitor Android sync, Java 21 Android assembly, APK package `com.fundapp.realtime 1.0.112 (113)`, and APK v1/v2 signature checks.
 - Published backend-only Android `1.0.112 (113)`. Public `/api/app/version` reports `available=true`; the independently downloaded HTTPS APK is `6,815,703` bytes with SHA-256 `89d9fc93629684e08ef1dde57b881f2eee59bf53b966212b6f8f35e4ceaa762d`, matching release metadata and the signed local artifact. Rollback manifest: `/opt/fund-proxy/data/app-version.json.previous-20260726T070250`. No Android device was attached for a live Cookie import.
+
+## 2026-07-26 - Holding valuation selector layout and help
+
+- Kept the holding-row valuation comparison on one clipped line at narrow widths, so the source button and trailing comparison text no longer wrap into a second line and change row height.
+- Restyled the shared valuation-source selector with the app theme variables, and moved the always-visible recommendation explanation into a separate, dismissible question-mark help dialog.
+- Verification passed: `git diff --check`, Vite production build, `vue-tsc --noEmit`, and a 360px-wide local mobile interaction check covering source-selector open/close and help-dialog open/close. This is a local frontend change only; no APK build or publication was performed.
