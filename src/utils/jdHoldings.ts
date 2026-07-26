@@ -1,6 +1,6 @@
 import { Capacitor, registerPlugin } from '@capacitor/core'
 import type { PluginListenerHandle } from '@capacitor/core'
-import { addCalendarDays } from './tradingDate.ts'
+import { addCalendarDays, getBeijingDateString } from './tradingDate.ts'
 
 export interface JdHoldingItem {
   code: string
@@ -37,6 +37,8 @@ export interface JdImportResult {
   /** Full current-holding stream used only to certify a grid import. */
   timelineAdjustments: JdAdjustmentItem[]
   summary?: JdAccountSummary
+  /** A current-holding snapshot remains usable when JD's optional trade page is unavailable. */
+  tradeWarning?: string
 }
 
 export interface JdAccountSummary {
@@ -53,7 +55,8 @@ export interface JdSyncProgress {
 }
 
 interface NativeJdHoldingsPlugin {
-  importHoldingsWithCookie(options: { cookie: string }): Promise<{ items?: JdHoldingItem[]; adjustments?: JdAdjustmentItem[] }>
+  importHoldings(): Promise<{ items?: JdHoldingItem[]; adjustments?: JdAdjustmentItem[] }>
+  importHoldingsWithCookie(options: { cookie: string; background?: boolean }): Promise<{ items?: JdHoldingItem[]; adjustments?: JdAdjustmentItem[] }>
   addListener(eventName: 'syncProgress', listenerFunc: (event: JdSyncProgress) => void): Promise<PluginListenerHandle>
 }
 
@@ -110,7 +113,7 @@ function normalizeJdAdjustments(value: unknown): JdAdjustmentItem[] {
     const code = text(candidate?.code) || ''
     const type = text(candidate?.type)
     const tradeDate = text(candidate?.tradeDate) || ''
-    if (!/^\d{6}$/.test(code) || !['add', 'reduce', 'convert'].includes(type || '') || !/^\d{4}-\d{2}-\d{2}$/.test(tradeDate)) return []
+    if (!/^\d{6}$/.test(code) || !['add', 'reduce', 'convert'].includes(type || '') || !isValidJdTradeDate(tradeDate)) return []
     const targetCode = text(candidate.targetCode)
     const rawTradeTime = text(candidate.tradeTime)
     const tradeTime = rawTradeTime && /^\d{4}-\d{2}-\d{2} \d{2}:\d{2}(?::\d{2})?$/.test(rawTradeTime)
@@ -238,8 +241,58 @@ function hasTerminalJdStatus(status: string): boolean {
   return /(确认|完成|成交|到账|赎回成功|转换成功|交易成功|申购成功)/.test(status)
 }
 
+/** A regex alone accepts impossible dates such as 2026-02-31. */
+export function isValidJdTradeDate(value: string): boolean {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(value)
+  if (!match) return false
+  const year = Number(match[1])
+  const month = Number(match[2])
+  const day = Number(match[3])
+  const date = new Date(Date.UTC(year, month - 1, day))
+  return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day
+}
+
+/** Browser transaction capture is bounded so imports never walk the full account history. */
+export const JD_TRANSACTION_HISTORY_DAYS = 30
+
+/** Only the current five Beijing calendar days are written to the holding adjustment audit. */
+export const JD_RECENT_ADJUSTMENT_DAYS = 5
+
+/** Include today and the preceding four Beijing calendar days. */
+export function isJdAdjustmentRecent(
+  adjustment: Pick<JdAdjustmentItem, 'tradeDate'>,
+  now = new Date(),
+  days = JD_RECENT_ADJUSTMENT_DAYS
+): boolean {
+  if (!isValidJdTradeDate(adjustment.tradeDate)) return false
+  const windowDays = Math.max(1, Math.floor(days))
+  const today = getBeijingDateString(now)
+  const earliest = addCalendarDays(today, -(windowDays - 1))
+  return adjustment.tradeDate >= earliest && adjustment.tradeDate <= today
+}
+
+export function filterRecentJdAdjustments(
+  adjustments: JdAdjustmentItem[],
+  now = new Date(),
+  days = JD_RECENT_ADJUSTMENT_DAYS
+): JdAdjustmentItem[] {
+  return adjustments.filter((adjustment) => isJdAdjustmentRecent(adjustment, now, days))
+}
+
+/**
+ * Keep the 30-day browser capture available to consumers such as the grid
+ * importer, while the holding page applies its stricter five-day audit limit.
+ */
+export function filterRecentJdTransactions(
+  adjustments: JdAdjustmentItem[],
+  now = new Date()
+): JdAdjustmentItem[] {
+  return filterRecentJdAdjustments(adjustments, now, JD_TRANSACTION_HISTORY_DAYS)
+}
+
 /** JD normally confirms pre-close orders at about noon and post-close orders at 15:00 the next day. */
 export function getJdAdjustmentConfirmationAt(adjustment: JdAdjustmentItem): number {
+  if (!isValidJdTradeDate(adjustment.tradeDate)) return Number.POSITIVE_INFINITY
   const time = adjustment.tradeTime?.slice(11, 16) || ''
   const timeSlot = time >= '15:00' ? 'after' : 'before'
   const date = addCalendarDays(adjustment.tradeDate, 1)
@@ -248,6 +301,7 @@ export function getJdAdjustmentConfirmationAt(adjustment: JdAdjustmentItem): num
 
 /** A completed JD status wins; old rows without a status become eligible after their confirmation window. */
 export function hasReachedJdConfirmationWindow(adjustment: JdAdjustmentItem, now = Date.now()): boolean {
+  if (!isValidJdTradeDate(adjustment.tradeDate)) return false
   return hasTerminalJdStatus((adjustment.status || '').trim()) || now >= getJdAdjustmentConfirmationAt(adjustment)
 }
 
@@ -274,12 +328,14 @@ export function summarizeJdAccount(items: JdHoldingItem[]): JdAccountSummary | u
 
 export function normalizeJdImportResult(value: unknown): JdImportResult {
   const items = normalizeJdHoldingItems(value)
-  const timelineAdjustments = normalizeJdAdjustments(value)
+  const timelineAdjustments = filterRecentJdTransactions(normalizeJdAdjustments(value))
+  const tradeWarning = text((value as { tradeWarning?: unknown })?.tradeWarning)
   return {
     items,
     adjustments: filterJdCurrentPositionCycle(items, timelineAdjustments),
     timelineAdjustments,
-    summary: summarizeJdAccount(items)
+    summary: summarizeJdAccount(items),
+    ...(tradeWarning ? { tradeWarning } : {})
   }
 }
 
@@ -289,20 +345,36 @@ export function normalizeJdCookie(value: unknown): string | null {
   return cookie
 }
 
-/** Sends a one-time user-supplied cookie only to JD's fixed holdings endpoints. */
-export async function importJdHoldingsWithCookie(cookie: string, options: { onProgress?: (progress: JdSyncProgress) => void } = {}): Promise<JdImportResult> {
+/** Opens the isolated native JD sign-in flow and returns only normalized fund data. */
+export async function importJdHoldings(options: { onProgress?: (progress: JdSyncProgress) => void } = {}): Promise<JdImportResult> {
   if (Capacitor.getPlatform() !== 'android') {
-    throw new Error('京东 Cookie 读取仅支持 Android App')
-  }
-  const normalizedCookie = normalizeJdCookie(cookie)
-  if (!normalizedCookie) {
-    throw new Error('请输入有效的京东 Cookie')
+    throw new Error('京东账户读取仅支持 Android App')
   }
   const listener = options.onProgress
     ? await JdHoldings.addListener('syncProgress', options.onProgress)
     : undefined
   try {
-    return normalizeJdImportResult(await JdHoldings.importHoldingsWithCookie({ cookie: normalizedCookie }))
+    return normalizeJdImportResult(await JdHoldings.importHoldings())
+  } finally {
+    await listener?.remove()
+  }
+}
+
+/** Sends a user-approved Cookie only to JD's fixed holdings endpoints. */
+export async function importJdHoldingsWithCookie(cookie: string, options: { onProgress?: (progress: JdSyncProgress) => void; background?: boolean } = {}): Promise<JdImportResult> {
+  if (Capacitor.getPlatform() !== 'android') {
+    throw new Error('京东 Cookie 读取仅支持 Android App')
+  }
+  const normalizedCookie = normalizeJdCookie(cookie)
+  if (!normalizedCookie) throw new Error('请输入有效的京东 Cookie')
+  const listener = options.onProgress
+    ? await JdHoldings.addListener('syncProgress', options.onProgress)
+    : undefined
+  try {
+    return normalizeJdImportResult(await JdHoldings.importHoldingsWithCookie({
+      cookie: normalizedCookie,
+      ...(options.background ? { background: true } : {})
+    }))
   } finally {
     await listener?.remove()
   }

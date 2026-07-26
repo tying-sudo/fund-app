@@ -43,6 +43,8 @@ import {
   refreshMarketSecurityQuotes,
   startMarketHoldingsSync
 } from './market-holdings-sync.mjs'
+import { clearRedisHttpCache, redisHttpCache } from './http-cache.mjs'
+import { getRedisStatus } from './redis-cache.mjs'
 
 const app = express()
 const PORT = process.env.PORT || 3000
@@ -63,6 +65,7 @@ app.use((req, res, next) => {
 
 // JSON 解析
 app.use(express.json({ limit: '12mb' }))
+app.use(redisHttpCache)
 
 // ========== 自有 API 路由 ==========
 
@@ -499,8 +502,8 @@ app.get('/api/sector-detail', async (req, res) => {
 /**
  * GET /api/cache-stats - 缓存统计
  */
-app.get('/api/cache-stats', (req, res) => {
-  res.json(getCacheStats())
+app.get('/api/cache-stats', async (req, res) => {
+  res.json({ ...getCacheStats(), redis: await getRedisStatus() })
 })
 
 /**
@@ -509,8 +512,9 @@ app.get('/api/cache-stats', (req, res) => {
 app.post('/api/cache-refresh', async (req, res) => {
   try {
     clearCache()
+    const redisDeleted = await clearRedisHttpCache()
     await warmupCache()
-    res.json({ success: true, stats: getCacheStats() })
+    res.json({ success: true, redisDeleted, stats: { ...getCacheStats(), redis: await getRedisStatus() } })
   } catch (error) {
     res.status(500).json({ error: error.message })
   }
@@ -519,11 +523,12 @@ app.post('/api/cache-refresh', async (req, res) => {
 /**
  * GET /api/health - 健康检查
  */
-app.get('/api/health', (req, res) => {
+app.get('/api/health', async (req, res) => {
   res.json({
     status: 'ok',
     uptime: process.uptime(),
     cache: getCacheStats(),
+    redis: await getRedisStatus({ ping: true }),
     timestamp: new Date().toISOString()
   })
 })

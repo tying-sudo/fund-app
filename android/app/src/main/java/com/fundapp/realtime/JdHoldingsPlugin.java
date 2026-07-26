@@ -9,13 +9,11 @@ import android.net.Uri;
 import android.net.http.SslError;
 import android.os.Build;
 import android.view.Gravity;
-import android.view.View;
 import android.view.ViewGroup;
 import android.webkit.CookieManager;
 import android.webkit.JavascriptInterface;
 import android.webkit.SslErrorHandler;
 import android.webkit.WebResourceRequest;
-import android.webkit.WebResourceResponse;
 import android.webkit.WebSettings;
 import android.webkit.WebView;
 import android.webkit.WebViewClient;
@@ -32,10 +30,8 @@ import com.getcapacitor.annotation.CapacitorPlugin;
 
 import org.json.JSONArray;
 import org.json.JSONObject;
-import org.json.JSONTokener;
 
 import java.io.BufferedReader;
-import java.io.ByteArrayInputStream;
 import java.io.InputStream;
 import java.io.InputStreamReader;
 import java.io.OutputStream;
@@ -43,104 +39,107 @@ import java.net.HttpURLConnection;
 import java.net.URL;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
-import java.text.SimpleDateFormat;
-import java.util.Calendar;
-import java.util.Date;
-import java.util.HashSet;
-import java.util.Iterator;
 import java.util.ArrayList;
+import java.util.Calendar;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 import java.util.TimeZone;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutionException;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicInteger;
 
-/** Reads JD data with a one-time user-supplied Cookie; it is never stored, logged, or forwarded to our backend. */
+/** Reads a JD account using either the interactive WebView session or a user-supplied Cookie. */
 @CapacitorPlugin(name = "JdHoldings")
 public class JdHoldingsPlugin extends Plugin {
     private static final String LOGIN_URL = "https://jdjr.jd.com/";
-    private static final String HOLDINGS_URL = "https://ms.jr.jd.com/gw2/generic/CreatorSer/h5/m/queryUserFundHoldInfo";
-    private static final String NEW_HOLDINGS_URL = "https://ms.jr.jd.com/gw/generic/base/h5/m/fundHoldGroup";
-    private static final String NEW_HOLDING_DETAIL_URL = "https://ms.jr.jd.com/gw/generic/jj/h5/m/getNewFundPositionDetail";
-    // Captured from the current web flow: the holding list supplies extJson
-    // and opens this Roma detail page. A fund code alone is not a valid
-    // detail-page identity and must never be used to construct this URL.
+    private static final String HOLDINGS_URL = "https://ms.jr.jd.com/gw/generic/base/h5/m/fundHoldGroup";
+    private static final String HOLDING_DETAIL_URL = "https://ms.jr.jd.com/gw/generic/jj/h5/m/getNewFundPositionDetail";
+    // The holdings-page Cookie import has a separate, browser-originated API
+    // contract. Keep the grid's legacy WebView endpoints untouched.
+    private static final String HOLDING_COOKIE_GROUP_URL = "https://ms.jr.jd.com/gw/generic/base/newna/m/fundHoldGroup";
+    private static final String HOLDING_COOKIE_DETAIL_URL = "https://ms.jr.jd.com/gw/generic/jj/newna/m/getNewFundPositionDetail";
+    // JD renders the current-holding panel from this Roma document.  Loading
+    // the finance homepage instead changes the browser origin and can make
+    // the newna fund endpoints fail their CORS/origin validation.
+    private static final String HOLDING_PAGE_URL = "https://roma.jd.com/fund/hold/list/pc/?channelfrom=grouppc&showPCfund=1&ua=jdjr-app";
     private static final String FUND_DETAIL_PAGE_URL = "https://roma.jd.com/fund/hold/detail/?extJson=%s";
-    // Kept only while the old helper methods are removed in a follow-up
-    // cleanup. No active import path calls this encrypted account-wide route.
-    @Deprecated private static final String TRADE_LIST_URL = "https://ms.jr.jd.com/gw2/generic/cfGateway/newna/m/queryTradeOrderList";
-    @Deprecated private static final String LEGACY_TRADE_LIST_URL = "https://ms.jr.jd.com/gw2/generic/cfGateway/h5/m/queryTradeOrderList";
-    private static final int RECENT_TRADE_DAYS = 30;
-    // The current JD H5 trade-order endpoint returns 20 rows per page when
-    // pageSize is omitted. Keep this in sync with its real pagination so a
-    // full first page is never mistaken for the end of the history.
-    private static final int DETAIL_TRADE_PAGE_TIMEOUT_SECONDS = 12;
-    @Deprecated private static final int TRADE_PAGE_SIZE = 20;
-    @Deprecated private static final int MAX_TRADE_PAGES = 100;
-    @Deprecated private static final String TRADE_LIST_REFERER = "https://roma.jd.com/wealth/tradeorder/list?pageShowType=1&businessCode=";
-    @Deprecated private static final String TRADE_PAGE_URL = "https://roma.jd.com/wealth/tradeorder/list?pageShowType=1&businessCode=FUND&pageShowTitle=%E5%9F%BA%E9%87%91%E4%BA%A4%E6%98%93";
-    @Deprecated private static final int TRADE_PAGE_TIMEOUT_SECONDS = 45;
+    // This is the same account-wide fund transaction page reached from the
+    // holding header's "昨日收益 -> 交易记录" entry.
+    private static final String ACCOUNT_TRADE_PAGE_URL = "https://roma.jd.com/wealth/tradeorder/list?pageShowType=1&businessCode=FUND&pageShowTitle=%E5%9F%BA%E9%87%91%E4%BA%A4%E6%98%93";
     private static final int MATCH_PARENT = ViewGroup.LayoutParams.MATCH_PARENT;
     private static final int WRAP_CONTENT = ViewGroup.LayoutParams.WRAP_CONTENT;
+    private static final int DETAIL_TIMEOUT_SECONDS = 18;
+    private static final int HOLDING_DETAIL_CONCURRENCY = 12;
+    private static final int HOLDING_TRADE_CONCURRENCY = 12;
+    private static final int TRADE_HISTORY_DAYS = 30;
+    private static final int ACCOUNT_TRADE_TIMEOUT_SECONDS = 35;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private PluginCall pendingCall;
     private Dialog loginDialog;
     private WebView loginWebView;
-    private WebView tradeWebView;
+    private final ConcurrentHashMap<String, BrowserCookieRequest> cookieBrowserRequests = new ConcurrentHashMap<>();
     private TextView statusView;
     private Button importButton;
     private boolean importInFlight;
+    private boolean cookieImport;
     private String requestUserAgent = "Mozilla/5.0";
 
     @PluginMethod
     public void importHoldings(PluginCall call) {
-        if (pendingCall != null) {
-            call.reject("京东登录窗口已打开");
+        if (pendingCall != null || importInFlight) {
+            call.reject("已有京东读取任务正在进行");
             return;
         }
-
         call.setKeepAlive(true);
         pendingCall = call;
-        reportProgress("login", "请在京东金融完成登录", 0, 0);
-        getActivity().runOnUiThread(this::showLoginDialog);
+        reportProgress("login", "正在打开京东金融登录页...", 0, 0);
+        Activity activity = getActivity();
+        if (activity == null) {
+            finishWithError("无法打开京东金融登录页");
+            return;
+        }
+        activity.runOnUiThread(this::showLoginDialog);
     }
 
     @PluginMethod
     public void importHoldingsWithCookie(PluginCall call) {
         if (pendingCall != null || importInFlight) {
-            call.reject("读取任务正在进行");
+            call.reject("已有京东读取任务正在进行");
             return;
         }
-
         String sessionCookie = normalizeCookie(call.getString("cookie", ""));
         if (sessionCookie == null) {
             call.reject("请输入有效的京东 Cookie");
             return;
         }
-
         call.setKeepAlive(true);
         pendingCall = call;
-        importInFlight = true;
-        reportProgress("reading_holdings", "正在读取当前持仓...", 0, 0);
-        executor.execute(() -> {
-            try {
-                JSObject result = requestPortfolio(sessionCookie);
-                getActivity().runOnUiThread(() -> {
-                    if (call == pendingCall) finishWithResult(result);
-                });
-            } catch (LoginRequiredException error) {
-                getActivity().runOnUiThread(() -> finishWithError("京东交易时间线未能读取：当前持仓已验证，但该接口需要京东页面端加密调用"));
-            } catch (Exception error) {
-                String message = error.getMessage();
-                if (message == null || message.trim().isEmpty()) message = "Unable to read JD holdings. Check Cookie and network.";
-                final String visibleMessage = message;
-                getActivity().runOnUiThread(() -> finishWithError(visibleMessage));
-            }
+        cookieImport = true;
+        reportProgress("reading_holdings", "正在读取京东当前持仓...", 0, 0);
+        Activity activity = getActivity();
+        if (activity == null) {
+            finishWithError("无法打开京东持仓读取");
+            return;
+        }
+        boolean background = call.getBoolean("background", false);
+        activity.runOnUiThread(() -> {
+            if (background) startBackgroundCookieImport(sessionCookie);
+            else showCookieImportDialog(sessionCookie);
         });
+    }
+
+    /** Kept only so an already-cached web bundle uses the shared grid importer. */
+    @PluginMethod
+    public void importHoldingCookieLegacy(PluginCall call) {
+        importHoldingsWithCookie(call);
     }
 
     private String normalizeCookie(String value) {
@@ -156,7 +155,7 @@ public class JdHoldingsPlugin extends Plugin {
     private void showLoginDialog() {
         Activity activity = getActivity();
         if (activity == null || activity.isFinishing()) {
-            finishWithError("无法打开京东登录页面");
+            finishWithError("无法打开京东金融登录页");
             return;
         }
 
@@ -187,50 +186,22 @@ public class JdHoldingsPlugin extends Plugin {
         root.addView(header, new LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT));
 
         statusView = new TextView(activity);
-        statusView.setText("完成登录后将自动读取基金持仓并关闭此页面");
+        statusView.setText("完成登录后点击读取持仓");
         statusView.setTextColor(Color.rgb(95, 95, 95));
         statusView.setTextSize(13);
         statusView.setPadding(dp(16), dp(8), dp(16), dp(8));
         root.addView(statusView, new LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT));
 
-        loginWebView = new WebView(activity);
-        WebSettings settings = loginWebView.getSettings();
-        settings.setJavaScriptEnabled(true);
-        settings.setDomStorageEnabled(true);
-        settings.setSupportMultipleWindows(false);
-        settings.setJavaScriptCanOpenWindowsAutomatically(false);
-        requestUserAgent = settings.getUserAgentString() + " FundApp";
-        settings.setUserAgentString(requestUserAgent);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
-        }
-
-        loginWebView.setWebViewClient(new WebViewClient() {
-            @Override
-            public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
-                return !isJdUrl(request.getUrl());
-            }
-
-            @Override
-            public boolean shouldOverrideUrlLoading(WebView view, String url) {
-                return !isJdUrl(Uri.parse(url));
-            }
-
-            @Override
-            public void onReceivedSslError(WebView view, SslErrorHandler handler, SslError error) {
-                handler.cancel();
-                setStatus("京东页面证书异常，已停止加载");
-            }
-        });
+        loginWebView = createWebView(activity);
+        loginWebView.setWebViewClient(new SecureJdWebViewClient());
         root.addView(loginWebView, new LinearLayout.LayoutParams(MATCH_PARENT, 0, 1));
 
         LinearLayout footer = new LinearLayout(activity);
         footer.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
         footer.setPadding(dp(12), dp(8), dp(12), dp(12));
-
         importButton = new Button(activity);
         importButton.setText("读取持仓");
-        importButton.setOnClickListener(view -> attemptImport(false));
+        importButton.setOnClickListener(view -> startImport());
         footer.addView(importButton, new LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT));
         root.addView(footer, new LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT));
 
@@ -244,52 +215,172 @@ public class JdHoldingsPlugin extends Plugin {
         loginWebView.loadUrl(LOGIN_URL);
     }
 
-    private void attemptImport(boolean automatic) {
+    private void startImport() {
         if (pendingCall == null || importInFlight) return;
-        String cookie = CookieManager.getInstance().getCookie(HOLDINGS_URL);
-        if (cookie == null || cookie.trim().isEmpty()) {
-            if (!automatic) setStatus("请先在此页面完成京东登录");
+        String sessionCookie = CookieManager.getInstance().getCookie(HOLDINGS_URL);
+        if (sessionCookie == null || sessionCookie.trim().isEmpty()) {
+            setStatus("请先完成京东金融登录");
             return;
         }
 
+        beginPortfolioRead(sessionCookie);
+    }
+
+    private void beginPortfolioRead(String sessionCookie) {
+        if (pendingCall == null || importInFlight) return;
         importInFlight = true;
-        reportProgress("reading_holdings", "正在读取当前持仓...", 0, 0);
-        setStatus("正在读取当前持仓和本轮建仓交易记录...");
         if (importButton != null) importButton.setEnabled(false);
-        final PluginCall call = pendingCall;
-        final String sessionCookie = cookie;
+        setStatus("正在读取京东当前持仓...");
+        reportProgress("reading_holdings", "正在读取京东当前持仓...", 0, 0);
+        PluginCall call = pendingCall;
         executor.execute(() -> {
             try {
-                JSObject result = requestPortfolio(sessionCookie);
-                getActivity().runOnUiThread(() -> {
+                // Cookie imports must use JD's browser-originated newna holdings
+                // APIs and the account-wide transaction page, never one detail
+                // page per fund.
+                JSObject result = cookieImport
+                    ? readHoldingCookiePortfolio(sessionCookie)
+                    : readPortfolio(sessionCookie);
+                Activity activity = getActivity();
+                if (activity != null) activity.runOnUiThread(() -> {
                     if (call == pendingCall) finishWithResult(result);
                 });
             } catch (LoginRequiredException error) {
-                getActivity().runOnUiThread(() -> resetImportState("登录尚未完成，请继续登录后重试"));
+                Activity activity = getActivity();
+                String visibleMessage = cookieImport ? "京东 Cookie 已过期或无效，请更新后重试" : "京东登录已失效，请重新登录";
+                if (activity != null) activity.runOnUiThread(() -> finishWithError(visibleMessage));
+                else finishWithError(visibleMessage);
             } catch (Exception error) {
-                getActivity().runOnUiThread(() -> resetImportState("读取持仓失败，请检查网络后重试"));
+                String message = error.getMessage();
+                if (message == null || message.trim().isEmpty()) message = "京东持仓读取失败，请检查网络后重试";
+                String finalMessage = message;
+                Activity activity = getActivity();
+                if (activity != null) activity.runOnUiThread(() -> finishWithError(finalMessage));
+                else finishWithError(finalMessage);
             }
         });
     }
 
-    private JSObject requestPortfolio(String sessionCookie) throws Exception {
+    @SuppressLint("SetJavaScriptEnabled")
+    private void startBackgroundCookieImport(String sessionCookie) {
+        Activity activity = getActivity();
+        if (activity == null || activity.isFinishing()) {
+            finishWithError("无法打开京东持仓读取");
+            return;
+        }
+        clearWebSession();
+        loginWebView = createWebView(activity);
+        loginWebView.setWebViewClient(new SecureJdWebViewClient());
+        seedWebSession(sessionCookie);
+        beginPortfolioRead(sessionCookie);
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private void showCookieImportDialog(String sessionCookie) {
+        Activity activity = getActivity();
+        if (activity == null || activity.isFinishing()) {
+            finishWithError("无法打开京东持仓读取");
+            return;
+        }
+        clearWebSession();
+        loginDialog = new Dialog(activity, android.R.style.Theme_DeviceDefault_Light_NoActionBar);
+        loginDialog.setCanceledOnTouchOutside(false);
+        loginDialog.setOnCancelListener(ignored -> finishWithError("已取消京东持仓读取"));
+
+        LinearLayout root = new LinearLayout(activity);
+        root.setOrientation(LinearLayout.VERTICAL);
+        root.setBackgroundColor(Color.WHITE);
+        LinearLayout header = new LinearLayout(activity);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+        header.setPadding(dp(16), dp(10), dp(10), dp(8));
+        header.setBackgroundColor(Color.rgb(250, 250, 250));
+        TextView title = new TextView(activity);
+        title.setText("京东金融");
+        title.setTextColor(Color.rgb(30, 30, 30));
+        title.setTextSize(18);
+        header.addView(title, new LinearLayout.LayoutParams(0, WRAP_CONTENT, 1));
+        Button cancel = new Button(activity);
+        cancel.setText("取消");
+        cancel.setOnClickListener(view -> finishWithError("已取消京东持仓读取"));
+        header.addView(cancel, new LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT));
+        root.addView(header, new LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT));
+
+        statusView = new TextView(activity);
+        statusView.setText("正在使用 Cookie 读取京东持仓...");
+        statusView.setTextColor(Color.rgb(95, 95, 95));
+        statusView.setTextSize(13);
+        statusView.setPadding(dp(16), dp(8), dp(16), dp(8));
+        root.addView(statusView, new LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT));
+        loginWebView = createWebView(activity);
+        loginWebView.setWebViewClient(new SecureJdWebViewClient());
+        root.addView(loginWebView, new LinearLayout.LayoutParams(MATCH_PARENT, 0, 1));
+
+        LinearLayout footer = new LinearLayout(activity);
+        footer.setGravity(Gravity.END | Gravity.CENTER_VERTICAL);
+        footer.setPadding(dp(12), dp(8), dp(12), dp(12));
+        importButton = new Button(activity);
+        importButton.setText("读取持仓");
+        importButton.setOnClickListener(view -> beginPortfolioRead(sessionCookie));
+        footer.addView(importButton, new LinearLayout.LayoutParams(WRAP_CONTENT, WRAP_CONTENT));
+        root.addView(footer, new LinearLayout.LayoutParams(MATCH_PARENT, WRAP_CONTENT));
+
+        loginDialog.setContentView(root);
+        if (loginDialog.getWindow() != null) {
+            loginDialog.getWindow().setLayout(MATCH_PARENT, MATCH_PARENT);
+            loginDialog.getWindow().setBackgroundDrawable(new ColorDrawable(Color.WHITE));
+        }
+        loginDialog.show();
+        if (loginDialog.getWindow() != null) loginDialog.getWindow().setLayout(MATCH_PARENT, MATCH_PARENT);
+        beginPortfolioRead(sessionCookie);
+    }
+
+    private JSObject readPortfolio(String sessionCookie) throws Exception {
+        return readPortfolioWithAccountTrades(sessionCookie, readHoldingDetails(sessionCookie));
+    }
+
+    private JSObject readHoldingCookiePortfolio(String sessionCookie) throws Exception {
+        // The newna endpoints must run in JD's actual Roma holding document
+        // with a registered browser bridge.  If JD temporarily rejects that
+        // modern page transport, use the same h5 snapshot reader that the
+        // grid importer already supports before failing the Cookie import.
+        try {
+            prepareHoldingCookieBrowser(sessionCookie);
+            return readPortfolioWithAccountTrades(sessionCookie, readHoldingCookieDetails(sessionCookie));
+        } catch (LoginRequiredException error) {
+            throw error;
+        } catch (Exception browserFailure) {
+            reportProgress("reading_holdings", "新版京东持仓页读取未完成，正在使用兼容读取...", 0, 0);
+            try {
+                return readPortfolioWithAccountTrades(sessionCookie, readHoldingDetails(sessionCookie));
+            } catch (Exception fallbackFailure) {
+                fallbackFailure.addSuppressed(browserFailure);
+                throw fallbackFailure;
+            }
+        }
+    }
+
+    /** The current-holding source varies by session type; transaction records never do. */
+    private JSObject readPortfolioWithAccountTrades(String sessionCookie, JSArray holdings) throws Exception {
         JSObject result = new JSObject();
-        JSArray holdings = requestNewHoldingDetails(sessionCookie);
         result.put("items", holdings);
-        setStatus("正在读取历史交易记录...");
-        reportProgress("reading_trades", "正在读取历史交易记录...", 0, 0);
-        result.put("adjustments", requestTradeListFromFundDetails(sessionCookie, holdings));
-        reportProgress("normalizing", "正在整理交易记录...", 0, 0);
+        try {
+            result.put("adjustments", readHoldingCookieAccountTrades(sessionCookie, holdings));
+        } catch (Exception error) {
+            // A valid current-holding snapshot must still reach the holding
+            // list when JD's optional transaction page is temporarily slow.
+            result.put("adjustments", new JSArray());
+            result.put("tradeWarning", "交易记录未完整读取，请稍后重新同步");
+        }
+        reportProgress("normalizing", "京东持仓数据读取完成", 0, 0);
         return result;
     }
 
     /**
-     * The legacy current-holding endpoint supplies market value and P/L only.
-     * The new web holding page exposes the actual cost, unit cost, and shares
-     * after following each fund's detail link, which is the only safe basis for
-     * a grid import.
+     * The holdings Cookie route owns this bounded fan-out.  Grid imports keep
+     * their serialized snapshot read so a grid run cannot change its existing
+     * request order or timing contract.
      */
-    private JSArray requestNewHoldingDetails(String sessionCookie) throws Exception {
+    private JSArray readHoldingCookieDetails(String sessionCookie) throws Exception {
         JSONObject request = new JSONObject();
         request.put("clientVersion", "9.9.9");
         request.put("clientType", "android");
@@ -299,41 +390,137 @@ public class JdHoldingsPlugin extends Plugin {
         request.put("viewType", "1");
         request.put("appChannel", "fund_jjcc");
         request.put("extParams", new JSONObject().put("channelCode", "outside"));
-        JSONObject payload = requestJdPost(NEW_HOLDINGS_URL, request, sessionCookie, "https://roma.jd.com/");
+        JSONObject payload = requestHoldingCookieBrowserPost(HOLDING_COOKIE_GROUP_URL, request);
         JSONObject fundData = payload.optJSONObject("resultData");
         fundData = fundData == null ? null : fundData.optJSONObject("resultData");
         fundData = fundData == null ? null : fundData.optJSONObject("fundData");
         JSONArray groups = fundData == null ? null : fundData.optJSONArray("fundList");
-        if (groups == null) throw new IllegalStateException("missing new holdings");
+        if (groups == null) throw new IllegalStateException("京东未返回当前持仓数据");
 
-        JSArray items = new JSArray();
-        int total = 0;
+        List<JSONObject> products = new ArrayList<>();
         for (int groupIndex = 0; groupIndex < groups.length(); groupIndex++) {
             JSONObject group = groups.optJSONObject(groupIndex);
-            JSONArray products = group == null ? null : group.optJSONArray("productList");
-            total += products == null ? 0 : products.length();
-        }
-        int current = 0;
-        for (int groupIndex = 0; groupIndex < groups.length(); groupIndex++) {
-            JSONObject group = groups.optJSONObject(groupIndex);
-            JSONArray products = group == null ? null : group.optJSONArray("productList");
-            if (products == null) continue;
-            for (int index = 0; index < products.length(); index++) {
-                JSONObject product = products.optJSONObject(index);
-                current++;
-                reportProgress("reading_holdings", "正在读取京东持仓成本（" + current + "/" + total + "）...", current, total);
-                JSObject item = requestNewHoldingDetail(product, sessionCookie);
-                if (item != null) items.put(item);
+            JSONArray groupProducts = group == null ? null : group.optJSONArray("productList");
+            if (groupProducts == null) continue;
+            for (int index = 0; index < groupProducts.length(); index++) {
+                JSONObject product = groupProducts.optJSONObject(index);
+                if (product != null) products.add(product);
             }
         }
-        return items;
+
+        int total = products.size();
+        JSArray holdings = new JSArray();
+        if (total == 0) return holdings;
+        ExecutorService detailReaders = Executors.newFixedThreadPool(Math.min(HOLDING_DETAIL_CONCURRENCY, total));
+        AtomicInteger completed = new AtomicInteger();
+        List<Future<JSObject>> reads = new ArrayList<>();
+        try {
+            for (JSONObject product : products) {
+                reads.add(detailReaders.submit(() -> {
+                    try {
+                        return readHoldingCookieDetail(product, sessionCookie);
+                    } finally {
+                        int current = completed.incrementAndGet();
+                        reportProgress("reading_holdings", "正在读取京东持仓（" + current + "/" + total + "）...", current, total);
+                    }
+                }));
+            }
+            // Preserve JD's list order in the result even though the network
+            // reads finish out of order.
+            for (Future<JSObject> read : reads) {
+                JSObject holding = read.get();
+                if (holding != null) holdings.put(holding);
+            }
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("京东持仓读取已中断", error);
+        } catch (ExecutionException error) {
+            Throwable cause = error.getCause();
+            if (cause instanceof Exception) throw (Exception) cause;
+            throw new IllegalStateException("京东持仓详情读取失败", cause);
+        } finally {
+            detailReaders.shutdownNow();
+        }
+        return holdings;
     }
 
-    private JSObject requestNewHoldingDetail(JSONObject product, String sessionCookie) throws Exception {
+    private JSArray readHoldingDetails(String sessionCookie) throws Exception {
+        JSONObject request = new JSONObject();
+        request.put("clientVersion", "9.9.9");
+        request.put("clientType", "android");
+        request.put("apiVersion", 1);
+        request.put("sortKey", "1");
+        request.put("sortDirection", "DESC");
+        request.put("viewType", "1");
+        request.put("appChannel", "fund_jjcc");
+        request.put("extParams", new JSONObject().put("channelCode", "outside"));
+        JSONObject payload = requestJdPost(HOLDINGS_URL, request, sessionCookie);
+        JSONObject fundData = payload.optJSONObject("resultData");
+        fundData = fundData == null ? null : fundData.optJSONObject("resultData");
+        fundData = fundData == null ? null : fundData.optJSONObject("fundData");
+        JSONArray groups = fundData == null ? null : fundData.optJSONArray("fundList");
+        if (groups == null) throw new IllegalStateException("京东未返回当前持仓数据");
+
+        List<JSONObject> products = new ArrayList<>();
+        for (int groupIndex = 0; groupIndex < groups.length(); groupIndex++) {
+            JSONObject group = groups.optJSONObject(groupIndex);
+            JSONArray groupProducts = group == null ? null : group.optJSONArray("productList");
+            if (groupProducts == null) continue;
+            for (int index = 0; index < groupProducts.length(); index++) {
+                JSONObject product = groupProducts.optJSONObject(index);
+                if (product != null) products.add(product);
+            }
+        }
+
+        int total = products.size();
+        JSArray holdings = new JSArray();
+        if (total == 0) return holdings;
+
+        ExecutorService detailReaders = Executors.newFixedThreadPool(Math.min(HOLDING_DETAIL_CONCURRENCY, total));
+        AtomicInteger completed = new AtomicInteger();
+        List<Future<JSObject>> reads = new ArrayList<>();
+        try {
+            for (JSONObject product : products) {
+                reads.add(detailReaders.submit(() -> {
+                    try {
+                        return readHoldingDetail(product, sessionCookie);
+                    } finally {
+                        int current = completed.incrementAndGet();
+                        reportProgress("reading_holdings", "正在读取京东持仓（" + current + "/" + total + "）...", current, total);
+                    }
+                }));
+            }
+            // Futures are consumed in JD list order, independent of completion order.
+            for (Future<JSObject> read : reads) {
+                JSObject holding = read.get();
+                if (holding != null) holdings.put(holding);
+            }
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("京东持仓读取已中断", error);
+        } catch (ExecutionException error) {
+            Throwable cause = error.getCause();
+            if (cause instanceof Exception) throw (Exception) cause;
+            throw new IllegalStateException("京东持仓详情读取失败", cause);
+        } finally {
+            detailReaders.shutdownNow();
+        }
+        return holdings;
+    }
+
+    private JSObject readHoldingDetail(JSONObject product, String sessionCookie) throws Exception {
+        return readHoldingDetail(product, sessionCookie, HOLDING_DETAIL_URL, "https://roma.jd.com/");
+    }
+
+    private JSObject readHoldingCookieDetail(JSONObject product, String sessionCookie) throws Exception {
+        return readHoldingDetail(product, sessionCookie, HOLDING_COOKIE_DETAIL_URL, LOGIN_URL);
+    }
+
+    private JSObject readHoldingDetail(JSONObject product, String sessionCookie, String detailEndpoint, String referer) throws Exception {
         if (product == null) return null;
         JSONObject jumpData = product.optJSONObject("jumpData");
-        JSONObject param = jumpData == null ? null : jumpData.optJSONObject("param");
-        String extJson = resolveDetailExtJson(param);
+        JSONObject parameter = jumpData == null ? null : jumpData.optJSONObject("param");
+        String extJson = resolveDetailExtJson(parameter);
         if (extJson.isEmpty()) return null;
 
         JSONObject request = new JSONObject();
@@ -341,201 +528,317 @@ public class JdHoldingsPlugin extends Plugin {
         request.put("version", 202);
         request.put("clientVersion", "9.9.9");
         request.put("clientType", "h5");
-        JSONObject payload = requestJdPost(NEW_HOLDING_DETAIL_URL, request, sessionCookie, "https://roma.jd.com/");
+        JSONObject payload = HOLDING_COOKIE_DETAIL_URL.equals(detailEndpoint)
+            ? requestHoldingCookieBrowserPost(detailEndpoint, request)
+            : requestJdPost(detailEndpoint, request, sessionCookie, referer);
         JSONObject data = payload.optJSONObject("resultData");
         data = data == null ? null : data.optJSONObject("data");
         JSONObject pageInfo = data == null ? null : data.optJSONObject("pageInfo");
         String code = pageInfo == null ? "" : pageInfo.optString("fundCode", "").trim();
         if (!code.matches("\\d{6}")) return null;
 
+        JSONObject amountTemplate = null;
+        JSONObject introduction = null;
         JSONArray templates = data.optJSONArray("templateList");
-        JSONObject fundAmount = null;
-        JSONObject fundIntro = null;
         if (templates != null) {
             for (int index = 0; index < templates.length(); index++) {
                 JSONObject template = templates.optJSONObject(index);
-                if (template == null) continue;
-                JSONObject templateData = template.optJSONObject("templateData");
-                JSONObject candidateAmount = templateData == null ? null : templateData.optJSONObject("fundAmount");
-                if (candidateAmount != null) {
-                    fundAmount = candidateAmount;
-                    fundIntro = templateData.optJSONObject("fundIntro");
+                JSONObject templateData = template == null ? null : template.optJSONObject("templateData");
+                JSONObject candidate = templateData == null ? null : templateData.optJSONObject("fundAmount");
+                if (candidate != null) {
+                    amountTemplate = candidate;
+                    introduction = templateData.optJSONObject("fundIntro");
                     break;
                 }
             }
         }
-        if (fundAmount == null) return null;
-        JSONObject minorData = fundAmount.optJSONObject("minorData");
-        JSONObject majorData = fundAmount.optJSONObject("majorData");
-        String shares = findLabeledValue(minorData == null ? null : minorData.optJSONArray("dataList"), "持有份额");
-        String costAmount = findLabeledValue(minorData == null ? null : minorData.optJSONArray("dataList"), "持仓成本价");
-        String costPrice = findLabeledValue(minorData == null ? null : minorData.optJSONArray("dataList"), "持仓成本单价");
-        String amount = findLabeledValue(minorData == null ? null : minorData.optJSONArray("dataList"), "持有金额");
-        // A few valid JD detail templates omit one display cost label. Shares
-        // remain the authoritative current-holding anchor for the timeline
-        // importer, so do not discard the fund for that missing display field.
+        if (amountTemplate == null) return null;
+
+        JSONObject minor = amountTemplate.optJSONObject("minorData");
+        JSONObject major = amountTemplate.optJSONObject("majorData");
+        String shares = findLabeledValue(minor == null ? null : minor.optJSONArray("dataList"), "持有份额");
+        String costAmount = findLabeledValue(minor == null ? null : minor.optJSONArray("dataList"), "持仓成本价");
+        String costPrice = findLabeledValue(minor == null ? null : minor.optJSONArray("dataList"), "持仓成本单价");
+        String amount = findLabeledValue(minor == null ? null : minor.optJSONArray("dataList"), "持有金额");
         if (!hasCurrentPosition(amount, shares) || shares.isEmpty()) return null;
 
-        JSObject item = new JSObject();
-        item.put("code", code);
-        item.put("name", fundIntro == null ? product.optString("productName", "") : fundIntro.optString("fundName", product.optString("productName", "")));
-        item.put("amount", amount);
-        item.put("yesterdayIncome", findLabeledValue(majorData == null ? null : majorData.optJSONArray("yieldList"), "昨日收益"));
-        item.put("profit", findLabeledValue(majorData == null ? null : majorData.optJSONArray("yieldList"), "持有收益"));
-        item.put("rate", findLabeledValue(majorData == null ? null : majorData.optJSONArray("yieldList"), "持有收益率"));
-        item.put("shares", shares);
-        if (!costAmount.isEmpty()) item.put("costAmount", costAmount);
-        if (!costPrice.isEmpty()) item.put("costPrice", costPrice);
-        item.put("detailExtJson", extJson);
-        return item;
+        JSObject holding = new JSObject();
+        holding.put("code", code);
+        holding.put("name", introduction == null ? product.optString("productName", "") : introduction.optString("fundName", product.optString("productName", "")));
+        holding.put("amount", amount);
+        holding.put("yesterdayIncome", findLabeledValue(major == null ? null : major.optJSONArray("yieldList"), "昨日收益"));
+        holding.put("profit", findLabeledValue(major == null ? null : major.optJSONArray("yieldList"), "持有收益"));
+        holding.put("rate", findLabeledValue(major == null ? null : major.optJSONArray("yieldList"), "持有收益率"));
+        holding.put("shares", shares);
+        if (!costAmount.isEmpty()) holding.put("costAmount", costAmount);
+        if (!costPrice.isEmpty()) holding.put("costPrice", costPrice);
+        return holding;
     }
 
-    private JSONObject requestJdPost(String endpoint, JSONObject request, String sessionCookie, String referer) throws Exception {
-        HttpURLConnection connection = (HttpURLConnection) new URL(endpoint).openConnection();
+    private JSArray readCurrentHoldingTrades(String sessionCookie, JSArray holdings) throws Exception {
+        JSArray adjustments = new JSArray();
+        List<FundTradeRequest> requests = new ArrayList<>();
+        for (int index = 0; index < holdings.length(); index++) {
+            JSONObject holding = holdings.optJSONObject(index);
+            String code = holding == null ? "" : holding.optString("code", "").trim();
+            String extJson = holding == null ? "" : holding.optString("detailExtJson", "").trim();
+            if (!code.matches("\\d{6}") || extJson.isEmpty()) continue;
+            requests.add(new FundTradeRequest(code, extJson));
+        }
+        if (requests.isEmpty()) return adjustments;
+
+        int total = requests.size();
+        ExecutorService tradeReaders = Executors.newFixedThreadPool(Math.min(HOLDING_TRADE_CONCURRENCY, total));
+        AtomicInteger completed = new AtomicInteger();
+        List<Future<FundTradeRows>> reads = new ArrayList<>();
         try {
-            connection.setRequestMethod("POST");
-            connection.setDoOutput(true);
-            connection.setInstanceFollowRedirects(false);
-            connection.setConnectTimeout(15_000);
-            connection.setReadTimeout(15_000);
-            connection.setRequestProperty("Accept", "application/json, text/plain, */*");
-            connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded;charset=UTF-8");
-            connection.setRequestProperty("Cookie", sessionCookie);
-            connection.setRequestProperty("Referer", referer);
-            connection.setRequestProperty("User-Agent", requestUserAgent);
-            byte[] body = ("reqData=" + URLEncoder.encode(request.toString(), "UTF-8")).getBytes(StandardCharsets.UTF_8);
-            try (OutputStream output = connection.getOutputStream()) { output.write(body); }
-            int status = connection.getResponseCode();
-            String response = readBody(status >= 200 && status < 300 ? connection.getInputStream() : connection.getErrorStream());
-            if (status == HttpURLConnection.HTTP_UNAUTHORIZED || status == HttpURLConnection.HTTP_FORBIDDEN || status >= 300) throw new LoginRequiredException();
-            if (response.isEmpty()) throw new IllegalStateException("empty response");
-            JSONObject payload = new JSONObject(response);
-            String message = payload.optString("resultMsg", payload.optString("message", ""));
-            if (!payload.optBoolean("success", true) && (payload.optInt("resultCode") == 3 || containsLoginMessage(message))) throw new LoginRequiredException();
-            return payload;
+            for (FundTradeRequest request : requests) {
+                reads.add(tradeReaders.submit(() -> {
+                    try {
+                        return new FundTradeRows(
+                            request.code,
+                            readFundTradeRowsInIsolatedWebView(sessionCookie, request.code, request.extJson)
+                        );
+                    } finally {
+                        int current = completed.incrementAndGet();
+                        reportProgress("reading_trades", "正在并发读取京东交易记录（" + current + "/" + total + "）...", current, total);
+                    }
+                }));
+            }
+
+            Set<String> seen = new HashSet<>();
+            // Merge in holdings order so concurrent page completion does not
+            // change the local audit record order or deduplication winner.
+            for (Future<FundTradeRows> read : reads) {
+                FundTradeRows result = read.get();
+                appendTradeRows(result.rows, result.code, adjustments, seen);
+            }
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("京东交易记录读取已中断", error);
+        } catch (ExecutionException error) {
+            Throwable cause = error.getCause();
+            if (cause instanceof Exception) throw (Exception) cause;
+            throw new IllegalStateException("京东交易记录读取失败", cause);
         } finally {
-            connection.disconnect();
+            tradeReaders.shutdownNow();
         }
-    }
-
-    private String resolveDetailExtJson(JSONObject param) throws Exception {
-        if (param == null) return "";
-        Object rawExtJson = param.opt("extJson");
-        if (rawExtJson instanceof JSONObject) return rawExtJson.toString();
-        String extJson = textValue(rawExtJson);
-        if (extJson.startsWith("{") && extJson.endsWith("}")) return extJson;
-        JSONObject built = new JSONObject();
-        for (String key : new String[] { "productId", "distinctCode", "orderId", "distinctCodes", "flowFlag", "type", "fromJumpType", "buSku", "buSkus" }) {
-            if (param.has(key)) built.put(key, param.opt(key));
-        }
-        return built.length() > 0 ? built.toString() : "";
-    }
-
-    private String findLabeledValue(JSONArray values, String label) {
-        if (values == null) return "";
-        for (int index = 0; index < values.length(); index++) {
-            JSONObject value = values.optJSONObject(index);
-            if (value != null && label.equals(value.optString("title1"))) return textValue(value.opt("title2"));
-        }
-        return "";
+        return adjustments;
     }
 
     /**
-     * The new JD web flow exposes a fund's transaction record from its own
-     * holding-detail page. Read one current fund at a time so the response can
-     * always be bound to that fund instead of guessing from an account-wide
-     * encrypted order list.
+     * Read the account-wide timeline once through JD's own browser runtime.
+     * This is the same page opened by "昨日收益 -> 交易记录", so a 12-fund
+     * portfolio no longer requires 12 serial detail-page navigations.
      */
-    private JSArray requestTradeListFromFundDetails(String sessionCookie, JSArray holdings) throws Exception {
-        JSArray items = new JSArray();
-        Set<String> seen = new HashSet<>();
-        int total = holdings.length();
-        for (int index = 0; index < total; index++) {
+    @SuppressLint("SetJavaScriptEnabled")
+    private JSArray readHoldingCookieAccountTrades(String sessionCookie, JSArray holdings) throws Exception {
+        Set<String> currentCodes = new HashSet<>();
+        for (int index = 0; index < holdings.length(); index++) {
             JSONObject holding = holdings.optJSONObject(index);
             String code = holding == null ? "" : holding.optString("code", "").trim();
-            if (!code.matches("\\d{6}")) continue;
-            reportProgress("reading_trades", "Reading JD fund records " + (index + 1) + "/" + total, index + 1, total);
-            String name = holding == null ? "" : holding.optString("name", "").trim();
-            String extJson = holding == null ? "" : holding.optString("detailExtJson", "").trim();
-            if (extJson.isEmpty()) throw new IllegalStateException("JD fund " + code + " is missing its web detail context");
-            JSONArray rows = requestFundDetailTradeRows(sessionCookie, code, name, extJson);
-            appendDetailTradeRows(rows, code, items, seen);
+            if (code.matches("\\d{6}")) currentCodes.add(code);
         }
-        return items;
-    }
+        if (currentCodes.isEmpty()) return new JSArray();
 
-    private JSONArray requestFundDetailTradeRows(String sessionCookie, String fundCode, String fundName, String extJson) throws Exception {
-        DetailTradeCapture capture = new DetailTradeCapture(fundCode);
-        CountDownLatch started = new CountDownLatch(1);
         Activity activity = getActivity();
-        if (activity == null || activity.isFinishing()) throw new IllegalStateException("activity unavailable");
-
+        if (activity == null || activity.isFinishing()) throw new IllegalStateException("无法打开京东交易记录页");
+        AccountTradeCapture capture = new AccountTradeCapture();
+        final WebView[] reader = new WebView[1];
+        CountDownLatch started = new CountDownLatch(1);
         activity.runOnUiThread(() -> {
             try {
-                destroyTradeWebView();
-                seedTradePageCookies(sessionCookie);
-                WebView view = new WebView(activity);
-                WebSettings settings = view.getSettings();
-                settings.setJavaScriptEnabled(true);
-                settings.setDomStorageEnabled(true);
-                settings.setSupportMultipleWindows(false);
-                settings.setJavaScriptCanOpenWindowsAutomatically(false);
-                settings.setUserAgentString(settings.getUserAgentString() + " FundApp");
-                view.addJavascriptInterface(new DetailTradeBridge(this, capture), "FundAppDetailTrade");
-                view.setWebViewClient(new WebViewClient() {
-                    @Override
-                    public boolean shouldOverrideUrlLoading(WebView webView, WebResourceRequest request) {
-                        return request == null || !isJdUrl(request.getUrl());
-                    }
-
+                reader[0] = createWebView(activity);
+                seedWebSession(sessionCookie);
+                reader[0].addJavascriptInterface(new AccountTradeBridge(capture), "FundAppAccountTrade");
+                reader[0].setWebViewClient(new SecureJdWebViewClient() {
                     @Override
                     public void onPageFinished(WebView webView, String url) {
-                        Uri uri = Uri.parse(url == null ? "" : url);
-                        // The only supported route is the detail page reached from
-                        // the daily-income holding list and its own trade record.
-                        // Do not fall back to the account-wide trade tab: JD does
-                        // not show a complete per-fund timeline there.
-                        // Roma is the actual host of the rendered fund detail
-                        // page. It is a jd.com host, not a jr.jd.com host.
-                        if (isJdUrl(uri) && (uri.getPath().contains("/fund/hold/detail")
-                            || uri.getPath().contains("/wealth/tradeorder/list"))) {
-                            webView.evaluateJavascript(detailTradeBootstrap(fundCode), null);
+                        if (isJdUrl(Uri.parse(url == null ? "" : url))) {
+                            webView.evaluateJavascript(accountTradeBootstrap(getTradeHistoryStartDate()), null);
                         }
                     }
                 });
-                tradeWebView = view;
-                view.loadUrl(String.format(Locale.ROOT, FUND_DETAIL_PAGE_URL, URLEncoder.encode(extJson, "UTF-8")));
+                reader[0].loadUrl(ACCOUNT_TRADE_PAGE_URL);
             } catch (Exception error) {
-                capture.fail();
+                capture.fail("无法打开京东交易记录页");
             } finally {
                 started.countDown();
             }
         });
 
-        if (!started.await(10, TimeUnit.SECONDS)) throw new IllegalStateException("fund detail did not start");
-        boolean completed = capture.done.await(DETAIL_TRADE_PAGE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        activity.runOnUiThread(this::destroyTradeWebView);
+        if (!started.await(10, TimeUnit.SECONDS) || reader[0] == null) {
+            throw new IllegalStateException("京东交易记录页启动超时");
+        }
+        reportProgress("reading_trades", "正在读取近30天京东交易记录...", 0, 0);
+        try {
+            boolean completed = capture.done.await(ACCOUNT_TRADE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+            if (!completed || capture.failed || !capture.complete) {
+                String reason = capture.failureReason();
+                throw new IllegalStateException(reason.isEmpty() ? "京东交易记录读取超时" : reason);
+            }
+            JSArray adjustments = new JSArray();
+            appendAccountTradeRows(capture.rows(), currentCodes, adjustments, new HashSet<>());
+            reportProgress("reading_trades", "近30天京东交易记录读取完成", 1, 1);
+            return adjustments;
+        } finally {
+            activity.runOnUiThread(() -> {
+                if (reader[0] != null) reader[0].removeJavascriptInterface("FundAppAccountTrade");
+                destroyWebView(reader[0]);
+            });
+        }
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private JSONArray readFundTradeRows(String sessionCookie, String fundCode, String extJson) throws Exception {
+        return readFundTradeRows(sessionCookie, fundCode, extJson, loginWebView);
+    }
+
+    /** Each concurrent fund reader owns its WebView and JavaScript bridge. */
+    @SuppressLint("SetJavaScriptEnabled")
+    private JSONArray readFundTradeRowsInIsolatedWebView(String sessionCookie, String fundCode, String extJson) throws Exception {
+        Activity activity = getActivity();
+        if (activity == null || activity.isFinishing()) {
+            throw new IllegalStateException("当前页面不可用，请返回持仓页后重试");
+        }
+        final WebView[] reader = new WebView[1];
+        CountDownLatch created = new CountDownLatch(1);
+        activity.runOnUiThread(() -> {
+            try {
+                reader[0] = createWebView(activity);
+            } catch (Exception ignored) {
+                // The caller turns a missing reader into a normal import error.
+            } finally {
+                created.countDown();
+            }
+        });
+        if (!created.await(10, TimeUnit.SECONDS) || reader[0] == null) {
+            throw new IllegalStateException("京东交易记录浏览器启动超时");
+        }
+        try {
+            return readFundTradeRows(sessionCookie, fundCode, extJson, reader[0]);
+        } finally {
+            activity.runOnUiThread(() -> {
+                if (reader[0] != null) reader[0].removeJavascriptInterface("FundAppDetailTrade");
+                destroyWebView(reader[0]);
+            });
+        }
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private JSONArray readFundTradeRows(String sessionCookie, String fundCode, String extJson, WebView detailWebView) throws Exception {
+        DetailTradeCapture capture = new DetailTradeCapture(fundCode);
+        CountDownLatch started = new CountDownLatch(1);
+        Activity activity = getActivity();
+        if (activity == null || activity.isFinishing()) throw new IllegalStateException("当前页面不可用，请返回持仓页后重试");
+
+        activity.runOnUiThread(() -> {
+            try {
+                seedWebSession(sessionCookie);
+                WebView view = detailWebView;
+                if (view == null) {
+                    capture.fail("京东登录页面不可用");
+                    return;
+                }
+                view.addJavascriptInterface(new DetailTradeBridge(capture), "FundAppDetailTrade");
+                view.setWebViewClient(new SecureJdWebViewClient() {
+                    @Override
+                    public void onPageFinished(WebView webView, String url) {
+                        Uri uri = Uri.parse(url == null ? "" : url);
+                        // A record transition can be a full navigation or an SPA
+                        // update. Bootstrap every JD document while this fund's
+                        // capture is active so neither case loses its bridge.
+                        if (isJdUrl(uri)) {
+                            webView.evaluateJavascript(detailTradeBootstrap(fundCode), null);
+                        }
+                    }
+                });
+                view.loadUrl(String.format(Locale.ROOT, FUND_DETAIL_PAGE_URL, URLEncoder.encode(extJson, "UTF-8")));
+            } catch (Exception error) {
+                capture.fail("无法打开基金持仓详情页");
+            } finally {
+                started.countDown();
+            }
+        });
+
+        if (!started.await(10, TimeUnit.SECONDS)) throw new IllegalStateException("基金持仓详情页启动超时");
+        boolean completed = capture.done.await(DETAIL_TIMEOUT_SECONDS, TimeUnit.SECONDS);
+        activity.runOnUiThread(() -> resetDetailWebViewClient(detailWebView));
         if (!completed || capture.failed || !capture.complete) {
             String reason = capture.failureReason();
-            throw new IllegalStateException("京东基金 " + fundCode + " 未能读取该基金的完整交易记录" + (reason.isEmpty() ? "" : "（" + reason + "）"));
+            throw new IllegalStateException("基金 " + fundCode + " 的交易记录读取不完整" + (reason.isEmpty() ? "" : "：" + reason));
         }
         return capture.rows();
     }
 
+    /** The selectors below are bound to JD's confirmed holding-detail controls. */
     private String detailTradeBootstrap(String fundCode) {
         return "(function(){if(window.__fundAppDetailTradeHook)return;window.__fundAppDetailTradeHook=true;var c='" + fundCode + "',sent={},started=Date.now(),last=Date.now(),opened=false;"
-            + "function emit(x){try{if(window.FundAppDetailTrade)window.FundAppDetailTrade.receive(JSON.stringify(x))}catch(e){}}"
-            + "function rows(v,out){if(Array.isArray(v)){if(v.length&&v.some(function(x){return x&&typeof x==='object'&&(x.bizTime||x.tradeTime||x.confirmTime||x.orderCreateTime||x.tradeDate)}))out.push.apply(out,v);else v.forEach(function(x){rows(x,out)});return}if(v&&typeof v==='object')Object.keys(v).forEach(function(k){rows(v[k],out)})}"
-            + "function take(u,t){try{if(!/(trade|record|order)/i.test(u))return;var v=JSON.parse(t),a=[];rows(v,a);if(!a.length)return;var k=JSON.stringify(a);if(sent[k])return;sent[k]=1;last=Date.now();emit({code:c,rows:a})}catch(e){}}"
-            + "var o=XMLHttpRequest.prototype.open,s=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.open=function(){this.__fundAppUrl=String(arguments[1]||'');return o.apply(this,arguments)};XMLHttpRequest.prototype.send=function(){this.addEventListener('load',function(){take(this.__fundAppUrl||'',this.responseText||'')});return s.apply(this,arguments)};"
-            + "if(window.fetch){var f=window.fetch;window.fetch=function(){var u=String(arguments[0]||'');return f.apply(this,arguments).then(function(r){r.clone().text().then(function(t){take(u,t)});return r})}}"
-            + "function click(e){if(!e)return false;['pointerdown','mousedown','mouseup','click'].forEach(function(type){e.dispatchEvent(new MouseEvent(type,{bubbles:true,cancelable:true,view:window}))});return true}"
-            + "function byText(text){return [].slice.call(document.querySelectorAll('a,button,[role=button],div,span,p')).filter(function(e){return (e.innerText||e.textContent||'').trim()===text})}"
-            + "var t=setInterval(function(){var path=location.pathname||'';if(path.indexOf('/fund/hold/detail')>=0){var card=document.querySelector('.template-container[data-jue-name=\"fundTemplate1001Amount.jue\"]');if(!card)return;if(!window.__fundAppExpanded){var arrow=card.querySelector('.arrow-container-down');if(arrow){click(arrow);window.__fundAppExpanded=true;return}}var minor=card.querySelector('.minor');if(!minor||!/持有份额|持仓成本价/.test(minor.innerText||''))return;if(!opened){var record=byText('交易记录')[0];if(record){opened=true;click(record);return}}if(Date.now()-started>10500){clearInterval(t);emit({code:c,ready:false,reason:'未打开该基金交易记录'});}return}if(path.indexOf('/wealth/tradeorder/list')>=0){var body=(document.body&&document.body.innerText)||'';var more=byText('加载更多')[0];if(more){click(more);last=Date.now();return}if(/没有更多|已全部加载|暂无交易记录/.test(body)||Date.now()-last>2200){clearInterval(t);emit({code:c,ready:true,done:true});return}}if(Date.now()-started>10500){clearInterval(t);emit({code:c,ready:false,reason:'交易记录页面未返回'});}},360)})();";
+            + "function emit(x){try{window.FundAppDetailTrade&&window.FundAppDetailTrade.receive(JSON.stringify(x))}catch(e){}}"
+            + "function isTradeRow(x){return !!(x&&typeof x==='object'&&(x.bizTime||x.tradeTime||x.confirmTime||x.orderCreateTime||x.tradeDate)&&(x.tradeTypeCode||x.tradeTypeName||x.tradeName||x.operationName||x.businessName||x.businessType||x.orderType)&&(x.unit||x.confirmUnit||x.tradeUnit||x.confirmShare||x.tradeShare||x.fundShare||x.applyShare||x.share||x.shares||x.allAmount||x.confirmAmount||x.tradeAmount||x.applyAmount||x.amount||x.money))}"
+            + "function rows(v,out){if(Array.isArray(v)){var matched=v.filter(isTradeRow);if(matched.length){out.push.apply(out,matched);return}v.forEach(function(x){rows(x,out)});return}if(v&&typeof v==='object')Object.keys(v).forEach(function(k){rows(v[k],out)})}"
+            // JD has changed the decoded transaction endpoint name repeatedly.
+            // Do not guess from the URL. Only actual order-shaped rows cross the
+            // bridge; this avoids sending unrelated page JSON to the grid API.
+            + "function take(u,t){try{var v=JSON.parse(t),a=[];rows(v,a);if(!a.length)return;var k=JSON.stringify(a);if(sent[k])return;sent[k]=1;last=Date.now();emit({code:c,rows:a})}catch(e){}}"
+            + "var open=XMLHttpRequest.prototype.open,send=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.open=function(){this.__fundAppUrl=String(arguments[1]||'');return open.apply(this,arguments)};XMLHttpRequest.prototype.send=function(){this.addEventListener('load',function(){take(this.__fundAppUrl||'',this.responseText||'')});return send.apply(this,arguments)};"
+            + "if(window.fetch){var fetch0=window.fetch;window.fetch=function(){var u=String(arguments[0]||'');return fetch0.apply(this,arguments).then(function(r){r.clone().text().then(function(t){take(u,t)});return r})}}"
+            + "function click(e){if(!e)return false;['pointerdown','mousedown','mouseup','click'].forEach(function(t){e.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window}))});return true}"
+            + "function textButton(text){return [].slice.call(document.querySelectorAll('a,button,[role=button],div,span,p')).find(function(e){return (e.innerText||e.textContent||'').trim()===text})}"
+            + "var timer=setInterval(function(){var path=location.pathname||'',body=(document.body&&document.body.innerText)||'',more=textButton('加载更多'),tradePage=/交易类型|没有更多记录|暂无交易记录/.test(body)||!!more;if(tradePage){if(more){click(more);last=Date.now();return}if(/没有更多|已全部加载|暂无交易记录/.test(body)||Date.now()-last>1800){clearInterval(timer);emit({code:c,ready:true,done:true});return}}if(path.indexOf('/fund/hold/detail')>=0){var card=document.querySelector('.template-container[data-jue-name=\"fundTemplate1001Amount.jue\"]');if(!card)return;if(!window.__fundAppExpanded){var expand=card.querySelector('.arrow-container-down');if(expand){click(expand);window.__fundAppExpanded=true;return}}var minor=card.querySelector('.minor');if(!minor||!/持有份额|持仓成本价/.test(minor.innerText||''))return;if(!opened){var record=textButton('交易记录');if(record){opened=true;click(record);return}}if(Date.now()-started>12000){clearInterval(timer);emit({code:c,ready:false,reason:'Transaction record control was unavailable'});return}}if(Date.now()-started>12000){clearInterval(timer);emit({code:c,ready:false,reason:'Transaction page did not respond'});}},300)})();";
     }
 
-    private int appendDetailTradeRows(JSONArray rows, String fundCode, JSArray items, Set<String> seen) {
-        int added = 0;
+    /** Hooks the decoded browser payload rather than replaying JD's encrypted trade API. */
+    private String accountTradeBootstrap(String earliestDate) {
+        return "(function(){if(window.__fundAppAccountTradeHook)return;window.__fundAppAccountTradeHook=true;var cutoff=" + JSONObject.quote(earliestDate) + ",sent={},started=Date.now(),last=started,hasRows=false,reached=false,parse0=JSON.parse;"
+            + "function emit(x){try{window.FundAppAccountTrade&&window.FundAppAccountTrade.receive(JSON.stringify(x))}catch(e){}}"
+            + "function isTradeRow(x){return !!(x&&typeof x==='object'&&(x.bizTime||x.tradeTime||x.confirmTime||x.orderCreateTime||x.tradeDate)&&(x.tradeTypeCode||x.tradeTypeName||x.tradeName||x.operationName||x.businessName||x.businessType||x.orderType)&&(x.productId||x.fundCode||x.sourceFundCode||x.fromFundCode)&&(x.unit||x.confirmUnit||x.tradeUnit||x.confirmShare||x.tradeShare||x.fundShare||x.applyShare||x.share||x.shares||x.allAmount||x.confirmAmount||x.tradeAmount||x.applyAmount||x.amount||x.money))}"
+            + "function rows(v,out){if(Array.isArray(v)){var matched=v.filter(isTradeRow);if(matched.length){out.push.apply(out,matched);return}v.forEach(function(x){rows(x,out)});return}if(v&&typeof v==='object')Object.keys(v).forEach(function(k){rows(v[k],out)})}"
+            + "function day(x){var t=String(x&&(x.bizTime||x.tradeTime||x.orderCreateTime||x.orderCreateDate||x.createTime||x.confirmTime||x.tradeDate)||'');var m=/(\\d{4})[-/.]?(\\d{1,2})[-/.]?(\\d{1,2})/.exec(t);return m?m[1]+'-'+('0'+m[2]).slice(-2)+'-'+('0'+m[3]).slice(-2):''}"
+            + "function take(v){try{var a=[];rows(v,a);if(!a.length)return;var k=JSON.stringify(a);if(sent[k])return;sent[k]=1;var old=false;a.forEach(function(x){var d=day(x);if(d&&d<cutoff)old=true});if(old)reached=true;a=a.filter(function(x){var d=day(x);return d&&d>=cutoff});if(!a.length){last=Date.now();return}hasRows=true;last=Date.now();emit({rows:a})}catch(e){}}"
+            + "JSON.parse=function(){var v=parse0.apply(this,arguments);take(v);return v};"
+            + "var open=XMLHttpRequest.prototype.open,send=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.open=function(){this.__fundAppUrl=String(arguments[1]||'');return open.apply(this,arguments)};XMLHttpRequest.prototype.send=function(){this.addEventListener('load',function(){try{take(parse0(this.responseText||''))}catch(e){}});return send.apply(this,arguments)};"
+            + "if(window.fetch){var fetch0=window.fetch;window.fetch=function(){return fetch0.apply(this,arguments).then(function(r){r.clone().text().then(function(t){try{take(parse0(t))}catch(e){}});return r})}}"
+            + "function click(e){if(!e)return false;['pointerdown','mousedown','mouseup','click'].forEach(function(t){e.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window}))});return true}"
+            + "function textButton(text){return [].slice.call(document.querySelectorAll('a,button,[role=button],div,span,p')).find(function(e){return (e.innerText||e.textContent||'').trim()===text})}"
+            + "var timer=setInterval(function(){if(reached){clearInterval(timer);emit({done:true});return}var body=(document.body&&document.body.innerText)||'',more=textButton('加载更多');if(more){click(more);last=Date.now();return}if(/没有更多|已全部加载|暂无交易记录/.test(body)||(hasRows&&Date.now()-last>2200)){clearInterval(timer);emit({done:true});return}if(Date.now()-started>32000){clearInterval(timer);emit({ready:false,reason:'京东交易记录读取超时'});return}try{window.scrollBy(0,window.innerHeight||600)}catch(e){}},350)})();";
+    }
+
+    private void appendAccountTradeRows(JSONArray rows, Set<String> currentCodes, JSArray target, Set<String> seen) {
+        for (int index = 0; index < rows.length(); index++) {
+            JSONObject row = rows.optJSONObject(index);
+            if (row == null || !isEffectiveTrade(row)) continue;
+            String type = resolveTradeType(row);
+            if (type == null) continue;
+            String code = resolveAccountTradeFundCode(row, currentCodes);
+            String targetCode = normalizeFundCode(firstText(row, "targetProductId", "targetFundCode", "toFundCode"));
+            if (!currentCodes.contains(code) && !("convert".equals(type) && currentCodes.contains(targetCode))) continue;
+            try {
+                row.put("fundCode", code);
+                appendTradeRows(new JSONArray().put(row), code, target, seen);
+            } catch (Exception ignored) {
+                // Ignore one malformed JD row while retaining the rest of the account timeline.
+            }
+        }
+    }
+
+    private String resolveAccountTradeFundCode(JSONObject row, Set<String> currentCodes) {
+        String fallback = "";
+        for (String key : new String[] { "fundCode", "productId", "productCode", "fundId", "sourceFundCode", "fromFundCode", "sourceProductId", "fromProductId" }) {
+            String value = firstText(row, key);
+            String normalized = normalizeFundCode(value);
+            if (currentCodes.contains(normalized)) return normalized;
+            if (fallback.isEmpty() && normalized.matches("\\d{6}")) fallback = normalized;
+            String digits = textValue(value).replaceAll("\\D", "");
+            for (int index = 0; index <= digits.length() - 6; index++) {
+                String candidate = digits.substring(index, index + 6);
+                if (currentCodes.contains(candidate)) return candidate;
+            }
+        }
+        return fallback;
+    }
+
+    private void appendTradeRows(JSONArray rows, String fundCode, JSArray target, Set<String> seen) {
         for (int index = 0; index < rows.length(); index++) {
             JSONObject row = rows.optJSONObject(index);
             if (row == null || !isEffectiveTrade(row)) continue;
@@ -543,13 +846,16 @@ public class JdHoldingsPlugin extends Plugin {
             if (type == null) continue;
             String code = normalizeFundCode(firstText(row, "fundCode", "productId", "sourceFundCode", "fromFundCode"));
             if (!code.matches("\\d{6}")) code = fundCode;
-            String rawTradeTime = firstText(row, "confirmTime", "tradeTime", "bizTime", "orderCreateTime", "orderCreateDate", "createTime", "tradeDate");
-            String date = normalizeTradeDate(rawTradeTime);
+            // Use the order/business time first. The grid resolves its
+            // confirmation NAV from this timestamp and the fund cut-off rule.
+            String rawTime = firstText(row, "bizTime", "tradeTime", "orderCreateTime", "orderCreateDate", "createTime", "confirmTime", "tradeDate");
+            String date = normalizeTradeDate(rawTime);
             if (date == null) continue;
+            if (!isWithinTradeHistory(date)) continue;
             String shares = firstText(row, "unit", "confirmUnit", "tradeUnit", "confirmShare", "tradeShare", "fundShare", "applyShare", "share", "shares");
             String amount = firstText(row, "allAmount", "confirmAmount", "tradeAmount", "applyAmount", "amount", "money");
+            String tradeTime = normalizeTradeTimestamp(rawTime);
             String id = firstText(row, "orderId", "bizOrderId", "tradeOrderId", "orderNo", "subOrderId", "id");
-            String tradeTime = normalizeTradeTimestamp(rawTradeTime);
             if (id.isEmpty()) id = code + ":" + type + ":" + (tradeTime == null ? date : tradeTime) + ":" + shares + ":" + amount;
             if (!seen.add(id)) continue;
             JSObject item = new JSObject();
@@ -567,182 +873,120 @@ public class JdHoldingsPlugin extends Plugin {
                 item.put("targetName", firstText(row, "targetProductName", "targetFundName", "toFundName"));
                 item.put("targetShares", firstText(row, "targetUnit", "targetShare", "targetShares", "targetFundShare", "toFundShare", "convertShare"));
             }
-            items.put(item);
-            added++;
+            target.put(item);
         }
-        return added;
+    }
+
+    @SuppressLint("SetJavaScriptEnabled")
+    private WebView createWebView(Activity activity) {
+        WebView view = new WebView(activity);
+        WebSettings settings = view.getSettings();
+        settings.setJavaScriptEnabled(true);
+        settings.setDomStorageEnabled(true);
+        settings.setSupportMultipleWindows(false);
+        settings.setJavaScriptCanOpenWindowsAutomatically(false);
+        requestUserAgent = settings.getUserAgentString() + " FundApp";
+        settings.setUserAgentString(requestUserAgent);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
+            settings.setMixedContentMode(WebSettings.MIXED_CONTENT_NEVER_ALLOW);
+        }
+        return view;
     }
 
     /**
-     * JD's live transaction route requires its own page-side encrypted request
-     * contract. The WebView loads the exact transaction page and captures only
-     * its already-decoded transaction rows; it never exposes Cookie or headers.
+     * Cookie headers copied from JD's browser can be valid while a raw Java
+     * POST is rejected for lacking the browser origin/session context.  Keep a
+     * temporary WebView only for this import and let JD receive the request
+     * through its own browser transport.  The WebView is destroyed with the
+     * import and no Cookie value reaches our backend.
      */
-    private JSArray requestTradeListFromJdPage(String sessionCookie, JSArray holdings) throws Exception {
-        JSArray items = new JSArray();
-        Set<String> seen = new HashSet<>();
-        // A single authenticated page returns the complete cross-fund timeline.
-        // Opening a page for every holding repeated the page bootstrap for each
-        // fund; downstream reconciliation still retains only current positions.
-        reportProgress("reading_trades", "正在通过京东交易页读取完整交易时间线...", 0, 0);
-        JSONArray rows = requestTradePagesInJdPage(sessionCookie);
-        appendTradeRows(rows, items, seen);
-        return items;
-    }
-
-    private JSONArray requestTradePagesInJdPage(String sessionCookie) throws Exception {
-        TradePageCapture capture = new TradePageCapture();
-        CountDownLatch started = new CountDownLatch(1);
+    private void prepareHoldingCookieBrowser(String sessionCookie) throws Exception {
         Activity activity = getActivity();
-        if (activity == null || activity.isFinishing()) throw new IllegalStateException("activity unavailable");
-
+        if (activity == null || activity.isFinishing()) throw new IllegalStateException("无法启动京东持仓读取");
+        CountDownLatch created = new CountDownLatch(1);
+        CountDownLatch ready = new CountDownLatch(1);
+        String[] startupError = new String[1];
         activity.runOnUiThread(() -> {
             try {
-                destroyTradeWebView();
-                seedTradePageCookies(sessionCookie);
-                WebView view = new WebView(activity);
-                WebSettings settings = view.getSettings();
-                settings.setJavaScriptEnabled(true);
-                settings.setDomStorageEnabled(true);
-                settings.setSupportMultipleWindows(false);
-                settings.setJavaScriptCanOpenWindowsAutomatically(false);
-                settings.setUserAgentString(settings.getUserAgentString() + " FundApp");
-                view.addJavascriptInterface(new TradePageBridge(capture), "FundAppTrade");
-                view.setWebViewClient(new WebViewClient() {
+                clearWebSession();
+                WebView reader = loginWebView == null ? createWebView(activity) : loginWebView;
+                reader.addJavascriptInterface(new HoldingCookieBrowserBridge(), "FundAppHoldingCookie");
+                reader.setWebViewClient(new SecureJdWebViewClient() {
                     @Override
-                    public boolean shouldOverrideUrlLoading(WebView webView, WebResourceRequest request) {
-                        return request == null || !isJdUrl(request.getUrl());
-                    }
-
-                    @Override
-                    public WebResourceResponse shouldInterceptRequest(WebView webView, WebResourceRequest request) {
-                        if (request != null && isTradePageScript(request.getUrl())) {
-                            return injectTradeCaptureScript(request.getUrl());
-                        }
-                        return null;
+                    public void onPageFinished(WebView view, String url) {
+                        super.onPageFinished(view, url);
+                        if (isJdUrl(Uri.parse(url))) ready.countDown();
                     }
                 });
-                tradeWebView = view;
-                view.loadUrl(TRADE_PAGE_URL);
+                seedWebSession(sessionCookie);
+                loginWebView = reader;
+                reader.loadUrl(HOLDING_PAGE_URL);
             } catch (Exception error) {
-                capture.fail();
+                startupError[0] = error.getMessage();
             } finally {
-                started.countDown();
+                created.countDown();
             }
         });
-
-        if (!started.await(10, TimeUnit.SECONDS)) throw new IllegalStateException("trade page did not start");
-        boolean completed = capture.done.await(TRADE_PAGE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        activity.runOnUiThread(this::destroyTradeWebView);
-        if (!completed || capture.failed || !capture.complete) {
-            throw new IllegalStateException("trade page did not return a complete timeline");
+        if (!created.await(10, TimeUnit.SECONDS)) throw new IllegalStateException("京东持仓读取启动超时");
+        if (startupError[0] != null) throw new IllegalStateException("无法启动京东持仓读取：" + startupError[0]);
+        if (loginWebView == null || !ready.await(15, TimeUnit.SECONDS)) {
+            throw new IllegalStateException("京东持仓页面启动超时");
         }
-        return capture.rows();
     }
 
-    private void seedTradePageCookies(String sessionCookie) {
-        CookieManager cookieManager = CookieManager.getInstance();
-        for (String pair : sessionCookie.split(";\\s*")) {
-            if (!pair.contains("=") || pair.startsWith("$")) continue;
-            for (String origin : new String[] { "https://jdjr.jd.com", "https://lc.jr.jd.com", "https://dingpan.jd.com", "https://roma.jd.com", "https://ms.jr.jd.com", "https://jd.com" }) {
-                cookieManager.setCookie(origin, pair);
-            }
+    private JSONObject requestHoldingCookieBrowserPost(String endpoint, JSONObject request) throws Exception {
+        WebView reader = loginWebView;
+        Activity activity = getActivity();
+        if (reader == null || activity == null || activity.isFinishing()) {
+            throw new IllegalStateException("京东持仓浏览器会话不可用");
         }
-        cookieManager.flush();
-    }
-
-    private boolean isTradePageScript(Uri uri) {
-        String path = uri == null ? "" : uri.getPath();
-        return path != null && path.contains("/wealth/tradeorder/js/page_tradeorder_") && path.endsWith(".js");
-    }
-
-    private WebResourceResponse injectTradeCaptureScript(Uri uri) {
-        HttpURLConnection connection = null;
+        String requestId = "holding-" + System.nanoTime();
+        BrowserCookieRequest capture = new BrowserCookieRequest();
+        cookieBrowserRequests.put(requestId, capture);
+        JSONObject options = new JSONObject();
+        options.put("id", requestId);
+        options.put("url", endpoint);
+        options.put("body", "reqData=" + URLEncoder.encode(request.toString(), "UTF-8"));
+        String script = "(function(){var o=JSON.parse(" + JSONObject.quote(options.toString()) + ");"
+            + "fetch(o.url,{method:'POST',credentials:'include',headers:{'Accept':'application/json, text/plain, */*','Content-Type':'application/x-www-form-urlencoded;charset=UTF-8','Accept-Language':'zh-CN,zh;q=0.9'},body:o.body})"
+            + ".then(function(r){return r.text().then(function(t){window.FundAppHoldingCookie.receive(JSON.stringify({id:o.id,status:r.status,body:t}))})})"
+            + ".catch(function(e){window.FundAppHoldingCookie.receive(JSON.stringify({id:o.id,error:String((e&&e.message)||e)}))});})();";
+        activity.runOnUiThread(() -> {
+            if (reader == loginWebView) reader.evaluateJavascript(script, null);
+            else capture.fail("京东持仓浏览器会话已关闭");
+        });
         try {
-            connection = (HttpURLConnection) new URL(uri.toString()).openConnection();
-            connection.setConnectTimeout(15_000);
-            connection.setReadTimeout(15_000);
-            connection.setRequestProperty("Accept-Encoding", "identity");
-            connection.setRequestProperty("User-Agent", requestUserAgent);
-            if (connection.getResponseCode() != HttpURLConnection.HTTP_OK) return null;
-            String source = readBody(connection.getInputStream());
-            // `queryTradeOrderList` is encrypted on the wire. Its own page
-            // calls `converDataWith(p)` only after the page-side callback has
-            // validated and decoded `e.data.tradeOrderVoList`; hook that
-            // decoded handoff rather than XHR/fetch responseText.
-            String methodMarker = "getTradeOrderData:function(){";
-            String decodedRowsMarker = "t.converDataWith(p),t.updateInstance";
-            if (!source.contains(methodMarker) || !source.contains(decodedRowsMarker)) return null;
-            String patched = tradeCaptureBootstrap()
-                + source.replace(methodMarker, "getTradeOrderData:function(){window.__fundAppTradePage=this;")
-                    .replace(decodedRowsMarker,
-                        "window.__fundAppTradeRows(p,t.pageNo,t.allCount),t.converDataWith(p),t.updateInstance");
-            return new WebResourceResponse("application/javascript", "UTF-8", new ByteArrayInputStream(patched.getBytes(StandardCharsets.UTF_8)));
-        } catch (Exception ignored) {
-            return null;
+            if (!capture.done.await(20, TimeUnit.SECONDS)) throw new IllegalStateException("京东持仓接口响应超时");
         } finally {
-            if (connection != null) connection.disconnect();
+            cookieBrowserRequests.remove(requestId);
         }
-    }
-
-    private String tradeCaptureBootstrap() {
-        return "(function(){if(window.__fundAppTradeHook)return;window.__fundAppTradeHook=true;"
-            + "window.__fundAppTradeRows=function(rows,page,allCount){try{if(!Array.isArray(rows)||!window.FundAppTrade)return;"
-            + "var done=rows.length<20;window.FundAppTrade.receive(JSON.stringify({rows:rows,page:page,done:done,allCount:allCount||0}));"
-            + "if(!done)setTimeout(function(){var q=window.__fundAppTradePage;if(q&&!q.netWorkLoading&&!q.isEnd)q.getTradeOrderData(true)},350)}catch(e){}}})();";
-    }
-
-    private void destroyTradeWebView() {
-        if (tradeWebView == null) return;
-        tradeWebView.stopLoading();
-        tradeWebView.clearHistory();
-        tradeWebView.loadUrl("about:blank");
-        tradeWebView.destroy();
-        tradeWebView = null;
-    }
-
-    private JSArray requestTradeList(String sessionCookie) throws Exception {
-        JSArray items = new JSArray();
-        Set<String> seen = new HashSet<>();
-        for (int page = 1; page <= MAX_TRADE_PAGES; page++) {
-            reportProgress("reading_trades", "正在读取历史交易记录（第 " + page + " 页）...", page, 0);
-            JSONObject payload = requestTradePage(sessionCookie, page);
-            JSONArray rows = findTradeRows(payload);
-            if (rows == null || rows.length() == 0) break;
-
-            appendTradeRows(rows, items, seen);
-            if (!hasMoreTradePages(payload, rows.length(), page)) break;
+        if (!capture.error.isEmpty()) throw new IllegalStateException("京东持仓接口读取失败：" + capture.error);
+        if (capture.status == HttpURLConnection.HTTP_UNAUTHORIZED || capture.status == HttpURLConnection.HTTP_FORBIDDEN) {
+            throw new LoginRequiredException();
         }
-        return items;
+        if (capture.status < 200 || capture.status >= 300) {
+            throw new IllegalStateException("京东持仓接口返回状态 " + capture.status);
+        }
+        if (capture.body.isEmpty()) throw new IllegalStateException("京东未返回有效持仓数据");
+        if (containsLoginMessage(capture.body)) throw new LoginRequiredException();
+        JSONObject payload;
+        try {
+            payload = new JSONObject(capture.body);
+        } catch (Exception error) {
+            throw new IllegalStateException("京东持仓接口返回格式异常");
+        }
+        String message = payload.optString("resultMsg", payload.optString("message", ""));
+        if (!payload.optBoolean("success", true) && (payload.optInt("resultCode") == 3 || containsLoginMessage(message))) {
+            throw new LoginRequiredException();
+        }
+        return payload;
     }
 
-    private JSONObject requestTradePage(String sessionCookie, int page) throws Exception {
-        Date end = new Date();
-        Calendar start = Calendar.getInstance();
-        start.add(Calendar.YEAR, -10);
-        SimpleDateFormat formatter = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.ROOT);
-        JSONObject request = new JSONObject();
-        // Captured from the authenticated JD H5 trade-order page. The legacy
-        // blank businessCode/H5 request returns no fund rows for current JD
-        // accounts even though the page itself shows those transactions.
-        request.put("businessCode", "FUND");
-        request.put("tradeTypeCodeList", new JSONArray());
-        request.put("pageNo", page);
-        request.put("pageType", "na");
-        request.put("title", "基金交易");
-        request.put("orderCreateStartDate", formatter.format(start.getTime()));
-        request.put("orderCreateEndDate", formatter.format(end));
-        request.put("clientVersion", "999.999.999");
-        request.put("clientType", "h5");
-
-        JSONObject payload = requestTradePageFromEndpoint(TRADE_LIST_URL, request, sessionCookie);
-        // Do not merge the two responses: one UI timeline must be the source
-        // of truth. The legacy route is used only for JD clients where the
-        // newna gateway is not yet available.
-        return findTradeRows(payload) == null ? requestTradePageFromEndpoint(LEGACY_TRADE_LIST_URL, request, sessionCookie) : payload;
+    private JSONObject requestJdPost(String endpoint, JSONObject request, String sessionCookie) throws Exception {
+        return requestJdPost(endpoint, request, sessionCookie, "https://roma.jd.com/");
     }
 
-    private JSONObject requestTradePageFromEndpoint(String endpoint, JSONObject request, String sessionCookie) throws Exception {
+    private JSONObject requestJdPost(String endpoint, JSONObject request, String sessionCookie, String referer) throws Exception {
         HttpURLConnection connection = (HttpURLConnection) new URL(endpoint).openConnection();
         try {
             connection.setRequestMethod("POST");
@@ -753,87 +997,46 @@ public class JdHoldingsPlugin extends Plugin {
             connection.setRequestProperty("Accept", "application/json, text/plain, */*");
             connection.setRequestProperty("Content-Type", "application/x-www-form-urlencoded;charset=UTF-8");
             connection.setRequestProperty("Cookie", sessionCookie);
-            connection.setRequestProperty("Referer", TRADE_LIST_REFERER);
+            connection.setRequestProperty("Referer", referer);
+            connection.setRequestProperty("Accept-Language", "zh-CN,zh;q=0.9");
             connection.setRequestProperty("User-Agent", requestUserAgent);
             byte[] body = ("reqData=" + URLEncoder.encode(request.toString(), "UTF-8")).getBytes(StandardCharsets.UTF_8);
             try (OutputStream output = connection.getOutputStream()) { output.write(body); }
             int status = connection.getResponseCode();
             String response = readBody(status >= 200 && status < 300 ? connection.getInputStream() : connection.getErrorStream());
             if (status == HttpURLConnection.HTTP_UNAUTHORIZED || status == HttpURLConnection.HTTP_FORBIDDEN || status >= 300) throw new LoginRequiredException();
+            if (response.isEmpty()) throw new IllegalStateException("京东未返回有效数据");
             JSONObject payload = new JSONObject(response);
             String message = payload.optString("resultMsg", payload.optString("message", ""));
-            if (!payload.optBoolean("success", true) && (payload.optInt("resultCode") == 3 || containsLoginMessage(message))) {
-                throw new LoginRequiredException();
-            }
+            if (!payload.optBoolean("success", true) && (payload.optInt("resultCode") == 3 || containsLoginMessage(message))) throw new LoginRequiredException();
             return payload;
         } finally {
             connection.disconnect();
         }
     }
 
-    private JSONArray findTradeRows(JSONObject payload) {
-        JSONObject resultData = payload.optJSONObject("resultData");
-        JSONObject data = resultData == null ? null : resultData.optJSONObject("data");
-        if (data == null) data = payload.optJSONObject("data");
-        if (data == null) return null;
-        for (String key : new String[] { "tradeOrderVoList", "tradeOrderList", "orderList", "list" }) {
-            JSONArray rows = data.optJSONArray(key);
-            if (rows != null) return rows;
+    private String resolveDetailExtJson(JSONObject parameter) throws Exception {
+        if (parameter == null) return "";
+        Object raw = parameter.opt("extJson");
+        if (raw instanceof JSONObject) return raw.toString();
+        String extJson = textValue(raw);
+        if (extJson.startsWith("{") && extJson.endsWith("}")) return extJson;
+        JSONObject built = new JSONObject();
+        for (String key : new String[] { "productId", "distinctCode", "orderId", "distinctCodes", "flowFlag", "type", "fromJumpType", "buSku", "buSkus" }) {
+            if (parameter.has(key)) built.put(key, parameter.opt(key));
         }
-        return null;
+        return built.length() > 0 ? built.toString() : "";
     }
 
-    private int appendTradeRows(JSONArray rows, JSArray items, Set<String> seen) {
-        int added = 0;
-        for (int index = 0; index < rows.length(); index++) {
-            JSONObject row = rows.optJSONObject(index);
-            if (row == null) continue;
-            String type = resolveTradeType(row);
-            if (type == null || !isEffectiveTrade(row)) continue;
-            String sourceCode = normalizeFundCode(firstText(row, "sellProductId", "sourceProductId", "sourceFundCode", "fromFundCode", "fundCode"));
-            String targetCode = normalizeFundCode(firstText(row, "productId", "targetProductId", "targetFundCode", "toFundCode", "fundCode"));
-            String code = "convert".equals(type) ? sourceCode : targetCode;
-            if ("convert".equals(type) && !code.matches("\\d{6}")) {
-                code = normalizeFundCode(firstText(row, "productId", "fundCode"));
-            }
-            String rawTradeTime = firstText(row, "confirmTime", "tradeTime", "bizTime", "orderCreateTime", "orderCreateDate", "createTime");
-            String date = normalizeTradeDate(rawTradeTime);
-            if (!code.matches("\\d{6}") || date == null) continue;
-            JSObject item = new JSObject();
-            String shares = firstText(row, "unit", "confirmUnit", "tradeUnit", "confirmShare", "tradeShare", "fundShare", "applyShare", "share", "shares");
-            String amount = firstText(row, "allAmount", "confirmAmount", "tradeAmount", "applyAmount", "amount", "money");
-            String id = firstText(row, "orderId", "bizOrderId", "tradeOrderId", "orderNo", "subOrderId");
-            String tradeTime = normalizeTradeTimestamp(rawTradeTime);
-            if (id.isEmpty()) id = code + ":" + type + ":" + (tradeTime == null ? date : tradeTime) + ":" + shares + ":" + amount;
-            if (!seen.add(id)) continue;
-            item.put("id", id);
-            item.put("code", code);
-            item.put("name", "convert".equals(type)
-                ? firstText(row, "sellProductName", "sourceProductName", "sourceFundName", "fromFundName", "fundName")
-                : firstText(row, "productName", "fundName", "targetProductName", "targetFundName"));
-            item.put("type", type);
-            item.put("tradeDate", date);
-            if (tradeTime != null) item.put("tradeTime", tradeTime);
-            item.put("shares", shares);
-            item.put("amount", amount);
-            item.put("status", firstText(row, "orderStatusDesc", "orderStatusName", "statusName", "tradeStatus", "status", "orderStatus"));
-            if ("convert".equals(type)) {
-                item.put("targetCode", targetCode);
-                item.put("targetName", firstText(row, "productName", "targetProductName", "targetFundName", "toFundName"));
-                item.put("targetShares", firstText(row, "targetUnit", "targetShare", "targetShares", "targetFundShare", "toFundShare", "convertShare"));
-            }
-            items.put(item);
-            added++;
+    private String findLabeledValue(JSONArray values, String label) {
+        if (values == null) return "";
+        for (int index = 0; index < values.length(); index++) {
+            JSONObject value = values.optJSONObject(index);
+            if (value != null && label.equals(value.optString("title1"))) return textValue(value.opt("title2"));
         }
-        return added;
+        return "";
     }
 
-    /**
-     * The JD trade list uses a product id, not a fund code. Fund products are
-     * returned as `1` plus the six-digit fund code (for example 1026211 for
-     * 026211); keeping the product id causes every transaction to be filtered
-     * out before it reaches the grid importer.
-     */
     private String normalizeFundCode(String value) {
         String candidate = textValue(value).trim();
         if (candidate.matches("\\d{6}")) return candidate;
@@ -841,43 +1044,8 @@ public class JdHoldingsPlugin extends Plugin {
         return digits.matches("1\\d{6}") ? digits.substring(1) : "";
     }
 
-    private boolean hasMoreTradePages(JSONObject payload, int rowCount, int page) {
-        JSONObject resultData = payload.optJSONObject("resultData");
-        JSONObject data = resultData == null ? null : resultData.optJSONObject("data");
-        if (data == null) data = payload.optJSONObject("data");
-        if (data == null) return rowCount >= TRADE_PAGE_SIZE;
-        for (String key : new String[] { "hasNext", "hasNextPage" }) {
-            if (data.has(key)) return truthy(data.opt(key));
-        }
-        int totalPages = firstInt(data, "totalPage", "totalPages", "pageCount", "pages");
-        if (totalPages > 0) return page < totalPages;
-        int total = firstInt(data, "total", "totalCount", "recordCount");
-        return total > 0 ? page * TRADE_PAGE_SIZE < total : rowCount >= TRADE_PAGE_SIZE;
-    }
-
-    private int firstInt(JSONObject row, String... keys) {
-        for (String key : keys) {
-            String value = textValue(row.opt(key));
-            try {
-                return Integer.parseInt(value);
-            } catch (Exception ignored) {
-                // Try the next known pagination field.
-            }
-        }
-        return 0;
-    }
-
-    private boolean truthy(Object value) {
-        if (value instanceof Boolean) return (Boolean) value;
-        String text = textValue(value).toLowerCase(Locale.ROOT);
-        return "true".equals(text) || "1".equals(text) || "yes".equals(text) || "y".equals(text);
-    }
-
     private String resolveTradeType(JSONObject row) {
-        String descriptor = (
-            firstText(row, "tradeTypeCode") + " " +
-            firstText(row, "tradeTypeName", "tradeName", "operationName", "businessName", "businessType", "orderType")
-        ).toLowerCase(Locale.ROOT);
+        String descriptor = (firstText(row, "tradeTypeCode") + " " + firstText(row, "tradeTypeName", "tradeName", "operationName", "businessName", "businessType", "orderType")).toLowerCase(Locale.ROOT);
         if (descriptor.contains("transform") || descriptor.contains("convert") || descriptor.contains("adjust_position") || descriptor.contains("转换") || descriptor.contains("调仓")) return "convert";
         if (descriptor.contains("sell") || descriptor.contains("redeem") || descriptor.contains("redemption") || descriptor.contains("赎回") || descriptor.contains("卖出") || descriptor.contains("转出")) return "reduce";
         if (descriptor.contains("buy") || descriptor.contains("purchase") || descriptor.contains("subscribe") || descriptor.contains("定投") || descriptor.contains("申购") || descriptor.contains("买入") || descriptor.contains("转入")) return "add";
@@ -889,241 +1057,79 @@ public class JdHoldingsPlugin extends Plugin {
         return !(status.contains("cancel") || status.contains("fail") || status.contains("refund") || status.contains("关闭") || status.contains("取消") || status.contains("失败") || status.contains("退款"));
     }
 
-    /**
-     * The authenticated holdings endpoint accepts its request data as a JSON
-     * query parameter. Asking for the recent window keeps the current holdings
-     * snapshot authoritative while allowing newer responses to include the
-     * user's latest buy, redemption, and conversion rows.
-     */
-    private String buildRecentPortfolioUrl() throws Exception {
-        Calendar calendar = Calendar.getInstance();
-        Date end = calendar.getTime();
-        calendar.add(Calendar.DAY_OF_YEAR, -(RECENT_TRADE_DAYS - 1));
-        SimpleDateFormat formatter = new SimpleDateFormat("yyyy-MM-dd", Locale.ROOT);
-        JSONObject request = new JSONObject();
-        request.put("startDate", formatter.format(calendar.getTime()));
-        request.put("endDate", formatter.format(end));
-        request.put("historyDays", RECENT_TRADE_DAYS);
-        request.put("pageNo", 1);
-        request.put("pageSize", 100);
-        return HOLDINGS_URL + "?reqData=" + URLEncoder.encode(request.toString(), "UTF-8");
-    }
-
-    private JSArray parseHoldingPayload(JSONObject payload) throws Exception {
-        String message = payload.optString("resultMsg", payload.optString("message", ""));
-        if (!payload.optBoolean("success", true) && (payload.optInt("resultCode") == 3 || containsLoginMessage(message))) {
-            throw new LoginRequiredException();
+    private String normalizeTradeDate(String value) {
+        String text = textValue(value).replace('T', ' ');
+        java.util.regex.Matcher full = java.util.regex.Pattern.compile("^(\\d{4})[-/.](\\d{1,2})[-/.](\\d{1,2}).*").matcher(text);
+        if (full.matches()) return formatTradeDate(Integer.parseInt(full.group(1)), Integer.parseInt(full.group(2)), Integer.parseInt(full.group(3)));
+        java.util.regex.Matcher compact = java.util.regex.Pattern.compile("^(\\d{4})(\\d{2})(\\d{2}).*").matcher(text);
+        if (compact.matches()) return formatTradeDate(Integer.parseInt(compact.group(1)), Integer.parseInt(compact.group(2)), Integer.parseInt(compact.group(3)));
+        java.util.regex.Matcher monthDay = java.util.regex.Pattern.compile("^(\\d{1,2})[-/.](\\d{1,2})(?:\\s|$).*").matcher(text);
+        if (monthDay.matches()) {
+            Calendar now = Calendar.getInstance(TimeZone.getTimeZone("Asia/Shanghai"));
+            int year = now.get(Calendar.YEAR);
+            int month = Integer.parseInt(monthDay.group(1));
+            int day = Integer.parseInt(monthDay.group(2));
+            String normalized = formatTradeDate(year, month, day);
+            if (normalized == null) return null;
+            Calendar tradeDay = Calendar.getInstance(TimeZone.getTimeZone("Asia/Shanghai"));
+            tradeDay.setLenient(false);
+            tradeDay.clear();
+            tradeDay.set(year, month - 1, day, 0, 0, 0);
+            if (tradeDay.getTimeInMillis() > now.getTimeInMillis() + TimeUnit.DAYS.toMillis(1)) normalized = formatTradeDate(year - 1, month, day);
+            return normalized;
         }
-
-        JSONObject data = findHoldingData(payload);
-        if (data == null) throw new IllegalStateException("invalid holdings response");
-        JSONArray holdings = data.optJSONArray("fundHoldingVOS");
-        if (holdings == null) throw new IllegalStateException("missing holdings");
-
-        JSArray items = new JSArray();
-        for (int index = 0; index < holdings.length(); index++) {
-            JSONObject row = holdings.optJSONObject(index);
-            if (row == null) continue;
-            String code = row.optString("fundCode", "").trim();
-            String name = row.optString("fundName", "").trim();
-            if (!code.matches("\\d{6}") || name.isEmpty()) continue;
-
-            String amount = firstText(row, "amount", "marketValue", "marketAmount", "holdingAmount", "holdAmount", "holdAsset", "fundAsset", "fundMarketValue", "totalAsset", "totalAmount", "asset", "currentValue");
-            String shares = firstText(row, "holdShare", "holdingShare", "fundShare", "shares", "share", "holdShares", "availableShare", "availableShares", "availableFundShare", "totalShare", "totalShares", "canRedeemShare");
-            if (!hasCurrentPosition(amount, shares)) continue;
-
-            JSObject item = new JSObject();
-            item.put("code", code);
-            item.put("name", name);
-            item.put("amount", amount);
-            item.put("yesterdayIncome", textValue(row.opt("yesterdayIncome")));
-            String profitDate = normalizeTradeDate(firstText(row, "yesterdayIncomeDate", "incomeDate", "profitDate", "navDate", "netValueDate", "lastIncomeDate"));
-            if (profitDate != null) item.put("profitDate", profitDate);
-            item.put("profit", firstText(row, "holdIncome", "holdingIncome", "totalIncome", "profit", "holdingProfit", "totalProfit", "accumulatedIncome", "income", "incomeAmount"));
-            item.put("rate", firstText(row, "holdRate", "holdingRate", "profitRate", "incomeRate", "totalRate"));
-            item.put("shares", shares);
-            item.put("costPrice", firstText(row, "costPrice", "holdCostPrice", "avgCost", "costNetValue", "costNetWorth", "costNav", "costUnitPrice"));
-            item.put("costAmount", firstText(row, "costAmount", "holdCost", "holdCostAmount", "holdingCost", "totalCost", "costValue", "costAsset", "principal", "investedAmount"));
-            String acquiredDate = normalizeTradeDate(firstText(row, "firstBuyDate", "buyDate", "purchaseDate", "holdingDate", "startDate", "costDate"));
-            if (acquiredDate != null) item.put("acquiredDate", acquiredDate);
-            items.put(item);
-        }
-        return items;
-    }
-
-    private JSArray parseRecentAdjustments(JSONObject payload) {
-        JSArray items = new JSArray();
-        collectTradeRows(payload, items, new HashSet<String>());
-        return items;
-    }
-
-    private void collectTradeRows(Object value, JSArray items, Set<String> seen) {
-        if (value instanceof JSONArray) {
-            JSONArray array = (JSONArray) value;
-            for (int index = 0; index < array.length(); index++) {
-                collectTradeRows(array.opt(index), items, seen);
-            }
-            return;
-        }
-        if (!(value instanceof JSONObject)) return;
-
-        JSONObject row = (JSONObject) value;
-        JSObject normalized = normalizeTradeRow(row);
-        if (normalized != null) {
-            String id = normalized.optString("id", "");
-            if (seen.add(id)) items.put(normalized);
-        }
-
-        Iterator<String> keys = row.keys();
-        while (keys.hasNext()) {
-            Object child = row.opt(keys.next());
-            if (child instanceof JSONObject || child instanceof JSONArray) collectTradeRows(child, items, seen);
-        }
-    }
-
-    private JSObject normalizeTradeRow(JSONObject row) {
-        String code = firstText(row, "fundCode", "sourceFundCode", "fromFundCode");
-        String operation = firstText(row, "tradeType", "operationType", "businessType", "orderType", "tradeName", "operationName");
-        String type = normalizeTradeType(operation);
-        String rawTradeTime = firstText(row, "confirmTime", "tradeTime", "bizTime", "confirmDate", "applyTime", "tradeDate", "orderCreateTime", "createTime", "applyDate", "orderDate", "createDate", "date");
-        String tradeDate = normalizeTradeDate(rawTradeTime);
-        if (!code.matches("\\d{6}") || type == null || tradeDate == null) return null;
-
-        JSObject item = new JSObject();
-        String shares = firstText(row, "confirmShare", "tradeShare", "shares", "share", "fundShare");
-        String amount = firstText(row, "confirmAmount", "tradeAmount", "amount", "applyAmount", "money");
-        String id = firstText(row, "orderId", "tradeId", "serialNo", "requestNo", "id");
-        String tradeTime = normalizeTradeTimestamp(rawTradeTime);
-        item.put("id", id.isEmpty() ? code + ":" + type + ":" + (tradeTime == null ? tradeDate : tradeTime) + ":" + shares + ":" + amount : id);
-        item.put("code", code);
-        item.put("name", firstText(row, "fundName", "sourceFundName", "fromFundName"));
-        item.put("type", type);
-        item.put("tradeDate", tradeDate);
-        if (tradeTime != null) item.put("tradeTime", tradeTime);
-        item.put("shares", shares);
-        item.put("amount", amount);
-        if ("convert".equals(type)) {
-            item.put("targetCode", firstText(row, "targetFundCode", "toFundCode", "convertFundCode"));
-            item.put("targetName", firstText(row, "targetFundName", "toFundName", "convertFundName"));
-            item.put("targetShares", firstText(row, "targetShare", "targetShares", "toFundShare", "convertShare"));
-        }
-        return item;
-    }
-
-    private String normalizeTradeType(String value) {
-        String normalized = value == null ? "" : value.toLowerCase(Locale.ROOT);
-        if (normalized.contains("转换") || normalized.contains("convert")) return "convert";
-        if (normalized.contains("赎回") || normalized.contains("卖出") || normalized.contains("redemption") || normalized.contains("sell")) return "reduce";
-        if (normalized.contains("申购") || normalized.contains("买入") || normalized.contains("定投") || normalized.contains("purchase") || normalized.contains("buy")) return "add";
         return null;
     }
 
-    private String normalizeTradeDate(String value) {
-        if (value == null) return null;
-        String digits = value.replaceAll("[^0-9]", "");
-        if (digits.length() < 8) return null;
-        if ((digits.length() == 10 || digits.length() == 13) && !digits.startsWith("19") && !digits.startsWith("20")) {
-            try {
-                long epoch = Long.parseLong(digits.substring(0, Math.min(13, digits.length())));
-                if (digits.length() == 10) epoch *= 1000;
-                SimpleDateFormat formatter = new SimpleDateFormat("yyyy-MM-dd", Locale.ROOT);
-                formatter.setTimeZone(TimeZone.getTimeZone("Asia/Shanghai"));
-                return formatter.format(new Date(epoch));
-            } catch (Exception ignored) {
-                return null;
-            }
+    private String formatTradeDate(int year, int month, int day) {
+        Calendar calendar = Calendar.getInstance(TimeZone.getTimeZone("Asia/Shanghai"));
+        calendar.setLenient(false);
+        calendar.clear();
+        try {
+            calendar.set(year, month - 1, day, 0, 0, 0);
+            calendar.getTimeInMillis();
+            return String.format(Locale.ROOT, "%04d-%02d-%02d", year, month, day);
+        } catch (IllegalArgumentException ignored) {
+            return null;
         }
-        return digits.substring(0, 4) + "-" + digits.substring(4, 6) + "-" + digits.substring(6, 8);
     }
 
     private String normalizeTradeTimestamp(String value) {
-        if (value == null) return null;
-        String digits = value.replaceAll("[^0-9]", "");
-        if ((digits.length() == 10 || digits.length() == 13) && !digits.startsWith("19") && !digits.startsWith("20")) {
-            try {
-                long epoch = Long.parseLong(digits.substring(0, Math.min(13, digits.length())));
-                if (digits.length() == 10) epoch *= 1000;
-                SimpleDateFormat formatter = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss", Locale.ROOT);
-                formatter.setTimeZone(TimeZone.getTimeZone("Asia/Shanghai"));
-                return formatter.format(new Date(epoch));
-            } catch (Exception ignored) {
-                return null;
-            }
-        }
-        if (digits.length() < 12 || (!digits.startsWith("19") && !digits.startsWith("20"))) return null;
-        String seconds = digits.length() >= 14 ? digits.substring(12, 14) : "00";
-        return digits.substring(0, 4) + "-" + digits.substring(4, 6) + "-" + digits.substring(6, 8)
-            + " " + digits.substring(8, 10) + ":" + digits.substring(10, 12) + ":" + seconds;
+        String text = textValue(value).replace('T', ' ');
+        String date = normalizeTradeDate(text);
+        if (date == null) return null;
+        java.util.regex.Matcher matcher = java.util.regex.Pattern.compile(".*?(\\d{2}:\\d{2})(?::(\\d{2}))?.*").matcher(text);
+        return matcher.matches() ? date + " " + matcher.group(1) + (matcher.group(2) == null ? "" : ":" + matcher.group(2)) : null;
+    }
+
+    /** Include today and the preceding 29 Beijing calendar days. */
+    private String getTradeHistoryStartDate() {
+        Calendar calendar = Calendar.getInstance(TimeZone.getTimeZone("Asia/Shanghai"));
+        calendar.set(Calendar.HOUR_OF_DAY, 0);
+        calendar.set(Calendar.MINUTE, 0);
+        calendar.set(Calendar.SECOND, 0);
+        calendar.set(Calendar.MILLISECOND, 0);
+        calendar.add(Calendar.DAY_OF_YEAR, -(TRADE_HISTORY_DAYS - 1));
+        return String.format(Locale.ROOT, "%04d-%02d-%02d", calendar.get(Calendar.YEAR), calendar.get(Calendar.MONTH) + 1, calendar.get(Calendar.DAY_OF_MONTH));
+    }
+
+    private boolean isWithinTradeHistory(String date) {
+        if (date == null || !date.matches("\\d{4}-\\d{2}-\\d{2}")) return false;
+        Calendar today = Calendar.getInstance(TimeZone.getTimeZone("Asia/Shanghai"));
+        String currentDate = String.format(Locale.ROOT, "%04d-%02d-%02d", today.get(Calendar.YEAR), today.get(Calendar.MONTH) + 1, today.get(Calendar.DAY_OF_MONTH));
+        return date.compareTo(getTradeHistoryStartDate()) >= 0 && date.compareTo(currentDate) <= 0;
     }
 
     private boolean hasCurrentPosition(String amount, String shares) {
-        boolean sawNumber = false;
-        for (String value : new String[] { shares, amount }) {
-            try {
-                double parsed = Double.parseDouble(value.replaceAll("[,，￥¥$\\s]", ""));
-                sawNumber = true;
-                if (parsed > 0) return true;
-            } catch (Exception ignored) {
-                // Some JD fields are display objects or masked text; keep the row
-                // unless both available numeric position fields explicitly equal zero.
-            }
-        }
-        return !sawNumber;
+        return positiveNumber(amount) || positiveNumber(shares);
     }
 
-    private boolean isWithinRecentWindow(String date) {
+    private boolean positiveNumber(String value) {
         try {
-            SimpleDateFormat formatter = new SimpleDateFormat("yyyy-MM-dd", Locale.ROOT);
-            formatter.setLenient(false);
-            Calendar start = Calendar.getInstance();
-            start.add(Calendar.DAY_OF_YEAR, -(RECENT_TRADE_DAYS - 1));
-            start.set(Calendar.HOUR_OF_DAY, 0);
-            start.set(Calendar.MINUTE, 0);
-            start.set(Calendar.SECOND, 0);
-            start.set(Calendar.MILLISECOND, 0);
-            return !formatter.parse(date).before(start.getTime());
+            return Double.parseDouble(textValue(value).replaceAll("[^0-9.\\-]", "")) > 0;
         } catch (Exception ignored) {
             return false;
         }
-    }
-
-    private JSONObject findHoldingData(Object value) {
-        if (value instanceof String) {
-            try {
-                return findHoldingData(new JSONTokener((String) value).nextValue());
-            } catch (Exception ignored) {
-                return null;
-            }
-        }
-        if (value instanceof JSONArray) {
-            JSONArray values = (JSONArray) value;
-            for (int index = 0; index < values.length(); index++) {
-                JSONObject found = findHoldingData(values.opt(index));
-                if (found != null) return found;
-            }
-            return null;
-        }
-        if (!(value instanceof JSONObject)) return null;
-
-        JSONObject object = (JSONObject) value;
-        if (object.opt("fundHoldingVOS") instanceof JSONArray) return object;
-        for (String key : new String[] { "resultData", "data", "datas" }) {
-            JSONObject found = findHoldingData(object.opt(key));
-            if (found != null) return found;
-        }
-        return null;
-    }
-
-    private String textValue(Object value) {
-        if (value instanceof JSONObject) {
-            JSONObject object = (JSONObject) value;
-            for (String key : new String[] { "text", "value", "amount", "number", "displayValue", "data" }) {
-                String candidate = textValue(object.opt(key));
-                if (!candidate.isEmpty()) return candidate;
-            }
-            return "";
-        }
-        return value == null || value == JSONObject.NULL ? "" : String.valueOf(value).trim();
     }
 
     private String firstText(JSONObject row, String... keys) {
@@ -1132,6 +1138,11 @@ public class JdHoldingsPlugin extends Plugin {
             if (!value.isEmpty()) return value;
         }
         return "";
+    }
+
+    private String textValue(Object value) {
+        if (value == null || JSONObject.NULL.equals(value)) return "";
+        return String.valueOf(value).trim();
     }
 
     private String readBody(InputStream stream) throws Exception {
@@ -1154,154 +1165,186 @@ public class JdHoldingsPlugin extends Plugin {
         String host = uri.getHost();
         if (host == null) return false;
         String normalized = host.toLowerCase(Locale.ROOT);
-        return normalized.equals("jd.com") || normalized.endsWith(".jd.com")
-            || normalized.equals("jd.com.cn") || normalized.endsWith(".jd.com.cn");
+        return normalized.equals("jd.com") || normalized.endsWith(".jd.com") || normalized.equals("jd.com.cn") || normalized.endsWith(".jd.com.cn");
     }
 
-    private boolean isJdFinanceUrl(Uri uri) {
-        String host = uri == null ? null : uri.getHost();
-        return host != null && (host.equalsIgnoreCase("jdjr.jd.com") || host.endsWith(".jr.jd.com") || host.equalsIgnoreCase("dingpan.jd.com"));
-    }
-
-    private void receiveDetailTradeMessage(DetailTradeCapture capture, String value) {
-        try {
-            JSONObject message = new JSONObject(value);
-            String detailUrl = message.optString("detailUrl", "").trim();
-            Uri uri = Uri.parse(detailUrl);
-            if (!detailUrl.isEmpty() && "dingpan.jd.com".equalsIgnoreCase(uri.getHost())
-                && capture.fundCode.equals(uri.getQueryParameter("fundCode"))) {
-                Activity activity = getActivity();
-                if (activity != null && !activity.isFinishing()) {
-                    activity.runOnUiThread(() -> {
-                        if (tradeWebView != null) tradeWebView.loadUrl(detailUrl);
-                    });
-                }
+    private void seedWebSession(String sessionCookie) {
+        CookieManager cookies = CookieManager.getInstance();
+        for (String pair : sessionCookie.split(";\\s*")) {
+            if (pair.contains("=")) {
+                cookies.setCookie(LOGIN_URL, pair);
+                cookies.setCookie("https://roma.jd.com", pair);
+                cookies.setCookie("https://ms.jr.jd.com", pair);
             }
-        } catch (Exception ignored) {
-            // The capture class reports malformed terminal responses.
         }
-        capture.receive(value);
+        cookies.flush();
     }
 
-    private void resetImportState(String message) {
-        importInFlight = false;
-        if (importButton != null) importButton.setEnabled(true);
-        setStatus(message);
+    private void resetDetailWebViewClient(WebView view) {
+        if (view == null) return;
+        view.removeJavascriptInterface("FundAppDetailTrade");
+        view.setWebViewClient(new SecureJdWebViewClient());
+    }
+
+    private void destroyWebView(WebView view) {
+        if (view == null) return;
+        view.stopLoading();
+        view.removeAllViews();
+        view.destroy();
     }
 
     private void finishWithResult(JSObject result) {
         PluginCall call = pendingCall;
         pendingCall = null;
+        importInFlight = false;
         closeDialogAndClearSession();
-        if (call != null) {
-            call.resolve(result);
-            bridge.releaseCall(call);
-        }
+        if (call != null) call.resolve(result);
     }
 
     private void finishWithError(String message) {
         PluginCall call = pendingCall;
         pendingCall = null;
+        importInFlight = false;
         closeDialogAndClearSession();
-        if (call != null) {
-            call.reject(message);
-            bridge.releaseCall(call);
-        }
+        if (call != null) call.reject(message);
     }
 
     private void closeDialogAndClearSession() {
-        importInFlight = false;
+        if (loginWebView != null) {
+            loginWebView.stopLoading();
+            loginWebView.removeAllViews();
+            loginWebView.destroy();
+            loginWebView = null;
+        }
         if (loginDialog != null && loginDialog.isShowing()) loginDialog.dismiss();
         loginDialog = null;
-        clearWebSession();
-        loginWebView = null;
         statusView = null;
         importButton = null;
-        requestUserAgent = "Mozilla/5.0";
+        cookieBrowserRequests.clear();
+        cookieImport = false;
+        clearWebSession();
     }
 
     private void clearWebSession() {
-        CookieManager cookieManager = CookieManager.getInstance();
-        cookieManager.removeAllCookies(null);
-        cookieManager.flush();
-        destroyTradeWebView();
-        if (loginWebView != null) {
-            loginWebView.stopLoading();
-            loginWebView.clearHistory();
-            loginWebView.clearCache(true);
-            loginWebView.loadUrl("about:blank");
-            loginWebView.destroy();
-        }
+        CookieManager cookies = CookieManager.getInstance();
+        cookies.removeAllCookies(null);
+        cookies.flush();
     }
 
     private void reportProgress(String stage, String message, int current, int total) {
         JSObject progress = new JSObject();
         progress.put("stage", stage);
         progress.put("message", message);
-        progress.put("current", current);
-        progress.put("total", total);
+        if (current > 0) progress.put("current", current);
+        if (total > 0) progress.put("total", total);
         notifyListeners("syncProgress", progress);
-        setStatus(message);
     }
 
     private void setStatus(String message) {
-        Activity activity = getActivity();
-        if (activity == null) return;
-        activity.runOnUiThread(() -> {
-            if (statusView != null) statusView.setText(message);
-        });
+        if (statusView != null) statusView.setText(message);
     }
 
     private int dp(int value) {
         return Math.round(value * getContext().getResources().getDisplayMetrics().density);
     }
 
-    private static class TradePageCapture {
-        private final CountDownLatch done = new CountDownLatch(1);
-        private final java.util.Map<Integer, JSONArray> pages = new java.util.TreeMap<>();
-        private boolean complete;
-        private boolean failed;
+    private class SecureJdWebViewClient extends WebViewClient {
+        @Override
+        public boolean shouldOverrideUrlLoading(WebView view, WebResourceRequest request) {
+            return request == null || !isJdUrl(request.getUrl());
+        }
 
-        synchronized void receive(String value) {
+        @Override
+        public boolean shouldOverrideUrlLoading(WebView view, String url) {
+            return !isJdUrl(Uri.parse(url));
+        }
+
+        @Override
+        public void onReceivedSslError(WebView view, SslErrorHandler handler, SslError error) {
+            handler.cancel();
+            setStatus("京东页面证书校验失败，已停止读取");
+        }
+    }
+
+    private class HoldingCookieBrowserBridge {
+        @JavascriptInterface
+        public void receive(String value) {
             try {
                 JSONObject response = new JSONObject(value);
-                JSONArray rows = response.optJSONArray("rows");
-                if (rows == null) return;
-                int page = response.optInt("page", 0);
-                if (page < 1) {
-                    fail();
-                    return;
-                }
-                // Loading events may fire twice while the list view updates.
-                // Preserve the first decoded response for each JD page.
-                if (!pages.containsKey(page)) pages.put(page, rows);
-                if (response.optBoolean("done", false)) {
-                    complete = true;
-                    done.countDown();
-                }
+                String id = response.optString("id", "");
+                BrowserCookieRequest capture = cookieBrowserRequests.get(id);
+                if (capture != null) capture.receive(response);
             } catch (Exception ignored) {
-                fail();
+                // A malformed page callback only fails its matching request.
             }
         }
+    }
 
-        synchronized JSONArray rows() {
-            JSONArray all = new JSONArray();
-            for (JSONArray page : pages.values()) {
-                for (int index = 0; index < page.length(); index++) all.put(page.opt(index));
-            }
-            return all;
+    private static class BrowserCookieRequest {
+        private final CountDownLatch done = new CountDownLatch(1);
+        private int status = -1;
+        private String body = "";
+        private String error = "";
+
+        synchronized void receive(JSONObject response) {
+            status = response.optInt("status", -1);
+            body = response.optString("body", "");
+            error = response.optString("error", "").trim();
+            done.countDown();
         }
 
-        synchronized void fail() {
-            failed = true;
+        synchronized void fail(String value) {
+            error = value == null ? "京东持仓浏览器会话不可用" : value;
             done.countDown();
         }
     }
 
-    private static class TradePageBridge {
-        private final TradePageCapture capture;
+    private static class AccountTradeCapture {
+        private final CountDownLatch done = new CountDownLatch(1);
+        private final JSONArray rows = new JSONArray();
+        private boolean complete;
+        private boolean failed;
+        private String reason = "";
 
-        TradePageBridge(TradePageCapture capture) {
+        synchronized void receive(String value) {
+            try {
+                JSONObject response = new JSONObject(value);
+                if (response.has("ready") && !response.optBoolean("ready", false)) {
+                    fail(response.optString("reason", "京东交易记录不可用"));
+                    return;
+                }
+                JSONArray responseRows = response.optJSONArray("rows");
+                if (responseRows != null) {
+                    for (int index = 0; index < responseRows.length(); index++) rows.put(responseRows.opt(index));
+                }
+                if (response.optBoolean("done", false)) {
+                    complete = true;
+                    done.countDown();
+                }
+            } catch (Exception error) {
+                fail("京东交易记录响应格式异常");
+            }
+        }
+
+        synchronized JSONArray rows() {
+            return rows;
+        }
+
+        synchronized void fail(String error) {
+            failed = true;
+            if (reason.isEmpty() && error != null) reason = error.trim();
+            done.countDown();
+        }
+
+        synchronized String failureReason() {
+            return reason;
+        }
+    }
+
+    private static class AccountTradeBridge {
+        private final AccountTradeCapture capture;
+
+        AccountTradeBridge(AccountTradeCapture capture) {
             this.capture = capture;
         }
 
@@ -1314,10 +1357,10 @@ public class JdHoldingsPlugin extends Plugin {
     private static class DetailTradeCapture {
         private final String fundCode;
         private final CountDownLatch done = new CountDownLatch(1);
-        private final List<JSONArray> responses = new ArrayList<>();
+        private final JSONArray rows = new JSONArray();
         private boolean complete;
         private boolean failed;
-        private String failureReason = "";
+        private String reason = "";
 
         DetailTradeCapture(String fundCode) {
             this.fundCode = fundCode;
@@ -1328,55 +1371,67 @@ public class JdHoldingsPlugin extends Plugin {
                 JSONObject response = new JSONObject(value);
                 if (!fundCode.equals(response.optString("code", ""))) return;
                 if (response.has("ready") && !response.optBoolean("ready", false)) {
-                    fail(response.optString("reason", "transaction entry was unavailable"));
+                    fail(response.optString("reason", "京东交易记录不可用"));
                     return;
                 }
-                JSONArray rows = response.optJSONArray("rows");
-                if (rows != null) responses.add(rows);
+                JSONArray responseRows = response.optJSONArray("rows");
+                if (responseRows != null) {
+                    for (int index = 0; index < responseRows.length(); index++) rows.put(responseRows.opt(index));
+                }
                 if (response.optBoolean("done", false)) {
                     complete = true;
                     done.countDown();
                 }
-            } catch (Exception ignored) {
-                fail();
+            } catch (Exception error) {
+                fail("京东交易记录响应格式异常");
             }
         }
 
         synchronized JSONArray rows() {
-            JSONArray all = new JSONArray();
-            for (JSONArray response : responses) {
-                for (int index = 0; index < response.length(); index++) all.put(response.opt(index));
-            }
-            return all;
+            return rows;
         }
 
-        synchronized void fail() {
-            fail("");
-        }
-
-        synchronized void fail(String reason) {
+        synchronized void fail(String error) {
             failed = true;
-            if (failureReason.isEmpty() && reason != null) failureReason = reason.trim();
+            if (reason.isEmpty() && error != null) reason = error.trim();
             done.countDown();
         }
 
         synchronized String failureReason() {
-            return failureReason;
+            return reason;
         }
     }
 
     private static class DetailTradeBridge {
-        private final JdHoldingsPlugin plugin;
         private final DetailTradeCapture capture;
 
-        DetailTradeBridge(JdHoldingsPlugin plugin, DetailTradeCapture capture) {
-            this.plugin = plugin;
+        DetailTradeBridge(DetailTradeCapture capture) {
             this.capture = capture;
         }
 
         @JavascriptInterface
         public void receive(String value) {
-            plugin.receiveDetailTradeMessage(capture, value);
+            capture.receive(value);
+        }
+    }
+
+    private static class FundTradeRequest {
+        private final String code;
+        private final String extJson;
+
+        FundTradeRequest(String code, String extJson) {
+            this.code = code;
+            this.extJson = extJson;
+        }
+    }
+
+    private static class FundTradeRows {
+        private final String code;
+        private final JSONArray rows;
+
+        FundTradeRows(String code, JSONArray rows) {
+            this.code = code;
+            this.rows = rows;
         }
     }
 

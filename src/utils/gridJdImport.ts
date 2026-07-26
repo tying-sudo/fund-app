@@ -1,4 +1,4 @@
-import { hasReachedJdConfirmationWindow, selectVerifiedJdCurrentTimeline, type JdAdjustmentItem, type JdHoldingItem } from './jdHoldings.ts'
+import { hasReachedJdConfirmationWindow, isValidJdTradeDate, type JdAdjustmentItem, type JdHoldingItem } from './jdHoldings.ts'
 
 export interface GridJdImportPayload {
   current_holding_codes: string[]
@@ -22,8 +22,7 @@ export function buildGridJdImportPayload(items: JdHoldingItem[], adjustments: Jd
     .map((item) => item.code.trim())
     .filter((code) => /^\d{6}$/.test(code)))]
   const currentCodes = new Set(current_holding_codes)
-  const confirmed = adjustments.filter((item) => hasReachedJdConfirmationWindow(item))
-  const selectedTimeline = selectVerifiedJdCurrentTimeline(items, confirmed)
+  const confirmed = adjustments.filter((item) => isValidJdTradeDate(item.tradeDate) && hasReachedJdConfirmationWindow(item))
   return {
     current_holding_codes,
     current_holdings: items.flatMap((item) => {
@@ -41,8 +40,11 @@ export function buildGridJdImportPayload(items: JdHoldingItem[], adjustments: Jd
         ...(item.acquiredDate ? { acquiredDate: item.acquiredDate } : {})
       }]
     }),
-    adjustments: selectedTimeline.adjustments.filter((item) => {
-      if (!/^\d{6}$/.test(item.code) || !['add', 'reduce', 'convert'].includes(item.type)) return false
+    // JD may omit confirmed shares on a transaction row. The backend derives
+    // shares from the amount and official NAV on the actual order time, then
+    // verifies the complete buy/sell/conversion timeline against the snapshot.
+    adjustments: confirmed.filter((item) => {
+      if (!/^\d{6}$/.test(item.code) || !isValidJdTradeDate(item.tradeDate) || !['add', 'reduce', 'convert'].includes(item.type)) return false
       // For a conversion, its target can be a current holding even if the
       // source was fully converted away and no longer appears in the snapshot.
       return currentCodes.has(item.code) || Boolean(item.targetCode && currentCodes.has(item.targetCode))

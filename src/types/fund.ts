@@ -171,6 +171,20 @@ export interface HoldingRecord {
   serviceFeeDeducted?: number
   /** 上次扣费日期 */
   lastFeeDate?: string
+  /** Latest official current-position values captured from JD. */
+  jdSnapshot?: JdHoldingSnapshot
+}
+
+/** JD's current-position values, kept separate from local intraday valuation. */
+export interface JdHoldingSnapshot {
+  source: 'jd'
+  amount: number
+  profit: number
+  profitRate: number
+  shares: number
+  costAmount: number
+  costPrice: number
+  syncedAt: number
 }
 
 /**

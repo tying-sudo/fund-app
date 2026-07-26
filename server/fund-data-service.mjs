@@ -261,7 +261,7 @@ export function getFundProfile(code) {
 export function parseFundHistoryPayload(payload, code) {
   const items = payload?.Data?.LSJZList
   if (!Array.isArray(items)) return []
-  return items.map(item => ({
+  return items.filter(item => item && typeof item === 'object').map(item => ({
     code,
     date: String(item.FSRQ || '').replaceAll('/', '-'),
     nav: numberOrNull(item.DWJZ),
@@ -319,7 +319,7 @@ function historyTtlMs() {
 
 export async function getFundHistory(code, limit = 30) {
   if (!codeIsValid(code)) throw new Error('基金代码必须是6位数字')
-  const boundedLimit = Math.max(1, Math.min(Number(limit) || 30, 500))
+  const boundedLimit = Math.max(1, Math.min(Number(limit) || 30, 2000))
   const cacheKey = `fund:history:${code}:${boundedLimit}`
   const cached = getCache(cacheKey)
   if (cached) return cached
@@ -328,12 +328,12 @@ export async function getFundHistory(code, limit = 30) {
   const persisted = getPersistentEntry(historyFileCache, code)
   const ttl = historyTtlMs()
   const database = await getStoredFundHistory(code)
-  if (database?.items?.length >= Math.min(boundedLimit, 5) && Date.now() - Date.parse(database.cachedAt) < ttl) {
+  if (database?.items?.length >= boundedLimit && Date.now() - Date.parse(database.cachedAt) < ttl) {
     const result = { ...database, items: database.items.slice(0, boundedLimit), cache: 'database', stale: false }
     setCache(cacheKey, result, ttl)
     return result
   }
-  if (persisted && Date.now() - Date.parse(persisted.cachedAt) < ttl && persisted.items?.length >= Math.min(boundedLimit, 5)) {
+  if (persisted && Date.now() - Date.parse(persisted.cachedAt) < ttl && persisted.items?.length >= boundedLimit) {
     const result = { ...persisted, items: persisted.items.slice(0, boundedLimit), cache: 'disk', stale: false }
     // Promote an existing durable file cache on the first request so history
     // charts gain the same database-first path without waiting for its TTL.
@@ -343,23 +343,33 @@ export async function getFundHistory(code, limit = 30) {
   }
 
   try {
-    const response = await fetchUpstream(`https://api.fund.eastmoney.com/f10/lsjz?fundCode=${code}&pageIndex=1&pageSize=${boundedLimit}`, {
-      headers: { ...DEFAULT_HEADERS, 'Accept': 'application/json' },
-      timeoutMs: 8_000,
-      retries: 2,
-      dedupeKey: `fund:history:${code}:${boundedLimit}`
-    })
-    const payload = await response.json()
-    const items = parseFundHistoryPayload(payload, code)
+    const pageSize = 500
+    const pageCount = Math.ceil(boundedLimit / pageSize)
+    const items = []
+    let fundType = ''
+    for (let pageIndex = 1; pageIndex <= pageCount; pageIndex++) {
+      const response = await fetchUpstream(`https://api.fund.eastmoney.com/f10/lsjz?fundCode=${code}&pageIndex=${pageIndex}&pageSize=${pageSize}`, {
+        headers: { ...DEFAULT_HEADERS, 'Accept': 'application/json' },
+        timeoutMs: 8_000,
+        retries: 2,
+        dedupeKey: `fund:history:${code}:${boundedLimit}:page:${pageIndex}`
+      })
+      const payload = await response.json()
+      const pageItems = parseFundHistoryPayload(payload, code)
+      if (!pageItems.length) break
+      items.push(...pageItems)
+      fundType ||= payload?.Data?.FundType || ''
+      if (pageItems.length < pageSize) break
+    }
     if (items.length === 0) throw new Error('历史净值为空')
     const result = {
       code,
       name: getFundProfile(code)?.name || '',
-      fundType: payload?.Data?.FundType || getFundProfile(code)?.type || '',
+      fundType: fundType || getFundProfile(code)?.type || '',
       source: 'eastmoney_lsjz',
       updatedAt: new Date().toISOString(),
       stale: false,
-      items
+      items: items.slice(0, boundedLimit)
     }
     updatePersistentCache(HISTORY_CACHE_FILE, historyFileCache, code, result)
     await storeFundHistory(code, result).catch(() => false)

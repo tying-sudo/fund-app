@@ -3,41 +3,29 @@ import { ref, watch } from 'vue'
 
 const props = defineProps<{ show: boolean; title?: string }>()
 const emit = defineEmits<{ 'update:show': [value: boolean]; confirm: [cookie: string] }>()
-const STORAGE_KEY = 'fund-app:jd-cookie:v1'
+const storageKey = 'fund-app:jd-cookie:v1'
 
-function restoreCookie(): string {
-  try {
-    return localStorage.getItem(STORAGE_KEY) || ''
-  } catch {
-    return ''
-  }
+function restoredCookie(): string {
+  try { return localStorage.getItem(storageKey) || '' } catch { return '' }
 }
 
-const cookie = ref(restoreCookie())
+const cookie = ref(restoredCookie())
 
 watch(() => props.show, (visible) => {
-  if (visible) cookie.value = restoreCookie()
+  if (visible) cookie.value = restoredCookie()
 })
 
 function submit() {
   const value = cookie.value.trim().replace(/^cookie\s*:\s*/i, '')
   if (!value || !value.includes('=')) return
-  try {
-    localStorage.setItem(STORAGE_KEY, value)
-  } catch {
-    // The one-time read remains available when device storage is blocked.
-  }
+  try { localStorage.setItem(storageKey, value) } catch { /* One-time import remains available. */ }
   emit('confirm', value)
   emit('update:show', false)
 }
 
 function clearCookie() {
   cookie.value = ''
-  try {
-    localStorage.removeItem(STORAGE_KEY)
-  } catch {
-    // The input has still been cleared for this page instance.
-  }
+  try { localStorage.removeItem(storageKey) } catch { /* The visible field is already cleared. */ }
 }
 </script>
 
@@ -51,20 +39,8 @@ function clearCookie() {
           <button type="button" class="icon-button" title="关闭" aria-label="关闭" @click="emit('update:show', false)"><van-icon name="cross" size="20" /></button>
         </span>
       </div>
-      <van-field
-        v-model="cookie"
-        label="Cookie"
-        type="textarea"
-        rows="4"
-        maxlength="16384"
-        autocomplete="off"
-        autocapitalize="off"
-        spellcheck="false"
-        placeholder="pt_key=...; pt_pin=..."
-      />
-      <div class="dialog-actions">
-        <van-button block type="primary" :disabled="!cookie.trim()" @click="submit">读取持仓</van-button>
-      </div>
+      <van-field v-model="cookie" label="Cookie" type="textarea" rows="4" maxlength="16384" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="pt_key=...; pt_pin=..." />
+      <div class="dialog-actions"><van-button block type="primary" :disabled="!cookie.trim()" @click="submit">读取持仓</van-button></div>
     </section>
   </van-popup>
 </template>

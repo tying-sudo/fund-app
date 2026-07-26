@@ -18,14 +18,14 @@ import { formatMoney, formatPercent, getChangeStatus, getJdFundLink } from '@/ut
 import MarketIndexBoard from '@/components/MarketIndexBoard.vue'
 import DataSourceSelector from '@/components/DataSourceSelector.vue'
 import JdCookieImportDialog from '@/components/JdCookieImportDialog.vue'
-import { DATA_SOURCE_CONFIG, type DataSource, type FundInfo, type HoldingRecord, type FundShareClass, type FundFeeInfo, type PendingAdjustment, type SyncedAdjustment } from '@/types/fund'
+import { DATA_SOURCE_CONFIG, type DataSource, type FundInfo, type HoldingRecord, type FundShareClass, type FundFeeInfo, type JdHoldingSnapshot, type PendingAdjustment, type SyncedAdjustment } from '@/types/fund'
 
 import { getTodayStr, getValuationComparisonState, isEstimateDateToday, isTradingHours as isBeijingTradingHours, PRECISION, round } from '@/utils/holdingCalculator'
 import { getAdjustmentConfirmationAt, getSettlementNavStartDate } from '@/utils/tradingDate'
-import { deriveHoldingImportBasis, parseHoldingImportNumber } from '@/utils/holdingImport'
+import { buildJdHoldingSnapshot, deriveHoldingImportBasis, parseHoldingImportNumber } from '@/utils/holdingImport'
 import { openAlipayFundDetail } from '@/utils/alipayFund'
 import { openJdFundDetail } from '@/utils/jdFund'
-import { hasReachedJdConfirmationWindow, importJdHoldingsWithCookie, type JdSyncProgress } from '@/utils/jdHoldings'
+import { filterRecentJdAdjustments, hasReachedJdConfirmationWindow, importJdHoldingsWithCookie, isJdAdjustmentRecent, type JdHoldingItem, type JdSyncProgress } from '@/utils/jdHoldings'
 
 // 集成风控系统和日志模块
 import { getRiskController } from '@/utils/riskControl'
@@ -178,11 +178,11 @@ const filteredHoldings = computed(() => {
     list = [...list].sort((a, b) => {
       switch (selectedSort.value) {
         case 'profit':
-          return (b.profit || 0) - (a.profit || 0)
+          return (getHoldingProfit(b) || 0) - (getHoldingProfit(a) || 0)
         case 'profitRate':
-          return (b.profitRate || 0) - (a.profitRate || 0)
+          return (getHoldingProfitRate(b) || 0) - (getHoldingProfitRate(a) || 0)
         case 'amount':
-          return (b.amount || 0) - (a.amount || 0)
+          return getHoldingMarketAmount(b) - getHoldingMarketAmount(a)
         case 'todayProfit':
           return (b.todayProfit || 0) - (a.todayProfit || 0)
         case 'todayChange':
@@ -274,7 +274,8 @@ const currentPendingAdjustments = computed<PendingAdjustment[]>(() =>
 /** JD records are audit-only and never enter the pending settlement engine. */
 const currentSyncedAdjustments = computed<SyncedAdjustment[]>(() =>
   holdingStore.syncedAdjustments.filter(
-    (item: SyncedAdjustment) => item.code === tradeFundCode.value || (item.type === 'convert' && item.targetCode === tradeFundCode.value)
+    (item: SyncedAdjustment) => isJdAdjustmentRecent(item)
+      && (item.code === tradeFundCode.value || (item.type === 'convert' && item.targetCode === tradeFundCode.value))
   )
 )
 
@@ -672,17 +673,22 @@ function getSyncedTags(holding: any): { label: string; title: string; type: 'add
   const seen = new Set<string>()
   return holdingStore.syncedAdjustments
     .filter((item: SyncedAdjustment) => (item.code === holding.code || (item.type === 'convert' && item.targetCode === holding.code))
+      && isJdAdjustmentRecent(item)
       && !hasReachedJdConfirmationWindow(item, now))
     .flatMap((item: SyncedAdjustment) => {
       if (seen.has(item.type)) return []
       seen.add(item.type)
       return [{
-        label: item.type === 'add' ? '调仓·买入' : item.type === 'reduce' ? '调仓·卖出' : '调仓·转换',
+        label: getSyncedAdjustmentLabel(item),
         title: `${item.tradeTime || item.tradeDate} · ${item.status || '已同步'}`,
         type: item.type
       }]
     })
     .slice(0, 3)
+}
+
+function getSyncedAdjustmentLabel(item: SyncedAdjustment): string {
+  return item.type === 'add' ? '买入' : item.type === 'reduce' ? '卖出' : '转换'
 }
 
 function formatSyncedTradeTime(item: SyncedAdjustment): string {
@@ -775,8 +781,28 @@ const getDisplayRealChange = (holding: any) => {
 
 // 列表金额使用当前市值（而不是历史成本），与顶部账户资产口径一致。
 const getHoldingMarketValue = (holding: any) => {
-  const value = Number(holding.marketValue)
+  const value = getHoldingMarketAmount(holding)
   return Number.isFinite(value) && value > 0 ? formatMoney(value) : '--'
+}
+
+function getHoldingMarketAmount(holding: any): number {
+  const value = Number(getJdHoldingSnapshot(holding)?.amount ?? holding.marketValue)
+  return Number.isFinite(value) ? value : 0
+}
+
+function getJdHoldingSnapshot(holding: any): JdHoldingSnapshot | undefined {
+  const snapshot = holding?.jdSnapshot as JdHoldingSnapshot | undefined
+  return snapshot?.source === 'jd' && Number.isFinite(snapshot.amount) ? snapshot : undefined
+}
+
+function getHoldingProfit(holding: any): number | undefined {
+  const value = getJdHoldingSnapshot(holding)?.profit ?? holding.profit
+  return Number.isFinite(Number(value)) ? Number(value) : undefined
+}
+
+function getHoldingProfitRate(holding: any): number | undefined {
+  const value = getJdHoldingSnapshot(holding)?.profitRate ?? holding.profitRate
+  return Number.isFinite(Number(value)) ? Number(value) : undefined
 }
 
 // 最新收益使用当前估值/官方净值计算出的金额，不展示基金单位净值。
@@ -864,17 +890,21 @@ function handleEdit(code: string) {
   // 编辑默认使用金额模式：金额是当前市值，收益是相对成本的盈亏。
   // 用户仍可切换到按份额模式精确维护份额和成本单价。
   inputMode.value = 'amount'
-  const marketAmount = holding.marketValue ?? ((holding.amount || 0) + (holding.profit || 0))
-  
+  const jdSnapshot = getJdHoldingSnapshot(holding)
+  const marketAmount = jdSnapshot?.amount ?? holding.marketValue ?? ((holding.amount || 0) + (holding.profit || 0))
+  const holdingProfit = jdSnapshot?.profit ?? holding.profit
+  const holdingShares = jdSnapshot?.shares ?? holding.shares
+  const holdingCostPrice = jdSnapshot?.costPrice ?? holding.costPrice
+
   formData.value = {
     code: holding.code,
     name: holding.name,
     amount: marketAmount > 0 ? marketAmount.toFixed(2) : '',
-    profit: holding.profit !== undefined ? holding.profit.toString() : '',
-    shares: holding.shares ? holding.shares.toString() : '',
+    profit: holdingProfit !== undefined ? holdingProfit.toString() : '',
+    shares: holdingShares ? holdingShares.toString() : '',
     buyDate: holding.buyDate,
-    costPrice: holding.costPrice ? holding.costPrice.toString() : '',
-    costUnitPrice: holding.costUnitPrice ? holding.costUnitPrice.toString() : ''
+    costPrice: holdingCostPrice ? holdingCostPrice.toString() : '',
+    costUnitPrice: (jdSnapshot?.costPrice ?? holding.costUnitPrice) ? (jdSnapshot?.costPrice ?? holding.costUnitPrice).toString() : ''
   }
   currentNetValue.value = holding.currentValue || holding.costPrice || holding.costUnitPrice || holding.buyNetValue || currentNetValue.value
   selectedFund.value = { code: holding.code, name: holding.name, type: '', pinyin: '' }
@@ -1161,7 +1191,9 @@ async function submitForm() {
     // C类基金费用字段
     serviceFeeRate: shareClass.value === 'C' ? serviceFeeRate.value : undefined,
     serviceFeeDeducted: shareClass.value === 'C' ? 0 : undefined,
-    lastFeeDate: shareClass.value === 'C' ? formData.value.buyDate : undefined
+    lastFeeDate: shareClass.value === 'C' ? formData.value.buyDate : undefined,
+    // Manual changes become the source of truth until the user explicitly re-syncs JD.
+    jdSnapshot: undefined
   }
 
   // ========== 风控检查 ==========
@@ -1310,20 +1342,35 @@ const jdImportedAdjustments = ref<SyncedAdjustment[]>([])
 const jdSyncProgress = ref({ message: '正在打开京东金融...', percentage: 5 })
 
 function updateJdSyncProgress(progress: JdSyncProgress | { stage: string; message: string; current?: number; total?: number }) {
-  const basePercent: Record<string, number> = {
-    login: 10,
-    reading_holdings: 30,
-    reading_trades: 42,
-    normalizing: 78,
-    saving: 86,
-    refreshing: 94,
-    completed: 100
-  }
-  const pageBonus = progress.stage === 'reading_trades' ? Math.min(28, Math.max(0, (progress.current || 1) - 1) * 8) : 0
+  const ratio = progress.total && progress.total > 0
+    ? Math.min(1, Math.max(0, (progress.current || 0) / progress.total))
+    : 0
+  const percentage = progress.stage === 'reading_holdings'
+    ? 12 + Math.round(ratio * 43)
+    : progress.stage === 'reading_trades'
+      ? 55 + Math.round(ratio * 25)
+      : ({ login: 8, normalizing: 82, saving: 88, refreshing: 95, completed: 100 } as Record<string, number>)[progress.stage] || 8
   jdSyncProgress.value = {
     message: progress.message,
-    percentage: Math.min(100, (basePercent[progress.stage] || 10) + pageBonus)
+    percentage
   }
+}
+
+function jdImportErrorMessage(error: unknown): string {
+  const message = String((error as { message?: unknown })?.message || '').trim()
+  if (!message) return '京东持仓读取失败，请检查网络后重试'
+  // Capacitor may prefix a native rejection with a Java exception class. Keep
+  // the localized native reason visible instead of treating that prefix as an
+  // English-only failure and hiding the actionable message.
+  const chineseReason = message.match(/[\u3400-\u9fff][\s\S]*/)?.[0]?.trim()
+  if (chineseReason) return chineseReason
+  if (/[A-Za-z]/.test(message)) {
+    if (/(cookie|login|sign.?in|unauthorized|forbidden|expired)/i.test(message)) {
+      return '京东 Cookie 已过期或无效，请更新后重试'
+    }
+    return '京东持仓读取失败，请检查 Cookie 和网络后重试'
+  }
+  return message
 }
 
 // [NEW] 手动补全相关状态
@@ -1555,11 +1602,15 @@ async function importJdHoldings(cookie: string) {
   if (isJdImporting.value) return
   isJdImporting.value = true
   updateJdSyncProgress({ stage: 'reading_holdings', message: '正在读取京东当前持仓...' })
-  showLoadingToast({ message: '正在读取京东当前持仓...', forbidClick: true, duration: 0 })
   try {
-    const result = await importJdHoldingsWithCookie(cookie, { onProgress: updateJdSyncProgress })
+    const result = await importJdHoldingsWithCookie(cookie, {
+      background: true,
+      onProgress: updateJdSyncProgress
+    })
     const syncedAt = Date.now()
-    jdImportedAdjustments.value = result.adjustments.map((item) => ({
+    updateJdSyncProgress({ stage: 'saving', message: '正在写入京东当前持仓...' })
+    const importedHoldings = await saveJdCurrentHoldings(result.items, syncedAt)
+    jdImportedAdjustments.value = filterRecentJdAdjustments(result.adjustments).map((item) => ({
       ...item,
       source: 'jd' as const,
       name: item.name || holdingStore.getHoldingByCode(item.code)?.name || item.code,
@@ -1568,9 +1619,8 @@ async function importJdHoldings(cookie: string) {
       targetShares: parseHoldingImportNumber(item.targetShares) ?? undefined,
       syncedAt
     }))
-    if (!result.summary && jdImportedAdjustments.value.length === 0) {
-      closeToast()
-      showToast('京东账户暂无可同步的调仓或收益记录')
+    if (result.items.length === 0) {
+      showToast('京东账户未返回当前持仓')
       return
     }
 
@@ -1584,21 +1634,84 @@ async function importJdHoldings(cookie: string) {
         profitDate: result.summary.profitDate,
         syncedOn: getTodayStr(),
         syncedAt
-      } : undefined
+      } : undefined,
+      { replaceAdjustments: true }
     )
     updateJdSyncProgress({ stage: 'completed', message: '同步完成' })
-    closeToast()
+    // The import is durable at this point. Do not keep the progress popup open
+    // while estimate refreshes wait on unrelated fund-data providers.
+    isJdImporting.value = false
     const details = [
+      importedHoldings.added > 0 ? `新增 ${importedHoldings.added} 只持仓` : '',
+      importedHoldings.updated > 0 ? `校准 ${importedHoldings.updated} 只已有持仓` : '',
       `${synced.adjustments} 条本轮建仓调仓记录`,
-      synced.summary && result.summary ? `昨日收益 ${formatMoney(result.summary.yesterdayProfit)}` : ''
+      synced.summary && result.summary ? `昨日收益 ${formatMoney(result.summary.yesterdayProfit)}` : '',
+      result.tradeWarning || '',
+      importedHoldings.failed > 0 ? `${importedHoldings.failed} 只持仓写入失败` : ''
     ].filter(Boolean).join('，')
+    if (importedHoldings.added > 0) {
+      void holdingStore.refreshEstimates().catch((error) => {
+        console.error('[京东持仓] 后台刷新估值失败:', error)
+      })
+    }
     showToast(`同步完成：${details}`)
   } catch (error: any) {
-    showToast(error?.message || '京东持仓读取失败')
+    showToast(jdImportErrorMessage(error))
   } finally {
-    if (jdSyncProgress.value.percentage < 100) closeToast()
     isJdImporting.value = false
   }
+}
+
+function createJdHoldingRecord(item: JdHoldingItem, snapshot: JdHoldingSnapshot): HoldingRecord | null {
+  const buyDate = /^\d{4}-\d{2}-\d{2}$/.test(item.acquiredDate || '')
+    ? item.acquiredDate as string
+    : getTodayStr()
+  return {
+    code: item.code,
+    name: item.name,
+    type: '',
+    shareClass: detectShareClass(item.code, item.name),
+    amount: snapshot.costAmount,
+    buyNetValue: snapshot.costPrice,
+    shares: snapshot.shares,
+    costPrice: snapshot.costPrice,
+    costUnitPrice: snapshot.costPrice,
+    buyDate,
+    holdingDays: 0,
+    createdAt: Date.now(),
+    jdSnapshot: snapshot
+  }
+}
+
+async function saveJdCurrentHoldings(items: JdHoldingItem[], syncedAt: number): Promise<{ added: number; updated: number; failed: number }> {
+  let added = 0
+  let updated = 0
+  let failed = 0
+  for (const item of items) {
+    const snapshot = buildJdHoldingSnapshot(item, syncedAt)
+    if (!snapshot) {
+      failed++
+      continue
+    }
+    if (holdingStore.hasHolding(item.code)) {
+      if (await holdingStore.applyJdHoldingSnapshot(item.code, snapshot)) updated++
+      else failed++
+      continue
+    }
+    const record = createJdHoldingRecord(item, snapshot)
+    if (!record) {
+      failed++
+      continue
+    }
+    try {
+      await holdingStore.addHoldingDirect(record)
+      added++
+    } catch (error) {
+      failed++
+      console.error(`[京东持仓] ${item.code} 写入失败:`, error)
+    }
+  }
+  return { added, updated, failed }
 }
 
 // [WHAT] 文件转Base64工具函数
@@ -1871,10 +1984,21 @@ function closeImportDialog() {
       :closeable="false"
       :safe-area-inset-bottom="true"
     >
-      <van-loading size="28px" color="#1989fa" />
-      <div class="jd-sync-progress-title">京东 Cookie 读取</div>
-      <div class="jd-sync-progress-message">{{ jdSyncProgress.message }}</div>
-      <van-progress :percentage="jdSyncProgress.percentage" stroke-width="5" :show-pivot="false" />
+      <section class="jd-sync-progress-content" aria-live="polite">
+        <van-loading size="28px" color="#1989fa" />
+        <div class="jd-sync-progress-title">京东账户读取</div>
+        <div class="jd-sync-progress-message">{{ jdSyncProgress.message }}</div>
+        <div
+          class="jd-sync-progress-track"
+          role="progressbar"
+          aria-label="京东持仓读取进度"
+          aria-valuemin="0"
+          aria-valuemax="100"
+          :aria-valuenow="jdSyncProgress.percentage"
+        >
+          <span class="jd-sync-progress-fill" :style="{ width: `${jdSyncProgress.percentage}%` }"></span>
+        </div>
+      </section>
     </van-popup>
 
     <!-- 隐藏的文件输入 -->
@@ -2020,9 +2144,9 @@ function closeImportDialog() {
                 <div class="position-amount">{{ getHoldingMarketValue(holding) }}</div>
                 <div class="position-nav" :class="getChangeStatus(holding.todayProfit || 0)">{{ getLatestIncome(holding) }}</div>
               </div>
-              <div class="col-profit" :class="getChangeStatus(holding.profit || 0)">
-                <div class="profit-amount">{{ holding.profit !== undefined ? (holding.profit >= 0 ? '+' : '') + formatMoney(holding.profit) : '--' }}</div>
-                <div class="profit-rate">{{ holding.profitRate !== undefined ? formatPercent(holding.profitRate) : '--' }}</div>
+              <div class="col-profit" :class="getChangeStatus(getHoldingProfit(holding) || 0)">
+                <div class="profit-amount">{{ getHoldingProfit(holding) !== undefined ? (getHoldingProfit(holding)! >= 0 ? '+' : '') + formatMoney(getHoldingProfit(holding)!) : '--' }}</div>
+                <div class="profit-rate">{{ getHoldingProfitRate(holding) !== undefined ? formatPercent(getHoldingProfitRate(holding)!) : '--' }}</div>
               </div>
               <div class="col-today" :class="getChangeStatus(holding.todayProfit || 0)">
                 <span class="today-profit">{{ holding.todayProfit !== undefined ? (holding.todayProfit >= 0 ? '+' : '') + formatMoney(holding.todayProfit) : '--' }}</span>
@@ -2528,7 +2652,7 @@ function closeImportDialog() {
         <div class="synced-adjustments" v-if="currentSyncedAdjustments.length > 0">
           <div class="pending-title synced-title">
             <van-icon name="records-o" />
-            <span>京东已同步调仓（{{ currentSyncedAdjustments.length }}）</span>
+            <span>京东已同步调仓（最近5天 · {{ currentSyncedAdjustments.length }}）</span>
             <span class="pending-tip">仅记录，不修改持仓</span>
           </div>
           <div class="pending-list">
@@ -2536,7 +2660,7 @@ function closeImportDialog() {
               <div class="pending-info">
                 <div class="pending-row">
                   <span class="pending-type" :class="item.type">
-                    {{ item.type === 'add' ? '买入' : item.type === 'reduce' ? '卖出' : '转换' }}
+                    {{ getSyncedAdjustmentLabel(item) }}
                   </span>
                   <span class="pending-date">{{ formatSyncedTradeTime(item) }}</span>
                   <span v-if="item.status" class="synced-status">{{ item.status }}</span>
@@ -2776,27 +2900,59 @@ function closeImportDialog() {
 .jd-sync-progress {
   width: min(280px, calc(100vw - 48px));
   box-sizing: border-box;
-  padding: 24px;
+  overflow: hidden;
+  padding: 0;
   border-radius: 8px;
+}
+
+.jd-sync-progress-content {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr);
+  gap: 10px;
+  box-sizing: border-box;
+  width: 100%;
+  padding: 24px;
   text-align: center;
 }
 
 .jd-sync-progress :deep(.van-loading) {
-  margin: 0 auto 12px;
+  justify-self: center;
+  margin: 0;
 }
 
 .jd-sync-progress-title {
   color: var(--text-primary);
   font-size: 15px;
   font-weight: 600;
+  line-height: 22px;
 }
 
 .jd-sync-progress-message {
-  min-height: 20px;
-  margin: 8px 0 14px;
+  min-height: 40px;
+  margin: 0;
   color: var(--text-secondary);
   font-size: 12px;
   line-height: 20px;
+  overflow-wrap: anywhere;
+}
+
+.jd-sync-progress-track {
+  position: relative;
+  width: 100%;
+  height: 5px;
+  margin-top: 2px;
+  overflow: hidden;
+  background: var(--border-color, rgba(255, 255, 255, 0.18));
+  border-radius: 999px;
+}
+
+.jd-sync-progress-fill {
+  display: block;
+  height: 100%;
+  min-width: 2px;
+  background: #1989fa;
+  border-radius: inherit;
+  transition: width 180ms ease-out;
 }
 
 /* 与自选页 .top-header 对齐，避免在页面容器上重复叠加安全区。 */
@@ -3795,18 +3951,6 @@ function closeImportDialog() {
   width: 100%;
   display: block;
   object-fit: contain;
-}
-
-.jd-cookie-content {
-  display: grid;
-  gap: 14px;
-  padding: 18px 16px;
-}
-
-.jd-cookie-privacy {
-  color: var(--text-secondary);
-  font-size: 12px;
-  line-height: 1.6;
 }
 
 .ocr-processing {

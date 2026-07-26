@@ -232,6 +232,7 @@ Environment=NODE_ENV=production
 Environment=PORT=3000
 Environment=APP_DOWNLOAD_DIR=/opt/fund-downloads
 EnvironmentFile=-/etc/fund-proxy.env
+EnvironmentFile=-/etc/fund-proxy-redis.env
 EnvironmentFile=-/etc/fund-market-db.env
 ${supabaseAnonKey ? `Environment=SUPABASE_ANON_KEY=${supabaseAnonKey}` : ''}
 ExecStart=/usr/bin/node /opt/fund-proxy/server.mjs

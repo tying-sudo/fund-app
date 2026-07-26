@@ -356,3 +356,135 @@ Append material implementation and release milestones here. This log does not co
 ## 2026-07-25 - JD Roma detail WebView host correction
 
 - Corrected the published detail-page script gate from `*.jr.jd.com` to the verified JD HTTPS host set. The real rendered fund-detail page is `roma.jd.com`; the former gate prevented the expander and per-fund transaction-record bootstrap from running at all and caused a deterministic timeout for `018147`.
+
+## 2026-07-26 - JD Cookie importer removal and native login rebuild
+
+- Removed the saved Cookie text-box module from the holding and grid pages, including its native parameter entry point and the obsolete account-wide trade-list fallbacks. Any credential saved by that old UI is removed on the next native JD read.
+- Rebuilt `JdHoldingsPlugin` around one isolated path: interactive JD sign-in, current-holding detail APIs, the confirmed holding-detail expander selector, then that fund's transaction-record page. Only normalized holdings and decoded transaction rows return to the web layer; the session is cleared after completion or failure.
+- Local verification passed: JD holding tests 5/5, grid JD payload tests 4/4, `vue-tsc --noEmit`, Vite production build, Capacitor Android sync, `:app:compileDebugJavaWithJavac`, and `git diff --check`. No APK or production deployment was produced for this local refactor.
+- Built and installed the local debug APK on Android device `95e24ed` (`2509FPN0BC`) with `adb install -r`, preserving app data. The device reports `com.fundapp.realtime 1.0.91 (92)` after a successful cold launch; APK size is `6,961,544` bytes, SHA-256 is `951fa60b38a559c77ec4b3e7ee0d885f45630e3603cedfa4e97e459c6162f340`, and v1/v2 signatures verified.
+- Device evidence for `018147` confirmed that the holding expander and transaction-record entry work, and that the page reaches `没有更多记录了`. The completion detector now uses those verified transaction-page controls/content rather than relying only on the former `/wealth/tradeorder/list` URL path; this remains a local device fix pending a complete account sync.
+- Rebuilt and reinstalled the completion-detector fix on the same device at `2026-07-26 00:26:37`. `adb install -r` and cold launch succeeded; the local `1.0.91 (92)` debug APK SHA-256 is `ff3ba5a545e371c13872820cde120b3a6339edea461600c5c3910114b34d783e` with verified v1/v2 signatures.
+- A second device screenshot showed the previous detector still timing out because it ran in a detached background `WebView` while the authenticated JD page remained in the visible login `WebView`. The importer now reuses that visible, authenticated WebView for each serial fund-detail capture and injects the bridge on every JD document during the active capture.
+- At user request, restored the Cookie synchronization route to avoid repeated account/password and CAPTCHA login. The holding and grid entry points now save a user-supplied Cookie locally with an explicit clear control; native uses it only for JD holdings and the visible serial transaction reader, clears the native web session after each import, and does not expose the Cookie to the grid backend. Built, signed, and installed the local `1.0.91 (92)` debug APK at `2026-07-26 00:36:36`; SHA-256 `9707731c958cc81fe2ad6ba3d7276d1eac42679db7b49324b3f475141e067900`.
+
+## 2026-07-26 - JD Cookie grid date normalization
+
+- Fixed the grid Cookie-import path failing before its backend request with `Invalid time value`. JD transaction rows that omit the year (for example, `07-03 14:25:22`) are now normalized by Android to a valid Beijing-calendar date with a year-rollover check.
+- Added front-end calendar validation and a non-throwing confirmation-window guard. Malformed or impossible transaction dates cannot abort the current-holding snapshot import and are never sent to the grid API.
+- Passed local checks: JD holdings tests 7/7, JD grid payload tests 5/5, `vue-tsc --noEmit`, Vite production build, Capacitor Android sync, and Java 21 debug compilation/build.
+- Built, v1/v2 signature-verified, and installed local debug `1.0.92 (93)` onto Android device `95e24ed` (`2509FPN0BC`) at `2026-07-26 00:52:45 +08:00`, preserving app data. APK size: `6,803,284` bytes; SHA-256: `aa1f2188d09b94e86e660d88feaabb91ae08e1b6d3ea8a048d09e5413848e1e3`. Cold launch completed successfully.
+
+## 2026-07-26 - JD grid real opening-purchase capture
+
+- The Cookie sync result completed with zero captured transaction rows, causing all 12 current funds to be skipped for lack of a real current-cycle opening trade. The Android capture hook had filtered decoded JD responses by guessed URL words (`trade`, `record`, or `order`), while JD's current endpoint name did not satisfy that filter.
+- The capture hook now examines every decoded JSON response and retains a row only after the existing native trade-type, real-calendar-date, share, and current-holding-cycle checks. The grid keeps its chronological order, so each current cycle is opened by its first genuine buy date; it does not substitute the holding snapshot cost or the current date.
+- Added a frontend regression that asserts the first real buy remains the first grid adjustment. Local checks passed: JD grid tests 6/6, JD holding tests 7/7, `vue-tsc --noEmit`, Vite production build, Capacitor sync, and Android Java 21 compilation/build.
+- Built, v1/v2 signature-verified, and installed local debug `1.0.93 (94)` onto Android device `95e24ed` (`2509FPN0BC`) at `2026-07-26 01:06:52 +08:00`, preserving app data. APK size: `6,803,382` bytes; SHA-256: `b77290edf7d5266d461cfcedee54ef0777efea1ef9aff77a1e0b51fe919c8d4b`. Cold launch completed successfully. A real Cookie sync remains necessary to verify the account-specific first purchase returned by JD.
+
+## 2026-07-26 - Valuation-grid confidence-only scheduled sync
+
+- Replaced the production `valuation-grid-upstream` timer's source-tree merge with a strict one-file allowlist: only upstream `data/confidence_deviations.json` may be downloaded, JSON-validated, and atomically installed. It never updates `app.py`, `valuation/`, `grid/`, frontend files, position data, or any other upstream path.
+- The sync is again enabled every 15 minutes, but neither the timer nor its service restarts `valuation-grid`; a failed download or invalid JSON leaves the previous confidence file intact. This removes the import-time restart/source-conflict path while preserving confidence calibration updates.
+- Removed the frontend's 45-second JD grid-import abort at user request. The import request now remains active until the native reader and grid transaction complete or return their own error.
+- Remote verification with the dedicated ED25519 key: `valuation-grid-upstream.timer` is enabled and active; `valuation-grid` stayed active and `/health` returned `{"status":"ok"}`. The installed confidence file is 3,956,455 bytes with SHA-256 `145f74e3325906987f818310f16768900a2a23bf337a3950134174b1122a3b38`, matching the GitHub API raw response. The successful service log states that only the confidence file was updated and the grid was not restarted.
+- Built and installed local debug Android `1.0.94 (95)` onto device `95e24ed`, preserving app data. `npx cap sync android`, Gradle assembly, and v1/v2 signature checks passed. The APK is 6,953,343 bytes with SHA-256 `0aad22558b4abf6a8c4f155b25ab0a0dcffd99d1b351d67824aecbc4cb2c4311`; a cold launch confirmed the installed package and version.
+
+## 2026-07-26 - Grid historical NAV fallback and real trade-date repair
+
+- Fixed the grid historical-NAV reader when Eastmoney returns either `Data: null` or a `null` item in `LSJZList`. It now ignores invalid rows and falls back first to the local fund-data service.
+- The fund-data service now requests up to 2,000 records in 500-row pages and no longer treats a short database/disk cache as sufficient for a longer request. The grid release script deploys and validates the matching fund-proxy source with a dedicated backup before restart.
+- Added the published `pingzhongdata` full NAV series as a second fallback only when the requested range is still incomplete. Its timestamps are interpreted as Beijing calendar dates, so the confirmation NAV used for a JD order preserves the real trade date.
+- Regression checks passed: grid API 13/13, grid importer 6/6, JD grid 7/7, JD holding 7/7, fund-data service 16/16, `vue-tsc --noEmit`, Vite build, Capacitor sync, Python compilation, and `git diff --check`.
+- Published and installed Android `1.0.98 (99)` on device `95e24ed` (`2509FPN0BC`). APK v1/v2 signatures verified; size `6,803,395` bytes, SHA-256 `a29601a7e1c46cc6029c9fb8a033f87610c08b4fd75739f951cec721befd4b22`.
+- Public verification passed: `https://tyingfund.com/v1/fund/002052/nav-history?days=5` returned the latest official record `2026-07-24 / 2.292`; `days=1500` returned 1,500 records back to `2020-05-25`; `/api/app/version` reports `1.0.98 (99)`; and the public APK byte size and SHA-256 match the local build.
+
+## 2026-07-26 - Separate holding Cookie import recovery
+
+- Restored a direct, holding-page-only Cookie operation for the current JD holding snapshot. Its optional per-fund record read is isolated from the grid timeline and cannot make a valid current-holding result fail.
+- The holding page now owns `HoldingJdCookieImportDialog` and `fund-app:holding-jd-cookie:v1`; the grid keeps its existing dialog, saved Cookie key, and full-timeline native entry point.
+- Verification passed: JD holding tests, TypeScript checking, Vite build, Capacitor sync, Java 21 Android build, and APK v1/v2 signature verification.
+- Published backend-only Android `1.0.99 (100)`. Public `/api/app/version` reports `available=true`; the HTTPS APK is `6,806,194` bytes with SHA-256 `b7e16c1dea148d7e1ce52879f6ac862b892c086c63244a4a0f48f14efc3f20e2`, matching the signed local artifact. Rollback manifest: `/opt/fund-proxy/data/app-version.json.previous-20260725T193138`.
+
+## 2026-07-26 - Holding Cookie progress layout and parallel details
+
+- Rebuilt the holding Cookie progress dialog as a constrained single-column layout. Its title, wrapping status text, and full-width progress track now occupy separate rows on narrow Android screens.
+- The holding-only direct Cookie route now reads up to four current-fund detail endpoints concurrently, preserves JD's original holding order, and leaves the grid reader's serialized request path unchanged. Fund-detail WebView transaction navigation remains serialized because it shares an authenticated page session.
+- Verification passed: JD holding tests, TypeScript checking, Vite build, Capacitor sync, Java 21 Android build, and APK v1/v2 signature verification. Published backend-only Android `1.0.100 (101)`; public `/api/app/version` reports `available=true`, and the HTTPS APK is `6,807,920` bytes with SHA-256 `c6d7d83198561a9f46de40dd7d0116e8821a7a1f1feab199d5df7963d7d0c9da`, matching the local artifact. Rollback manifest: `/opt/fund-proxy/data/app-version.json.previous-20260725T194014`.
+
+## 2026-07-26 - Holding import overlay and language correction
+
+- Removed the duplicate Vant loading Toast that was opened under the holding Cookie progress popup. The popup now owns one CSS progress track and one status message, so no separate overlay can overlap it.
+- Native holding Cookie failures now return Chinese messages, and the web layer maps any remaining English native error to a Chinese Cookie/session or network explanation before displaying it.
+- Verification passed: JD holding tests, TypeScript checking, Vite build, Capacitor sync, Java 21 Android build, and APK v1/v2 signature verification. Published backend-only Android `1.0.101 (102)`.
+- Public verification passed: `/api/app/version` reports `1.0.101 (102)` with `available=true`; the HTTPS APK is `6,808,414` bytes with SHA-256 `85d2d41a1a54f94515b7a2bada655d1c6f8763f0ab56bcc998dec4e88fdd83ba`, matching the signed local artifact. Rollback manifest: `/opt/fund-proxy/data/app-version.json.previous-20260725T195441`.
+
+## 2026-07-26 - Holding account-level transaction import
+
+- The holding-only Cookie route now reads the current snapshot from JD's dedicated holdings APIs with four concurrent detail requests, then opens the same account-wide fund transaction page exposed by `昨日收益 -> 交易记录`. Its browser bridge captures JD's decoded buy, sell, and conversion records across the full account timeline instead of navigating through every fund detail page.
+- The holding snapshot is saved into the local holding list before audit records are persisted. After cleared App data, valid current JD positions therefore appear in the holding list even when the optional transaction page is unavailable; the UI reports that the trade audit can be retried. Grid Cookie import remains on its separate native operation and storage key.
+- The cost import now trusts current value minus reported holding profit before ambiguously labelled JD cost fields, and all native holding-entry progress/errors are Chinese.
+- Verification passed: JD holding tests 9/9, `vue-tsc --noEmit`, Vite build, Capacitor sync, Java 21 Android assembly, and APK v1/v2 signature verification. Published backend-only Android `1.0.102 (103)`.
+- Public verification passed: `/api/app/version` reports `available=true`, `1.0.102 (103)`, and the HTTPS APK is `6,960,908` bytes with SHA-256 `86eb1be5ad8d9eb844b9571ed8fc2f4a23bacd47c633e1916fd24fd633fd2142`, matching the signed local artifact. Rollback manifest: `/opt/fund-proxy/data/app-version.json.previous-20260725T204700`.
+
+## 2026-07-26 - Holding Cookie browser-session transport
+
+- Kept the holding-page manual Cookie input and its independent storage key. The page does not open an account-login screen, and the grid Cookie dialog, storage, and native import route remain unchanged.
+- Reworked the holding-only Java reader so the supplied Cookie is temporarily injected into an in-memory WebView and the fixed JD holding endpoints are called from that browser context. This retains browser origin/session behavior that a raw `HttpURLConnection` request can lack; the temporary WebView and Cookie jar are cleared after success or failure.
+- Current holding detail reads remain bounded to four concurrent requests. The account-wide browser transaction read still uses the same `昨日收益 -> 交易记录` entry and preserves buy, sell, and conversion audits separately from local position math.
+- Verification passed: JD holdings tests 9/9, `vue-tsc --noEmit`, `git diff --check`, Vite build, Capacitor sync, Java 21 Android assembly, and APK v1/v2 signature verification. Published backend-only Android `1.0.103 (104)`.
+- Public verification passed: `/api/app/version` reports `available=true`, `1.0.103 (104)`; the HTTPS APK is `6,813,627` bytes with SHA-256 `142972492d7d107aceaf5a047d22b7fc1664d16c432950ff153ca49f11270379`, matching the signed local artifact. Rollback manifest: `/opt/fund-proxy/data/app-version.json.previous-20260726T053051`. No Android device was attached for a live Cookie import after this implementation.
+
+## 2026-07-26 - Holding page reuses grid Cookie importer
+
+- Removed the holding page's separate Cookie dialog and `importHoldingCookieLegacy` frontend binding. The existing holding-page Cookie button now uses the same dialog, storage key, and `importHoldingsWithCookie` operation as the grid page.
+- The shared native operation accepts `background=true`. The holding page passes this flag so it reuses the grid request/pagination logic while keeping its own modal stage progress bar; no native page-polling window is shown. Grid imports retain their existing visual behavior.
+- Verification passed: JD holdings tests 9/9, `vue-tsc --noEmit`, `git diff --check`, Vite build, Capacitor sync, Java 21 Android assembly, and APK v1/v2 signature verification. Published backend-only Android `1.0.104 (105)`.
+- Public verification passed: `/api/app/version` reports `available=true`, `1.0.104 (105)`; the HTTPS APK is `6,812,973` bytes with SHA-256 `314abbbe452ad4587d69f25196ea75a5248920aaaf965cfea6025097d90c1cb9`, matching the signed local artifact. Rollback manifest: `/opt/fund-proxy/data/app-version.json.previous-20260726T054245`. No Android device was attached for a live Cookie import after this implementation.
+
+## 2026-07-26 - Holding Cookie importer final compatibility route
+
+- Redirected the deprecated native holding Cookie method to `importHoldingsWithCookie`, so an old cached holding bundle cannot invoke the former independent reader. The visible holding-page button continues to use the shared grid Cookie dialog and importer with `background=true`.
+- Verification passed: Vite build, Capacitor sync, Java 21 Android assembly, and APK v1/v2 signature verification. Published backend-only Android `1.0.105 (106)`.
+- Public verification passed: `/api/app/version` reports `available=true`, `1.0.105 (106)`; the HTTPS APK is `6,812,251` bytes with SHA-256 `55ede52991541a623c26ab95dcd835789d976dd543e7639c29f60b36f89c26f3`, matching the signed local artifact. Rollback manifest: `/opt/fund-proxy/data/app-version.json.previous-20260726T054659`. No Android device was attached for a live Cookie import after this implementation.
+
+## 2026-07-26 - Holding import completion and 12-way detail reads
+
+- The holding import popup now closes as soon as current holdings and JD audit data are stored. Fund-estimate refresh is deliberately detached into a background task, so a delayed valuation provider cannot leave the popup stuck on `同步完成`.
+- The shared Cookie importer's current-holding details now run through a bounded `min(12, holding count)` executor. Progress uses an atomic completed count, while future results are consumed in JD's original list order. Transaction-page reads remain serialized because they share one authenticated WebView session.
+- Verification passed: JD holdings tests 9/9, `vue-tsc --noEmit`, Vite build, Capacitor sync, Java 21 Android assembly, `git diff --check`, APK package version `1.0.106 (107)`, and APK v1/v2 signature verification.
+- Published backend-only Android `1.0.106 (107)`. Public `/api/app/version` reports `available=true`; the HTTPS APK is `6,812,435` bytes with SHA-256 `464b063308bd7c68747d82991ea52991f4d0c1fa6b6e079ee760776e7757a57b`, matching the downloaded artifact and release metadata. Rollback manifest: `/opt/fund-proxy/data/app-version.json.previous-20260726T060039`. No Android device was attached for a live Cookie import after this implementation.
+
+## 2026-07-26 - JD holding snapshot accuracy and bounded transaction history
+
+- Holding imports now retain JD's official current-position snapshot separately from local intraday valuation. Holding amount, holding profit, profit rate, shares, total cost, and unit cost use that snapshot after a Cookie sync; today's intraday income remains local valuation data. Sorting and the edit form use the same JD values, and a manual edit clears the snapshot until the next JD sync.
+- JD browser transaction capture is bounded to the latest 30 Beijing calendar days. Native account-page capture stops when it reaches that boundary, and a native date guard rejects older rows. Holding-page adjustment audit records still persist and display only the latest five Beijing calendar days; the grid receives the separate 30-day timeline.
+- Verification passed: JD holding tests 12/12, grid JD payload tests 7/7, holding settlement verification, `vue-tsc --noEmit`, Vite production build, Capacitor Android sync, Java 21 Android assembly, and `git diff --check`. APK package `com.fundapp.realtime` is `1.0.109 (110)` with valid v1/v2 signatures.
+- Published backend-only Android `1.0.109 (110)`. Public `/api/app/version` reports `available=true`; the HTTPS APK is `6,815,497` bytes with SHA-256 `b9e4a409fdac157e3723d864095e70eeb37d6a7dda8b4a558cfdafb61e56b9a0`, matching release metadata and the downloaded artifact. Rollback manifest: `/opt/fund-proxy/data/app-version.json.previous-20260726T062713`. No Android device was attached for a live Cookie import.
+
+## 2026-07-26 - Holding Cookie account-level transaction path enforcement
+
+- Fixed the active Cookie import dispatch: it had incorrectly entered the legacy `readPortfolio()` route, which opens a transaction record for each individual fund. Cookie imports now use the browser-originated `newna` holding APIs and then one account-wide JD transaction page reached from the holdings popup's `昨日收益 -> 交易记录` entry.
+- The ordinary session route now shares the same account-level transaction reader. The active transaction path captures account-level buy, sell, and conversion rows, stops at the 30-day Beijing-calendar boundary, and leaves the holding adjustment audit limited to five days.
+- Verification passed: JD holdings tests 12/12, grid JD payload tests 7/7, holding settlement verification, `vue-tsc --noEmit`, Vite production build, Capacitor Android sync, Java 21 Android assembly, APK package `com.fundapp.realtime 1.0.110 (111)`, v1/v2 signature checks, and `git diff --check`.
+- Published backend-only Android `1.0.110 (111)`. Public `/api/app/version` reports `available=true`; the HTTPS APK is `6,815,347` bytes with SHA-256 `82df474916467be032b93aa49b0bce28f43dbeee2511d8ed9a8996c8dee9158c`, matching release metadata and the downloaded artifact. Rollback manifest: `/opt/fund-proxy/data/app-version.json.previous-20260726T064321`. No Android device was attached for a live Cookie import.
+
+## 2026-07-26 - Holding Cookie browser bridge completion
+
+- Fixed the Cookie import stall at `正在读取京东当前持仓`: the `newna` browser request path now initializes the temporary JD WebView, registers `FundAppHoldingCookie`, seeds the supplied Cookie, and waits for the JD document before issuing holding requests. Any initialization or request failure now rejects the pending Capacitor call and closes the holding progress popup instead of leaving it at 12%.
+- Verification passed: JD holding tests 12/12, holding settlement verification, `vue-tsc --noEmit`, Vite production build, Capacitor Android sync, Java 21 Android assembly, APK package `com.fundapp.realtime 1.0.111 (112)`, and APK v1/v2 signature checks.
+- Published backend-only Android `1.0.111 (112)`. Public `/api/app/version` reports `available=true`; the independently downloaded HTTPS APK is `6,815,410` bytes with SHA-256 `eb223773c9733345f154ea1bb3a838f43b36469f9fbc80895909e01866807219`, matching release metadata and the signed local artifact. Rollback manifest: `/opt/fund-proxy/data/app-version.json.previous-20260726T065056`. No Android device was attached for a live Cookie import.
+
+## 2026-07-26 - Redis shared API cache
+
+- Added a Redis 8-backed, failure-tolerant shared response cache for stable fund-proxy reads: fund directory/profile, NAV history, daily returns, performance, holdings, estimate-source diagnostics, snapshots, rankings, and sector details. Query parameters are normalized so equivalent requests share one key. Intraday estimates, stock quotes, streams, health/version, and cache management remain uncached to preserve real-time behavior.
+- Redis configuration is isolated in `/etc/fund-proxy-redis.env` with root-only permissions and loaded by a systemd drop-in. The application reports Redis state in `/api/health` and `/api/cache-stats`; `/api/cache-refresh` clears both the legacy local cache and the Redis HTTP namespace. Redis connection failures fall back to the existing memory, disk, and PostgreSQL cache layers.
+- Verification passed: 42 Node server tests, syntax checks, deployed service health with Redis `PONG`, and container verification of 55 `fund-proxy:http:v1:*` keys. The source host showed a `redis-miss` followed by `redis-hit`; public `https://www.tyingfund.com/api/fund-list?q=000001&page=1&pageSize=1` returned HTTP 200 with `x-cache: redis-hit`.
+- Deployment rollback directory: `/opt/fund-proxy/.redis-cache-backup-20260726T071323`.
+
+## 2026-07-26 - Holding Cookie reads from the actual JD holding page
+
+- Live browser inspection confirmed that JD's current-holding panel is served from `https://roma.jd.com/fund/hold/list/pc/`, rather than the `jdjr.jd.com` root document. The native Cookie importer now prepares its `newna` browser request from that Roma holding page, so the request has the same source origin as the current JD web flow.
+- If the modern page transport is temporarily rejected, the holding importer falls back to the h5 snapshot reader used by the existing grid Cookie path. Native rejection messages now remain Chinese in the holding popup instead of being hidden by Capacitor's Java exception prefix.
+- Verification passed: JD holding tests 12/12, grid JD payload tests 7/7, holding settlement verification, `vue-tsc --noEmit`, Vite production build, Capacitor Android sync, Java 21 Android assembly, APK package `com.fundapp.realtime 1.0.112 (113)`, and APK v1/v2 signature checks.
+- Published backend-only Android `1.0.112 (113)`. Public `/api/app/version` reports `available=true`; the independently downloaded HTTPS APK is `6,815,703` bytes with SHA-256 `89d9fc93629684e08ef1dde57b881f2eee59bf53b966212b6f8f35e4ceaa762d`, matching release metadata and the signed local artifact. Rollback manifest: `/opt/fund-proxy/data/app-version.json.previous-20260726T070250`. No Android device was attached for a live Cookie import.

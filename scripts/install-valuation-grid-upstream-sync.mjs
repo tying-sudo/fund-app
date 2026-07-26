@@ -46,7 +46,7 @@ function exec(client, command) {
   })
 }
 
-const syncScript = String.raw`#!/usr/bin/env bash
+const legacySourceSyncScript = String.raw`#!/usr/bin/env bash
 set -eu -o pipefail
 
 readonly APP_ROOT=/opt/valuation-grid
@@ -436,8 +436,53 @@ if ! run_pending_release; then
 fi
 `.replaceAll('\\${', '${')
 
+// Scheduled synchronization deliberately has a one-file allowlist. Source
+// updates require an explicit reviewed release and may never restart the grid.
+const syncScript = String.raw`#!/usr/bin/env bash
+set -eu -o pipefail
+
+readonly APP_ROOT=/opt/valuation-grid
+readonly TARGET_FILE="\${APP_ROOT}/data/confidence_deviations.json"
+readonly UPSTREAM_FILE=https://api.github.com/repos/shangjinma-source/valuation_grid/contents/data/confidence_deviations.json
+readonly WORK_ROOT=/var/lib/valuation-grid-upstream-sync
+readonly LOG_TAG=valuation-grid-upstream-sync
+
+log() { logger -t "\${LOG_TAG}" -- "$*"; printf '%s\\n' "$*"; }
+mkdir -p "\${WORK_ROOT}"
+temporary_file=$(mktemp "\${WORK_ROOT}/confidence_deviations.XXXXXX")
+trap 'rm -f "\${temporary_file}"' EXIT
+
+if ! curl --location --fail --silent --show-error --connect-timeout 15 --max-time 60 \
+  -H 'Accept: application/vnd.github.raw+json' "\${UPSTREAM_FILE}" --output "\${temporary_file}"; then
+  log 'confidence source download failed; preserving the current file'
+  exit 1
+fi
+
+if ! "\${APP_ROOT}/.venv/bin/python" - "\${temporary_file}" <<'PY'
+import json
+import sys
+
+with open(sys.argv[1], encoding='utf-8') as handle:
+    value = json.load(handle)
+if not isinstance(value, dict):
+    raise SystemExit('confidence deviations must be a JSON object')
+PY
+then
+  log 'confidence source is invalid; preserving the current file'
+  exit 1
+fi
+
+if [ -f "\${TARGET_FILE}" ] && cmp -s "\${temporary_file}" "\${TARGET_FILE}"; then
+  log 'confidence source is unchanged'
+  exit 0
+fi
+
+install -o valuationgrid -g valuationgrid -m 0644 "\${temporary_file}" "\${TARGET_FILE}"
+log 'updated data/confidence_deviations.json only; valuation-grid was not restarted'
+`.replaceAll('\\${', '${')
+
 const serviceUnit = `[Unit]
-Description=Synchronize Valuation Grid upstream source
+Description=Synchronize Valuation Grid confidence deviations only
 After=network-online.target valuation-grid.service
 Wants=network-online.target
 
@@ -449,7 +494,7 @@ TimeoutStartSec=45min
 `
 
 const timerUnit = `[Unit]
-Description=Run Valuation Grid upstream sync every 15 minutes
+Description=Run Valuation Grid confidence sync every 15 minutes
 
 [Timer]
 OnBootSec=5min
@@ -465,19 +510,12 @@ const base64 = (value) => Buffer.from(value).toString('base64')
 const client = await connect()
 
 try {
-  await exec(client, `printf %s ${base64(aptMirrorScript)} | base64 -d | bash`)
   await exec(client, `printf %s ${base64(syncScript)} | base64 -d > /tmp/valuation-grid-upstream-sync && bash -n /tmp/valuation-grid-upstream-sync && install -o root -g root -m 0750 /tmp/valuation-grid-upstream-sync /usr/local/sbin/valuation-grid-upstream-sync && rm -f /tmp/valuation-grid-upstream-sync`)
   await exec(client, `printf %s ${base64(serviceUnit)} | base64 -d > /etc/systemd/system/valuation-grid-upstream.service`)
   await exec(client, `printf %s ${base64(timerUnit)} | base64 -d > /etc/systemd/system/valuation-grid-upstream.timer`)
-  await exec(client, 'rm -f /var/lib/valuation-grid-upstream-sync/disabled && systemctl daemon-reload && systemctl enable --now valuation-grid-upstream.timer')
-  let initialRun = 'Initial upstream sync completed.'
-  try {
-    await exec(client, 'systemctl start valuation-grid-upstream.service')
-  } catch {
-    initialRun = 'Initial upstream sync was deferred after a transient or upstream failure; the timer will retry.'
-  }
-  const status = await exec(client, 'test "$(systemctl is-enabled valuation-grid-upstream.timer)" = enabled; test "$(systemctl is-active valuation-grid-upstream.timer)" = active; test "$(systemctl is-active valuation-grid)" = active; curl --fail --silent --show-error --max-time 15 http://127.0.0.1:8000/health; systemctl status valuation-grid-upstream.service --no-pager -n 12 || true')
-  console.log(`${initialRun}\n${status.trim()}`)
+  await exec(client, 'systemctl daemon-reload && systemctl reset-failed valuation-grid-upstream.service || true; systemctl enable --now valuation-grid-upstream.timer')
+  const status = await exec(client, 'test "$(systemctl is-active valuation-grid)" = active; curl --fail --silent --show-error --max-time 15 http://127.0.0.1:8000/health; systemctl is-enabled valuation-grid-upstream.timer; systemctl is-active valuation-grid-upstream.timer; systemctl status valuation-grid-upstream.service --no-pager -n 12 || true')
+  console.log(`Installed valuation-grid confidence-only sync.\n${status.trim()}`)
 } finally {
   client.end()
 }

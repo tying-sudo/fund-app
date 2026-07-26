@@ -11,7 +11,7 @@
 
 import { defineStore } from 'pinia'
 import { ref, computed } from 'vue'
-import type { HoldingRecord, HoldingSummary, FundEstimate, JdSyncedSummary, PendingAdjustment, SyncedAdjustment } from '@/types/fund'
+import type { HoldingRecord, HoldingSummary, FundEstimate, JdHoldingSnapshot, JdSyncedSummary, PendingAdjustment, SyncedAdjustment } from '@/types/fund'
 import {
   getHoldings,
   upsertHolding as storageUpsertHolding,
@@ -280,13 +280,18 @@ export const useHoldingStore = defineStore('holding', () => {
     let yesterdayBaseValue = 0
 
     holdings.value.forEach((h) => {
-      if (h.marketValue !== undefined && h.marketValue > 0) {
+      const jdSnapshot = h.jdSnapshot
+      if (jdSnapshot && jdSnapshot.amount > 0) {
+        totalValue += jdSnapshot.amount
+      } else if (h.marketValue !== undefined && h.marketValue > 0) {
         totalValue += h.marketValue
       }
       // [FIX] 总成本与单基金计算保持一致：优先使用 holding.amount（精确成本），
       // 其次才用 shares × costPrice/costUnitPrice，避免四舍五入导致 0.01 级差异
       const costPrice = h.costPrice || h.costUnitPrice || h.buyNetValue || 0
-      if (h.amount > 0) {
+      if (jdSnapshot && jdSnapshot.costAmount > 0) {
+        totalCost += jdSnapshot.costAmount
+      } else if (h.amount > 0) {
         totalCost += h.amount
       } else if (h.shares && costPrice > 0) {
         totalCost += h.shares * costPrice
@@ -901,12 +906,38 @@ export const useHoldingStore = defineStore('holding', () => {
     })
   }
 
+  /** Apply JD's official snapshot and matching position basis to an existing local holding. */
+  async function applyJdHoldingSnapshot(code: string, snapshot: JdHoldingSnapshot): Promise<boolean> {
+    const index = holdings.value.findIndex((holding) => holding.code === code)
+    if (index < 0) return false
+    const current = holdings.value[index]
+    const record: HoldingRecord = {
+      ...current,
+      amount: snapshot.costAmount,
+      buyNetValue: snapshot.costPrice,
+      shares: snapshot.shares,
+      costPrice: snapshot.costPrice,
+      costUnitPrice: snapshot.costPrice,
+      jdSnapshot: snapshot
+    }
+    await queueWrite({
+      type: 'UPSERT',
+      code,
+      data: record,
+      timestamp: Date.now()
+    })
+    holdings.value[index] = { ...current, ...record }
+    return true
+  }
+
   /** Persist JD audit data without changing local position inputs or estimates. */
   async function syncJdData(
     adjustments: SyncedAdjustment[],
-    summary?: JdSyncedSummary
+    summary?: JdSyncedSummary,
+    options: { replaceAdjustments?: boolean } = {}
   ): Promise<{ adjustments: number; updatedAdjustments: number; summary: boolean }> {
-    const adjustmentsById = new Map(syncedAdjustments.value.map((item) => [item.id, item]))
+    const previousAdjustments = options.replaceAdjustments ? [] : syncedAdjustments.value
+    const adjustmentsById = new Map(previousAdjustments.map((item) => [item.id, item]))
     let adjustmentCount = 0
     for (const adjustment of adjustments) {
       const previous = adjustmentsById.get(adjustment.id)
@@ -915,10 +946,13 @@ export const useHoldingStore = defineStore('holding', () => {
         adjustmentCount++
       }
     }
-    if (adjustmentCount > 0) {
-      syncedAdjustments.value = [...adjustmentsById.values()]
-        .sort((left, right) => (right.tradeTime || right.tradeDate).localeCompare(left.tradeTime || left.tradeDate) || right.syncedAt - left.syncedAt)
-        .slice(0, 300)
+    const nextAdjustments = [...adjustmentsById.values()]
+      .sort((left, right) => (right.tradeTime || right.tradeDate).localeCompare(left.tradeTime || left.tradeDate) || right.syncedAt - left.syncedAt)
+      .slice(0, 300)
+    const didReplace = options.replaceAdjustments
+      && JSON.stringify(nextAdjustments) !== JSON.stringify(syncedAdjustments.value)
+    if (adjustmentCount > 0 || didReplace) {
+      syncedAdjustments.value = nextAdjustments
       saveJdSyncedAdjustments(syncedAdjustments.value)
     }
 
@@ -1231,6 +1265,7 @@ export const useHoldingStore = defineStore('holding', () => {
     refreshEstimates,
     addOrUpdateHolding,
     addHoldingDirect,
+    applyJdHoldingSnapshot,
     syncJdData,
     removeHolding,
     hasHolding,

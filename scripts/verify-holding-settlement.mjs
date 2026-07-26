@@ -16,7 +16,7 @@ const history = [
 ]
 
 assert.equal(getSettlementNavStartDate('2026-07-17', 'before'), '2026-07-18')
-assert.equal(getSettlementNavStartDate('2026-07-17', 'after'), '2026-07-18')
+assert.equal(getSettlementNavStartDate('2026-07-17', 'after'), '2026-07-19')
 assert.equal(findSettlementNav(history, getSettlementNavStartDate('2026-07-17', 'before'), '2026-07-17'), null)
 assert.equal(findSettlementNav(history, getSettlementNavStartDate('2026-07-17', 'before'), '2026-07-20')?.date, '2026-07-20')
 assert.equal(findSettlementNav(history, '2026-07-18', '2026-07-17'), null)

@@ -3,12 +3,17 @@ import test from 'node:test'
 
 import {
   filterJdCurrentPositionCycle,
+  filterRecentJdAdjustments,
+  filterRecentJdTransactions,
   hasReachedJdConfirmationWindow,
+  isJdAdjustmentRecent,
+  isValidJdTradeDate,
   normalizeJdCookie,
   normalizeJdImportResult,
   selectVerifiedJdCurrentTimeline,
   summarizeJdAccount
 } from './jdHoldings.ts'
+import { buildJdHoldingSnapshot, deriveJdHoldingImportBasis } from './holdingImport.ts'
 import { getSettlementNavStartDate } from './tradingDate.ts'
 
 test('accepts one Cookie header value and rejects header injection', () => {
@@ -61,6 +66,52 @@ test('normalizes current JD holdings and 30-day adjustment records', () => {
     targetName: undefined,
     targetShares: '80',
     status: '订单完成'
+  })
+})
+
+test('keeps a usable current-holding snapshot when the account trade page warns', () => {
+  const result = normalizeJdImportResult({
+    items: [{ code: '000001', name: '当前持仓', amount: '120.00', profit: '-8.00', shares: '100.00' }],
+    adjustments: [],
+    tradeWarning: '交易记录未完整读取，请稍后重新同步'
+  })
+
+  assert.equal(result.items.length, 1)
+  assert.equal(result.adjustments.length, 0)
+  assert.equal(result.tradeWarning, '交易记录未完整读取，请稍后重新同步')
+})
+
+test('uses JD market value and profit before an ambiguously labelled cost field', () => {
+  assert.deepEqual(deriveJdHoldingImportBasis({
+    amount: '200.00',
+    profit: '20.00',
+    shares: '100.00',
+    costAmount: '2.00',
+    costPrice: '2.00'
+  }), {
+    principal: 180,
+    shares: 100,
+    costPrice: 1.8
+  })
+})
+
+test('keeps JD official current-position amounts separate from local intraday valuation', () => {
+  assert.deepEqual(buildJdHoldingSnapshot({
+    amount: '9009.87',
+    profit: '-1453.77',
+    rate: '-13.89%',
+    shares: '3612.33',
+    costAmount: '10463.6400',
+    costPrice: '2.8966'
+  }, 1_784_600_000_000), {
+    source: 'jd',
+    amount: 9009.87,
+    profit: -1453.77,
+    profitRate: -13.89,
+    shares: 3612.33,
+    costAmount: 10463.64,
+    costPrice: 2.8966,
+    syncedAt: 1_784_600_000_000
   })
 })
 
@@ -121,4 +172,41 @@ test('uses JD confirmation windows for tag visibility and grid eligibility', () 
   assert.equal(hasReachedJdConfirmationWindow(completed, Date.parse('2026-07-24T09:00:00+08:00')), true)
   assert.equal(getSettlementNavStartDate('2026-07-24', 'before'), '2026-07-25')
   assert.equal(getSettlementNavStartDate('2026-07-24', 'after'), '2026-07-26')
+})
+
+test('does not treat malformed JD transaction dates as confirmed', () => {
+  const malformed = { id: 'malformed', code: '000001', type: 'add' as const, tradeDate: '07-03', status: '订单完成' }
+  const impossible = { ...malformed, id: 'impossible', tradeDate: '2026-02-31' }
+
+  assert.equal(isValidJdTradeDate(malformed.tradeDate), false)
+  assert.equal(isValidJdTradeDate(impossible.tradeDate), false)
+  assert.equal(hasReachedJdConfirmationWindow(malformed), false)
+  assert.equal(hasReachedJdConfirmationWindow(impossible), false)
+})
+
+test('keeps only the five most recent Beijing calendar days of JD adjustment records', () => {
+  const now = new Date('2026-07-26T14:00:00+08:00')
+  const adjustments = [
+    { id: 'old', code: '000001', type: 'add' as const, tradeDate: '2026-07-21' },
+    { id: 'first', code: '000001', type: 'reduce' as const, tradeDate: '2026-07-22' },
+    { id: 'today', code: '000001', type: 'convert' as const, tradeDate: '2026-07-26' },
+    { id: 'future', code: '000001', type: 'add' as const, tradeDate: '2026-07-27' }
+  ]
+
+  assert.equal(isJdAdjustmentRecent(adjustments[1], now), true)
+  assert.equal(isJdAdjustmentRecent(adjustments[0], now), false)
+  assert.deepEqual(filterRecentJdAdjustments(adjustments, now).map((item) => item.id), ['first', 'today'])
+})
+
+test('keeps thirty days of transaction capture while holding adjustments retain five days', () => {
+  const now = new Date('2026-07-26T14:00:00+08:00')
+  const transactions = [
+    { id: 'old', code: '000001', type: 'add' as const, tradeDate: '2026-06-26' },
+    { id: 'boundary', code: '000001', type: 'reduce' as const, tradeDate: '2026-06-27' },
+    { id: 'recent', code: '000001', type: 'convert' as const, tradeDate: '2026-07-22' },
+    { id: 'today', code: '000001', type: 'add' as const, tradeDate: '2026-07-26' }
+  ]
+
+  assert.deepEqual(filterRecentJdTransactions(transactions, now).map((item) => item.id), ['boundary', 'recent', 'today'])
+  assert.deepEqual(filterRecentJdAdjustments(transactions, now).map((item) => item.id), ['recent', 'today'])
 })

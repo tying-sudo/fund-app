@@ -955,7 +955,6 @@ function openJdGridCookieImport() {
 async function importJdGridTransactions(cookie: string) {
   if (jdImporting.value) return
   jdImporting.value = true
-  showLoadingToast({ message: '正在读取京东当前持仓...', forbidClick: true, duration: 0 })
   try {
     const jdResult = await importJdHoldingsWithCookie(cookie, {
       onProgress: (progress) => showLoadingToast({ message: progress.message, forbidClick: true, duration: 0 })

@@ -128,11 +128,11 @@ manifest.releaseNotes = [
   '调仓标签按京东确认窗口自动消失：15点前次日12点、15点后次日15点；后者收益从再下一交易日计算'
 ]
 
-manifest.title = '京东交易时间线确权导入'
+manifest.title = '京东交易金额时间确认净值导入'
 manifest.releaseNotes = [
-  '使用京东当前持有份额倒序核对真实买入、卖出与转换时间线，只有完整匹配的当前建仓周期才导入网格',
-  '交易字段缺失、份额不匹配或当前周期未完整返回时整只基金不会写入，避免部分批次改变网格信号',
-  'JD 详情模板缺少成本展示字段时仍保留真实当前份额；手工批次不会被京东同步覆盖'
+  '修复网格历史净值遇到上游空数据时返回空曲线的问题，自动回退到持仓净值服务',
+  '历史净值按 500 条分页补全，旧买入记录可从公开完整净值序列取得确认日净值并推算份额',
+  '完整导入京东交易记录页的买入、卖出和转换，后端继续核对当前持仓与完整时间线'
 ]
 
 const privateKey = privateKeyPath ? await readFile(privateKeyPath) : null
@@ -141,6 +141,8 @@ try {
   const sftp = await sftpFor(client)
   const gridFiles = ['app.py', 'positions.py', 'valuation/providers.py']
   const gridBackup = `${gridRemote}/.jd-import-backup-${releaseStamp}`
+  const proxyFiles = ['server.mjs', 'fund-data-service.mjs']
+  const proxyBackup = `${proxyRoot}/.history-nav-backup-${releaseStamp}`
   await exec(client, `install -d -m 0755 ${gridBackup}`)
   for (const file of gridFiles) {
     const backupFile = `${gridBackup}/${file}`
@@ -158,6 +160,21 @@ try {
     throw error
   }
 
+  await exec(client, `install -d -m 0755 ${proxyBackup}`)
+  for (const file of proxyFiles) {
+    await exec(client, `cp -p ${proxyRoot}/${file} ${proxyBackup}/${file}`)
+    await upload(sftp, join(root, 'server', file), `${proxyRoot}/${file}.uploading`)
+    await exec(client, `mv ${proxyRoot}/${file}.uploading ${proxyRoot}/${file}`)
+  }
+  try {
+    await exec(client, `cd ${proxyRoot} && node --check server.mjs && node --check fund-data-service.mjs && systemctl restart fund-proxy`)
+    await waitForHealth(client, 'curl --fail --silent --show-error http://127.0.0.1:3000/api/health >/dev/null')
+  } catch (error) {
+    for (const file of proxyFiles) await exec(client, `cp -p ${proxyBackup}/${file} ${proxyRoot}/${file}`)
+    await exec(client, 'systemctl restart fund-proxy').catch(() => {})
+    throw error
+  }
+
   await exec(client, `rm -rf ${webNext}; install -d -m 0755 ${webNext}`)
   const webFiles = await collect(join(root, 'dist'))
   const webDirs = [...new Set(webFiles.map((file) => dirname(relative(join(root, 'dist'), file))))]
@@ -172,7 +189,7 @@ try {
   await exec(client, `cp -p ${proxyRoot}/data/app-version.json ${proxyRoot}/data/app-version.json.previous-${releaseStamp} && mv ${remoteApk}.uploading ${remoteApk} && ln -sfn ${apkName} ${downloadRoot}/fund-app-latest.apk && printf %s ${base64(JSON.stringify(manifest))} | base64 -d > ${proxyRoot}/data/app-version.json && chown -R fundproxy:fundproxy ${webNext} ${downloadRoot} ${proxyRoot}/data && chmod -R a+rX ${downloadRoot}`)
   await exec(client, `if [ -d ${webRoot} ]; then mv ${webRoot} ${webPrevious}; fi; mv ${webNext} ${webRoot}`)
   await exec(client, `curl --fail --silent --show-error http://127.0.0.1:8000/v1/health >/dev/null && curl --fail --silent --show-error http://127.0.0.1/api/app/version >/dev/null && curl --fail --silent --show-error --head http://127.0.0.1/downloads/fund-app-latest.apk >/dev/null`)
-  console.log(JSON.stringify({ success: true, version, versionCode, apkName, sha256: manifest.sha256, sizeBytes: manifest.sizeBytes, webPrevious, gridBackup }))
+  console.log(JSON.stringify({ success: true, version, versionCode, apkName, sha256: manifest.sha256, sizeBytes: manifest.sizeBytes, webPrevious, gridBackup, proxyBackup }))
 } finally {
   client.end()
 }

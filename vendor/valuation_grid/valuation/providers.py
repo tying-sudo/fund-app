@@ -6,7 +6,7 @@ providers.py - 持仓抓取 + 行情拉取（含缓存/超时/批量）
 import json
 import time
 import re
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from urllib.request import urlopen, Request, install_opener, build_opener, ProxyHandler
 from urllib.error import URLError, HTTPError
@@ -875,6 +875,82 @@ _NAV_HISTORY_TTL = 3600  # 1小时缓存
 _NAV_HISTORY_ERROR_TTL = 60  # 失败结果短缓存，避免同一批请求立即重复轰炸上游
 _NAV_HISTORY_FETCH_SIZE = 30
 _NAV_HISTORY_PAGE_SIZE = 500
+_BEIJING_TZ = timezone(timedelta(hours=8))
+
+
+def _get_fund_proxy_nav_history(fund_code: str, days: int) -> list:
+    """Use the local fund-data service when Eastmoney rejects grid traffic."""
+    try:
+        limit = min(max(1, days), 2000)
+        req = Request(
+            f"http://127.0.0.1:3000/api/funds/{fund_code}/nav-history?limit={limit}",
+            headers={"Accept": "application/json"},
+        )
+        with urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            payload = json.loads(resp.read().decode("utf-8"))
+        items = payload.get("data", {}).get("items", [])
+        if not isinstance(items, list):
+            return []
+        result = []
+        for item in items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                nav = float(item.get("nav"))
+            except (TypeError, ValueError):
+                continue
+            if nav <= 0:
+                continue
+            try:
+                change = float(item.get("changePercent"))
+            except (TypeError, ValueError):
+                change = None
+            result.append({"date": str(item.get("date", "")), "nav": nav, "change": change})
+        return result
+    except Exception:
+        return []
+
+
+def _get_pingzhong_nav_history(fund_code: str, days: int) -> list:
+    """Read the published full NAV series when the paginated F10 feed is incomplete."""
+    try:
+        req = Request(
+            f"https://fund.eastmoney.com/pingzhongdata/{fund_code}.js",
+            headers={
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                "Referer": f"https://fund.eastmoney.com/{fund_code}.html",
+            },
+        )
+        with urlopen(req, timeout=REQUEST_TIMEOUT) as resp:
+            content = resp.read().decode("utf-8")
+        match = re.search(r"var\s+Data_netWorthTrend\s*=\s*(\[[\s\S]*?\]);", content)
+        if not match:
+            return []
+        raw_items = json.loads(match.group(1))
+        result = []
+        for item in raw_items:
+            if not isinstance(item, dict):
+                continue
+            try:
+                timestamp = float(item.get("x")) / 1000
+                nav = float(item.get("y"))
+            except (TypeError, ValueError):
+                continue
+            if nav <= 0:
+                continue
+            try:
+                change = float(item.get("equityReturn"))
+            except (TypeError, ValueError):
+                change = None
+            result.append({
+                "date": datetime.fromtimestamp(timestamp, _BEIJING_TZ).strftime("%Y-%m-%d"),
+                "nav": nav,
+                "change": change,
+            })
+        result.sort(key=lambda item: item["date"], reverse=True)
+        return result[:days]
+    except Exception:
+        return []
 
 
 def get_fund_nav_history(fund_code: str, days: int = 15) -> list:
@@ -925,10 +1001,15 @@ def get_fund_nav_history(fund_code: str, days: int = 15) -> list:
                 content = resp.read().decode("utf-8")
 
             data = json.loads(content)
-            items = data.get("Data", {}).get("LSJZList", [])
+            payload = data.get("Data") if isinstance(data, dict) else None
+            items = payload.get("LSJZList", []) if isinstance(payload, dict) else []
             if not items:
                 break
             for item in items:
+                # Eastmoney occasionally appends null placeholders. One bad
+                # entry must not discard the valid historical NAV page.
+                if not isinstance(item, dict):
+                    continue
                 date_str = item.get("FSRQ", "")
                 nav_str = item.get("DWJZ", "")
                 change_str = item.get("JZZZL", "")
@@ -950,6 +1031,15 @@ def get_fund_nav_history(fund_code: str, days: int = 15) -> list:
                 })
             if len(items) < _NAV_HISTORY_PAGE_SIZE:
                 break
+
+        if len(result) < fetch_size:
+            proxy_result = _get_fund_proxy_nav_history(fund_code, fetch_size)
+            if len(proxy_result) > len(result):
+                result = proxy_result
+        if len(result) < fetch_size:
+            pingzhong_result = _get_pingzhong_nav_history(fund_code, fetch_size)
+            if len(pingzhong_result) > len(result):
+                result = pingzhong_result
 
         # 写入缓存
         _nav_history_cache[cache_key] = {

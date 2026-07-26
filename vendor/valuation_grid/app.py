@@ -487,8 +487,9 @@ def _jd_positive_number(value) -> Optional[float]:
     return number if number > 0 else None
 
 
-def _jd_nav_on_date(code: str, trade_date: str, cache: dict) -> Optional[float]:
-    cache_key = (code, trade_date)
+def _jd_nav_on_date(code: str, trade_date: str, trade_time: Optional[str], cache: dict) -> Optional[float]:
+    """Resolve the published confirmation NAV from the JD order timestamp."""
+    cache_key = (code, trade_date, trade_time or "")
     if cache_key in cache:
         return cache[cache_key]
     try:
@@ -499,11 +500,18 @@ def _jd_nav_on_date(code: str, trade_date: str, cache: dict) -> Optional[float]:
         # at a decade of published history used by the JD transaction reader.
         history_days = min(3000, max(90, calendar_days * 5 // 7 + 90))
         history = get_fund_nav_history(code, history_days)
-        nav = next((
-            _jd_positive_number(item.get("nav"))
+        nav_by_date = {
+            item.get("date"): _jd_positive_number(item.get("nav"))
             for item in history
-            if item.get("date") == trade_date and _jd_positive_number(item.get("nav"))
-        ), None)
+            if isinstance(item, dict) and item.get("date") and _jd_positive_number(item.get("nav"))
+        }
+        order_time = str(trade_time or "").rsplit(" ", 1)[-1]
+        before_cutoff = not re.match(r"^(?:1[5-9]|2[0-3]):", order_time)
+        available_dates = sorted(nav_by_date)
+        confirmation_date = trade_date if before_cutoff and trade_date in nav_by_date else next(
+            (item for item in available_dates if item > trade_date), ""
+        )
+        nav = nav_by_date.get(confirmation_date)
     except Exception:
         nav = None
     cache[cache_key] = nav
@@ -515,16 +523,17 @@ def _jd_import_leg(ledger_id: str, code: str, action: str, trade_date: str,
                    nav_cache: dict, note: str, name: str = "") -> Optional[dict]:
     shares = _jd_positive_number(shares_value)
     amount = _jd_positive_number(amount_value)
-    nav = amount / shares if amount and shares else _jd_nav_on_date(code, trade_date, nav_cache)
+    nav = _jd_nav_on_date(code, trade_date, trade_time, nav_cache)
     if action == "buy":
         if not amount and shares and nav:
             amount = shares * nav
         if not amount or not nav:
             return None
+        shares = amount / nav
     elif not shares:
         if amount and nav:
             shares = amount / nav
-        if not shares:
+        if not shares or not nav:
             return None
     return {
         "ledger_id": ledger_id,
@@ -626,7 +635,7 @@ def import_jd_positions(req: JdGridImportRequest):
             source_amount = _jd_positive_number(adjustment.amount)
             if not source_amount:
                 source_shares = _jd_positive_number(adjustment.shares)
-                source_nav = _jd_nav_on_date(code, trade_date, nav_cache)
+                source_nav = _jd_nav_on_date(code, trade_date, adjustment.tradeTime, nav_cache)
                 source_amount = source_shares * source_nav if source_shares and source_nav else None
             target_leg = _jd_import_leg(f"jd:{adjustment.id}:target", target_code, "buy", trade_date, adjustment.tradeTime,
                                         adjustment.targetShares, source_amount, nav_cache, "京东导入·转换转入")

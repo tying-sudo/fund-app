@@ -54,3 +54,39 @@ test('keeps the explicit JD holding cost when it is present', () => {
 
   assert.equal(payload.current_holdings[0].costAmount, '1050')
 })
+
+test('keeps malformed JD dates from aborting or reaching the grid importer', () => {
+  const payload = buildGridJdImportPayload(
+    [{ code: '000001', name: 'Current', shares: '100' }],
+    [{ id: 'malformed', code: '000001', type: 'add', tradeDate: '07-03', shares: '100', status: '订单完成' }]
+  )
+
+  assert.deepEqual(payload.adjustments, [])
+  assert.deepEqual(payload.current_holding_codes, ['000001'])
+})
+
+test('keeps amount-only buy, sell, and conversion records for backend NAV confirmation', () => {
+  const payload = buildGridJdImportPayload(
+    [{ code: '000001', name: 'Current', shares: '100' }],
+    [
+      { id: 'buy', code: '000001', type: 'add', tradeDate: '2026-07-20', amount: '120', status: '订单完成' },
+      { id: 'sell', code: '000001', type: 'reduce', tradeDate: '2026-07-21', amount: '60', status: '订单完成' },
+      { id: 'convert', code: '000001', type: 'convert', tradeDate: '2026-07-22', amount: '30', status: '订单完成', targetCode: '000002' }
+    ]
+  )
+
+  assert.deepEqual(payload.adjustments.map((item) => item.id), ['buy', 'sell', 'convert'])
+})
+
+test('uses the first real purchase in the current cycle as the grid opening check', () => {
+  const payload = buildGridJdImportPayload(
+    [{ code: '000001', name: 'Current', shares: '60' }],
+    [
+      { id: 'first-buy', code: '000001', type: 'add', tradeDate: '2024-01-02', shares: '10', amount: '10' },
+      { id: 'second-buy', code: '000001', type: 'add', tradeDate: '2025-07-03', shares: '50', amount: '50' }
+    ]
+  )
+
+  assert.deepEqual(payload.adjustments.map((item) => item.id), ['first-buy', 'second-buy'])
+  assert.equal(payload.adjustments[0].tradeDate, '2024-01-02')
+})

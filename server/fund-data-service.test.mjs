@@ -73,6 +73,16 @@ test('normalizes Eastmoney NAV history', () => {
   })
 })
 
+test('ignores null entries and an empty Eastmoney history payload', () => {
+  const items = parseFundHistoryPayload({ Data: { LSJZList: [null, {
+    FSRQ: '2026-07-17', DWJZ: '1.2345'
+  }] } }, '000001')
+
+  assert.equal(items.length, 1)
+  assert.equal(items[0].nav, 1.2345)
+  assert.deepEqual(parseFundHistoryPayload({ Data: null }, '000001'), [])
+})
+
 test('keeps the prior NAV return stable until Beijing midnight', () => {
   const items = [
     { date: '2026-07-22', nav: 1.03, changePercent: 2.00 },
