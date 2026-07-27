@@ -7,6 +7,7 @@ import {
   getHongKongMarketState,
   getUsMarketState,
   shouldFetchFundgzEstimate,
+  shouldPollEastmoneyOfficialNav,
   findRelatedFundsFromConstituentHoldings,
   buildConstituentFundMatches,
   isSnapshotFreshEnoughForTrading,
@@ -78,6 +79,14 @@ test('keeps reading final same-day fund estimates after the close', () => {
   assert.equal(shouldFetchFundgzEstimate(getBeijingMarketState(new Date('2026-07-20T07:55:00Z'))), true)
   assert.equal(shouldFetchFundgzEstimate(getBeijingMarketState(new Date('2026-07-20T12:01:00Z'))), false)
   assert.equal(shouldFetchFundgzEstimate(getBeijingMarketState(new Date('2026-07-19T07:55:00Z'))), false)
+})
+
+test('polls Eastmoney official NAV only in the weekday post-close disclosure window', () => {
+  assert.equal(shouldPollEastmoneyOfficialNav(getBeijingMarketState(new Date('2026-07-20T06:59:00Z'))), false)
+  assert.equal(shouldPollEastmoneyOfficialNav(getBeijingMarketState(new Date('2026-07-20T07:00:00Z'))), true)
+  assert.equal(shouldPollEastmoneyOfficialNav(getBeijingMarketState(new Date('2026-07-20T11:59:00Z'))), true)
+  assert.equal(shouldPollEastmoneyOfficialNav(getBeijingMarketState(new Date('2026-07-20T12:00:00Z'))), false)
+  assert.equal(shouldPollEastmoneyOfficialNav(getBeijingMarketState(new Date('2026-07-19T07:30:00Z'))), false)
 })
 
 test('keeps the same-day estimate active through the mainland lunch recess', () => {

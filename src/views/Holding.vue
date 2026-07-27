@@ -16,9 +16,8 @@ import { API_BASE_URL } from '@/config/api'
 import { showConfirmDialog, showToast, showLoadingToast, closeToast, showDialog } from 'vant'
 import { formatMoney, formatPercent, getChangeStatus, getJdFundLink } from '@/utils/format'
 import MarketIndexBoard from '@/components/MarketIndexBoard.vue'
-import DataSourceSelector from '@/components/DataSourceSelector.vue'
 import JdCookieImportDialog from '@/components/JdCookieImportDialog.vue'
-import { DATA_SOURCE_CONFIG, type DataSource, type FundInfo, type HoldingRecord, type FundShareClass, type FundFeeInfo, type JdHoldingSnapshot, type PendingAdjustment, type SyncedAdjustment } from '@/types/fund'
+import { type FundInfo, type HoldingRecord, type FundShareClass, type FundFeeInfo, type JdHoldingSnapshot, type PendingAdjustment, type SyncedAdjustment } from '@/types/fund'
 
 import { getTodayStr, getValuationComparisonState, isEstimateDateToday, isTradingHours as isBeijingTradingHours, PRECISION, round } from '@/utils/holdingCalculator'
 import { getAdjustmentConfirmationAt, getSettlementNavStartDate } from '@/utils/tradingDate'
@@ -40,35 +39,11 @@ let autoRefreshTimer: ReturnType<typeof setTimeout> | null = null
 let autoRefreshActive = false
 const confirmationClock = ref(Date.now())
 let confirmationClockTimer: ReturnType<typeof setInterval> | null = null
-const showDataSourceSelector = ref(false)
-const dataSourceTargetCode = ref('')
-const dataSourceTargetName = ref('')
 const jdTradeActions: ReadonlyArray<{ value: JdFundTradeAction, label: string }> = [
   { value: 'buy', label: '买入' },
   { value: 'sell', label: '卖出' },
   { value: 'convert', label: '转换' }
 ]
-
-function openDataSourceSelector(code: string, name: string) {
-  dataSourceTargetCode.value = code
-  dataSourceTargetName.value = name
-  showDataSourceSelector.value = true
-}
-
-async function applyHoldingDataSource(source: DataSource) {
-  const code = dataSourceTargetCode.value
-  if (!code) return
-  showLoadingToast({ message: `正在切换至${DATA_SOURCE_CONFIG[source].name}...`, forbidClick: true, duration: 0 })
-  try {
-    await fundStore.setFundDataSource(code, source)
-    await holdingStore.refreshEstimates()
-    closeToast()
-    showToast(`持仓估值已切换至${DATA_SOURCE_CONFIG[source].name}`)
-  } catch (error) {
-    closeToast()
-    showToast(error instanceof Error ? error.message : '估值来源切换失败')
-  }
-}
 
 function scheduleAutoRefresh() {
   if (autoRefreshTimer) clearTimeout(autoRefreshTimer)
@@ -1975,12 +1950,6 @@ function closeImportDialog() {
 
 <template>
   <div class="holding-page">
-    <DataSourceSelector
-      v-model:show="showDataSourceSelector"
-      :fund-code="dataSourceTargetCode"
-      :fund-name="dataSourceTargetName"
-      @select="applyHoldingDataSource"
-    />
     <JdCookieImportDialog v-model:show="showJdCookieDialog" title="京东 Cookie 读取" @confirm="importJdHoldings" />
     <van-popup
       :show="isJdImporting"
@@ -2142,8 +2111,8 @@ function closeImportDialog() {
                   >{{ action.label }}</a>
                 </div>
                 <div class="valuation-diff-row">
-                  <button type="button" class="estimate-source-button estimate-source-inline-button" title="切换估值来源" @click.stop="openDataSourceSelector(holding.code, holding.name)">估 <van-icon name="arrow-down" /></button>
                   <template v-if="hasDiffData(holding)">
+                    <span class="diff-label">估值</span>
                     <span :class="['diff-value', getEstimateChangeClass(holding)]">{{ getDisplayEstimateChange(holding) }}</span>
                     <span class="diff-separator">|</span>
                     <span class="diff-label">{{ getRealChangeLabel(holding) }}</span>
@@ -3304,9 +3273,9 @@ function closeImportDialog() {
 }
 
 .valuation-action-row {
-  justify-content: center;
-  gap: 8px;
-  padding-left: 8px;
+  justify-content: flex-start;
+  gap: 6px;
+  padding-left: 0;
 }
 
 .valuation-diff-row {
@@ -3315,15 +3284,15 @@ function closeImportDialog() {
 
 .jd-trade-link {
   display: inline-flex;
-  flex: 0 0 42px;
+  flex: 0 0 38px;
   box-sizing: border-box;
-  min-height: 26px;
+  min-height: 24px;
   align-items: center;
   justify-content: center;
-  padding: 0 7px;
+  padding: 0 5px;
   border-radius: 4px;
   font-family: inherit;
-  font-size: calc(var(--holding-fund-name-size, 14px) - 2px);
+  font-size: calc(var(--holding-fund-name-size, 14px) - 3px);
   font-weight: 600;
   line-height: 1;
   text-decoration: none;
@@ -3351,30 +3320,6 @@ function closeImportDialog() {
 .diff-label {
   color: var(--text-secondary);
   font-size: 10px;
-}
-
-.estimate-source-button {
-  display: inline-flex;
-  flex: 0 0 auto;
-  align-items: center;
-  gap: 1px;
-  min-height: 20px;
-  padding: 0 5px;
-  color: #1d8eb6;
-  font-size: 11px;
-  line-height: 18px;
-  background: color-mix(in srgb, #1d8eb6 9%, transparent);
-  border: 1px solid color-mix(in srgb, #1d8eb6 62%, transparent);
-  border-radius: 4px;
-}
-
-.estimate-source-button :deep(.van-icon) { font-size: 10px; }
-
-.estimate-source-inline-button {
-  min-height: 18px;
-  padding: 0 3px;
-  font-size: 10px;
-  line-height: 16px;
 }
 
 .diff-value {

@@ -12,6 +12,7 @@ import {
   parseFundHoldingPeriodsHtml,
   parseSinaEstimatePayload,
   selectFundDailyReturns,
+  snapshotToEastmoneyOfficialNav,
   selectVerifiedOverseasMarket
 } from './fund-data-service.mjs'
 import { getFundEstimateMarketState } from './cache.mjs'
@@ -197,6 +198,24 @@ test('normalizes both Sina estimate variants', () => {
   assert.equal(parsed.sina_ds2.gsz, '1.3182')
   assert.equal(parsed.sina_ds2.gszzl, '-6.04')
   assert.equal(parsed.sina_ds3.gszzl, '-5.40')
+})
+
+test('uses the Eastmoney full-market snapshot as the official NAV contract', () => {
+  const source = snapshotToEastmoneyOfficialNav({
+    name: 'Test Fund',
+    type: 'Mixed',
+    nav: 1.398,
+    previousNav: 1.372,
+    changePercent: 1.9,
+    navDate: '2026-07-27',
+    previousNavDate: '2026-07-24'
+  }, '000001')
+
+  assert.deepEqual(source, {
+    fundcode: '000001', name: 'Test Fund', dwjz: '1.3720', gsz: '1.3980', gszzl: '1.90',
+    gztime: '2026-07-27 15:00', source: 'eastmoney', kind: 'official_nav', realtime: false,
+    stale: false, available: true, note: '东方财富最新已公布净值', fundType: 'Mixed'
+  })
 })
 
 test('creates a QDII estimate from disclosed real-time holdings without normalizing missing weight', () => {

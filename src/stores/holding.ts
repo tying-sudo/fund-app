@@ -24,9 +24,8 @@ import {
   saveJdSyncedSummary
 } from '@/utils/storage'
 
-import { fetchFundEstimateFast, fetchNetValueHistoryFast, fetchRealDayChange, fetchValuationEstimateBySource } from '@/api/fundFast'
+import { fetchFundEstimateFast, fetchNetValueHistoryFast, fetchRealDayChange } from '@/api/fundFast'
 import type { FundDailyReturnPoint, FundRealDayChange } from '@/api/fundFast'
-import { useFundStore } from './fund'
 import { getFundTypes } from '@/api/fund'
 import { persistCache } from '@/api/tiantianApi'
 import { fetchLatestValuationSettlement, rememberValuationSettlement } from '@/api/valuationGrid'
@@ -39,6 +38,7 @@ import {
   hasUsableEstimateChange,
   getValuationComparisonState,
   getTodayStr,
+  isJdYesterdaySummaryCurrent,
   isEstimateDateToday,
   isRetainedMarketEstimate,
   isTradingHours,
@@ -309,7 +309,7 @@ export const useHoldingStore = defineStore('holding', () => {
     const totalProfitRate = totalCost > 0 ? round((totalProfit / totalCost) * 100, PRECISION.PERCENT) : 0
     const todayBaseValue = totalValue - todayProfit
     const todayProfitRate = todayBaseValue > 0 ? round((todayProfit / todayBaseValue) * 100, PRECISION.PERCENT) : 0
-    const currentJdSummary = jdSyncedSummary.value?.syncedOn === getTodayStr()
+    const currentJdSummary = jdSyncedSummary.value && isJdYesterdaySummaryCurrent(jdSyncedSummary.value, getTodayStr())
       ? jdSyncedSummary.value
       : null
     const displayedYesterdayProfit = currentJdSummary?.yesterdayProfit ?? yesterdayProfit
@@ -467,13 +467,10 @@ export const useHoldingStore = defineStore('holding', () => {
         const fundStart = performance.now()
         
         try {
-          const selectedSource = useFundStore().getFundDataSource(code)
-          const isNamedSource = selectedSource === 'tiantian' || selectedSource === 'sina' || selectedSource === 'eastmoney'
-          const estimateRequest = isNamedSource
-            ? fetchValuationEstimateBySource(code, selectedSource).catch(() => fetchFundEstimateFast(code))
-            : fetchFundEstimateFast(code)
           const [estimateResult, realResult] = await Promise.allSettled([
-            estimateRequest,
+            // Holdings always use the backend's automatic provider contract:
+            // Sina for a current intraday estimate, then Eastmoney official NAV.
+            fetchFundEstimateFast(code),
             fetchRealDayChange(code)
           ])
           const realData = realResult.status === 'fulfilled' ? realResult.value : null
@@ -565,10 +562,6 @@ export const useHoldingStore = defineStore('holding', () => {
   async function hydrateHoldingSettlementIfMissing(code: string) {
     const holding = holdings.value.find((item) => item.code === code)
     if (!holding) return
-    // A provider can stamp a new date while returning `--`. That is not an
-    // estimate, so keep hydrating the previous completed estimate/NAV pair.
-    if (isEstimateDateToday(holding.estimateTime || '', getTodayStr()) && hasUsableEstimateChange(holding.estimateChange)) return
-
     const current = getValuationComparisonState({
       realChange: holding.realChange,
       realChangeDate: holding.realChangeDate,
@@ -577,6 +570,11 @@ export const useHoldingStore = defineStore('holding', () => {
       fundName: holding.name
     })
     if (current.isTrading || current.hasActualDiff) return
+    // Post-midnight providers can return an estimate stamped for the new
+    // calendar day before that market has opened. Recover the completed
+    // previous-day pair instead of combining those two dates.
+    if (isEstimateDateToday(holding.estimateTime || '', getTodayStr()) &&
+      hasUsableEstimateChange(holding.estimateChange) && !current.isPreOpen) return
 
     const settlement = await fetchLatestValuationSettlement(code)
     if (!settlement) return
@@ -686,9 +684,12 @@ export const useHoldingStore = defineStore('holding', () => {
       now
     })
     // Preserve the last settled comparison through the next trading day's
-    // pre-open period; providers can report a new timestamp before 9:30.
+    // pre-open period. A new-date estimate cannot be compared with the
+    // preceding day's official NAV, so retain the completed pair until a
+    // same-day official result exists.
     const useCachedCompletedEstimate = cachedComparison.hasActualDiff && (
       incomingIsOfficialSnapshot ||
+      (incomingComparison.isPreOpen && !incomingComparison.hasActualDiff) ||
       (!isEstimateToday && !incomingComparison.isTrading && !incomingComparison.hasActualDiff)
     )
     const comparison = useCachedCompletedEstimate ? cachedComparison : incomingComparison

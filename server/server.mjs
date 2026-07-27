@@ -23,7 +23,8 @@ import {
   getFundSnapshot,
   getFundSnapshotMetadata,
   refreshFullMarketSnapshots,
-  getBeijingMarketState
+  getBeijingMarketState,
+  shouldPollEastmoneyOfficialNav
 } from './cache.mjs'
 import {
   getFundEstimateSources,
@@ -645,6 +646,13 @@ const refreshSnapshotsFromCron = () => {
 cron.schedule('45 8 * * *', refreshSnapshotsFromCron, cronOptions)
 cron.schedule('10 15,16,18,20,22 * * 1-5', refreshSnapshotsFromCron, cronOptions)
 cron.schedule('30 0 * * *', refreshSnapshotsFromCron, cronOptions)
+
+// During the official NAV disclosure window, check Eastmoney every 30 seconds.
+// refreshFullMarketSnapshots coalesces overlapping calls, so slow upstream
+// requests cannot fan out into concurrent full-market downloads.
+setInterval(() => {
+  if (shouldPollEastmoneyOfficialNav()) refreshSnapshotsFromCron()
+}, 30_000)
 
 // Holdings disclosures are synchronized outside page requests. A successful
 // fund is revisited weekly; empty funds are revisited monthly.

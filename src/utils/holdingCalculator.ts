@@ -66,6 +66,16 @@ export function getTodayStr(baseDate?: Date): string {
   return getBeijingDateString(baseDate)
 }
 
+/** Keep a late-night JD account summary through the first post-midnight day. */
+export function isJdYesterdaySummaryCurrent(
+  summary: { syncedOn: string; profitDate?: string },
+  today = getTodayStr()
+): boolean {
+  const reportedDate = summary.profitDate || summary.syncedOn
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(reportedDate) || !/^\d{4}-\d{2}-\d{2}$/.test(today)) return false
+  return reportedDate <= today && getCalendarDayDifference(reportedDate, today) <= 1
+}
+
 /**
  * 判断是否为交易时段
  * [WHAT] 周一至周五 9:30-15:00
@@ -392,10 +402,10 @@ export function getValuationComparisonState({
     value !== null && value !== undefined && value !== '' && Number.isFinite(numericValue)
   const hasOfficialValue = isPresentNumber(realChange, realValue) && Boolean(realDate) && realDate <= today
   const hasComparableValues = hasOfficialValue && isPresentNumber(estimateChange, estimateValue)
-  // Some providers stamp the new calendar date before its market opens. In
-  // that pre-open window the estimate still belongs to the prior completed
-  // session, so pair it with that session's published NAV.
-  const estimateMatchesOfficial = realDate === estimateDate || (isPreOpen && Boolean(estimateDate) && realDate < estimateDate)
+  // A difference is meaningful only when both figures describe the same
+  // completed trading day. A provider's post-midnight timestamp must never
+  // be paired with the preceding day's published NAV.
+  const estimateMatchesOfficial = realDate === estimateDate
   const hasActualDiff = !isTrading && hasComparableValues && Boolean(realDate) && estimateMatchesOfficial && realDate <= today
   const realChangeAgeDays = realDate && realDate <= today
     ? getCalendarDayDifference(realDate, today)
@@ -405,11 +415,15 @@ export function getValuationComparisonState({
   // present, but is valid when it is the only/latest displayed date.
   const isCurrentReal = !isTrading && hasOfficialValue && (!estimateDate || realDate >= estimateDate || isPreOpen)
   const isSameDayAfterClose = day >= 1 && day <= 5 && minutes >= 15 * 60 && realDate === today
-  const realChangeLabel = isSameDayAfterClose
-    ? '真实'
-    : realChangeAgeDays === null
-      ? null
-      : realChangeAgeDays >= 2 ? '前' : '昨'
+  // "前" is reserved for Sunday, where the latest published mainland result
+  // is Friday's prior trading day. On every other day, including the weekday
+  // post-midnight window, that result is labeled "昨" until today's official
+  // NAV arrives after close.
+  const realChangeLabel = realChangeAgeDays === null
+    ? null
+    : isSameDayAfterClose
+      ? '真实'
+      : day === 0 ? '前' : '昨'
 
   return {
     isTrading,

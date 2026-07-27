@@ -6,7 +6,7 @@ import {
   getCalendarDayDifference,
   getSettlementNavStartDate
 } from '../src/utils/tradingDate.ts'
-import { calculateHoldingProfit, calculateOfficialHoldingProfit, getValuationComparisonState, hasUsableCurrentEstimate, hasUsableEstimateChange, isDelayedSettlementQdiiFund, isFundPreOpen, isFundTradingHours, isLunchBreak, isRetainedMarketEstimate, selectLatestRealChange, shouldRetainCompletedEstimate, shouldRetainCurrentDayEstimate, shouldRetainCurrentIntradayEstimate, shouldUseDelayedQdiiPublishedChange, shouldUseGridEstimateFallback } from '../src/utils/holdingCalculator.ts'
+import { calculateHoldingProfit, calculateOfficialHoldingProfit, getValuationComparisonState, hasUsableCurrentEstimate, hasUsableEstimateChange, isDelayedSettlementQdiiFund, isFundPreOpen, isFundTradingHours, isJdYesterdaySummaryCurrent, isLunchBreak, isRetainedMarketEstimate, selectLatestRealChange, shouldRetainCompletedEstimate, shouldRetainCurrentDayEstimate, shouldRetainCurrentIntradayEstimate, shouldUseDelayedQdiiPublishedChange, shouldUseGridEstimateFallback } from '../src/utils/holdingCalculator.ts'
 import { deriveHoldingImportBasis } from '../src/utils/holdingImport.ts'
 
 const history = [
@@ -26,6 +26,10 @@ assert.equal(calculateSubscriptionShares(10_000, 15, 1.2), 8_320.833333333334)
 assert.equal(calculateSubscriptionShares(10_000, 10_000, 1.2), 0)
 assert.equal(getCalendarDayDifference('2026-07-10', '2026-07-20'), 10)
 assert.equal(getBeijingDateString(new Date('2026-07-15T16:30:00.000Z')), '2026-07-16')
+assert.equal(isJdYesterdaySummaryCurrent({ syncedOn: '2026-07-27' }, '2026-07-27'), true)
+assert.equal(isJdYesterdaySummaryCurrent({ syncedOn: '2026-07-27' }, '2026-07-28'), true)
+assert.equal(isJdYesterdaySummaryCurrent({ syncedOn: '2026-07-27' }, '2026-07-29'), false)
+assert.equal(isJdYesterdaySummaryCurrent({ syncedOn: '2026-07-27', profitDate: '2026-07-26' }, '2026-07-28'), false)
 
 const fridayAfterClose = getValuationComparisonState({
   realChange: -6.89,
@@ -71,6 +75,36 @@ const nextTradingPreOpen = getValuationComparisonState({
 assert.equal(nextTradingPreOpen.isCurrentReal, true)
 assert.equal(nextTradingPreOpen.realChangeLabel, '昨')
 assert.equal(nextTradingPreOpen.hasActualDiff, true)
+
+const weekdayMidnight = getValuationComparisonState({
+  realChange: 0.84,
+  realChangeDate: '2026-07-27',
+  estimateChange: -2.23,
+  estimateTime: '2026-07-28 00:08',
+  now: new Date('2026-07-27T16:08:00.000Z')
+})
+assert.equal(weekdayMidnight.realChangeLabel, '昨')
+assert.equal(weekdayMidnight.hasActualDiff, false)
+
+const weekdayMidnightSettlement = getValuationComparisonState({
+  realChange: 0.84,
+  realChangeDate: '2026-07-27',
+  estimateChange: -2.23,
+  estimateTime: '2026-07-27 15:00',
+  now: new Date('2026-07-27T16:08:00.000Z')
+})
+assert.equal(weekdayMidnightSettlement.realChangeLabel, '昨')
+assert.equal(weekdayMidnightSettlement.hasActualDiff, true)
+
+const weekdayPreOpenStalePublication = getValuationComparisonState({
+  realChange: 0.83,
+  realChangeDate: '2026-07-24',
+  estimateChange: 0.87,
+  estimateTime: '2026-07-24 15:00',
+  now: new Date('2026-07-27T17:20:00.000Z')
+})
+assert.equal(weekdayPreOpenStalePublication.realChangeLabel, '昨')
+assert.equal(weekdayPreOpenStalePublication.hasActualDiff, true)
 
 assert.deepEqual(selectLatestRealChange({
   incomingChange: -2.15,
@@ -132,7 +166,7 @@ const hangSengPreOpenStampedToday = getValuationComparisonState({
 assert.equal(isFundPreOpen('华泰紫金恒生互联网科技业指数型发起基金(QDII)C', new Date('2026-07-20T16:36:00.000Z')), true)
 assert.equal(hangSengPreOpenStampedToday.isTrading, false)
 assert.equal(hangSengPreOpenStampedToday.isCurrentReal, true)
-assert.equal(hangSengPreOpenStampedToday.hasActualDiff, true)
+assert.equal(hangSengPreOpenStampedToday.hasActualDiff, false)
 assert.equal(hasUsableEstimateChange('--'), false)
 assert.equal(hasUsableEstimateChange('-7.7739'), true)
 assert.equal(hasUsableCurrentEstimate({ source: 'market_snapshot', gszzl: '-0.35', gztime: '2026-07-21 15:00' }, '2026-07-21'), false)

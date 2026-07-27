@@ -208,8 +208,6 @@ export const useFundStore = defineStore('fund', () => {
   async function hydrateSettlementIfMissing(code: string) {
     const item = watchlist.value.find((fund) => fund.code === code)
     if (!item) return
-    if (isEstimateDateToday(item.estimateTime || '', getTodayStr()) && hasUsableEstimateChange(item.estimateChange)) return
-
     const current = getValuationComparisonState({
       realChange: item.realChange,
       realChangeDate: item.realChangeDate,
@@ -218,6 +216,8 @@ export const useFundStore = defineStore('fund', () => {
       fundName: item.name
     })
     if (current.isTrading || current.hasActualDiff) return
+    if (isEstimateDateToday(item.estimateTime || '', getTodayStr()) &&
+      hasUsableEstimateChange(item.estimateChange) && !current.isPreOpen) return
 
     const settlement = await fetchLatestValuationSettlement(code)
     if (!settlement) return
@@ -379,11 +379,12 @@ export const useFundStore = defineStore('fund', () => {
         estimateTime: existingEstimateTime,
         fundName: data.name
       })
-      // Some providers begin stamping data with the new calendar day before
-      // 9:30. Keep the last completed trading-day pair until the market opens.
+      // A new-date estimate must not be paired with the preceding day's NAV.
+      // Keep the completed pair through the next market open instead.
       const hasIncomingCurrentEstimate = isEstimateDateToday(estimateTimeValue || '')
       const useCachedCompletedEstimate = cachedComparison.hasActualDiff && (
         incomingIsOfficialSnapshot ||
+        (incomingComparison.isPreOpen && !incomingComparison.hasActualDiff) ||
         (!hasIncomingCurrentEstimate && !incomingComparison.isTrading && !incomingComparison.hasActualDiff)
       )
       const comparison = useCachedCompletedEstimate ? cachedComparison : incomingComparison

@@ -7,7 +7,9 @@ const ROUTE_POLICIES = [
   [/^\/api\/fund-list$/, 600],
   [/^\/api\/funds\/\d{6}$/, 1_800],
   [/^\/api\/funds\/\d{6}\/nav-history$/, 21_600],
-  [/^\/api\/funds\/\d{6}\/daily-returns$/, 900],
+  // Same-day Eastmoney NAVs are polled every 30 seconds after close. This
+  // response must not retain a pre-publication result for fifteen minutes.
+  [/^\/api\/funds\/\d{6}\/daily-returns$/, 30],
   [/^\/api\/funds\/\d{6}\/performance$/, 1_800],
   [/^\/api\/funds\/\d{6}\/holdings$/, 3_600],
   [/^\/api\/fund-estimate-sources$/, 30],

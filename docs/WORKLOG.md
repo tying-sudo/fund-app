@@ -507,3 +507,28 @@ Append material implementation and release milestones here. This log does not co
 - Kept the holding-row valuation comparison on one clipped line at narrow widths, so the source button and trailing comparison text no longer wrap into a second line and change row height.
 - Restyled the shared valuation-source selector with the app theme variables, and moved the always-visible recommendation explanation into a separate, dismissible question-mark help dialog.
 - Verification passed: `git diff --check`, Vite production build, `vue-tsc --noEmit`, and a 360px-wide local mobile interaction check covering source-selector open/close and help-dialog open/close. This is a local frontend change only; no APK build or publication was performed.
+
+## 2026-07-27 - Backend source selection and server cleanup
+
+- Fixed the estimate-source recommendation so only an available, non-stale estimate marked `realtime=true` can win during a live session. After close, the selector now recommends the current official NAV instead of a same-day Sina estimate that is explicitly non-realtime.
+- Deployed the backend-only change to `10.0.10.20` with a timestamped `fund-data-service.mjs` rollback copy and restarted `fund-proxy.service`. Node server tests passed 37/37.
+- Removed the never-started `real-time-fund-web` container, its unreferenced image, 1.883 GiB of Docker build cache, obsolete ranking fallback files, one abandoned APK upload, 95 old APKs, and 34 old static rollback trees. Kept the active APK, its five newest predecessors, the active static tree, five recent rollback trees, all running containers, Supabase volumes, and fund data.
+- Public verification passed: health is OK; `/api/fund-estimate-sources?code=000001` recommends the current Tiantian official NAV after close; fund ranking returns 50 records dated 2026-07-27; and the public `1.0.115 (116)` APK remains 6,817,806 bytes with SHA-256 `551d29f478d63503c296c92bf7fe9ae513f942f262965ed9ea18ca42bd071c74`.
+
+## 2026-07-28 - Holding overnight labels and JD yesterday-profit stability
+
+- Aligned the JD buy, sell, and conversion links to the fund-name left edge and reduced their mobile footprint. The valuation comparison row now starts with `估值`.
+- A late-night JD account-level yesterday-profit aggregate remains authoritative through the first post-midnight day, preventing a 00:00 fallback to stale per-fund local totals. On weekday midnight through 09:30, the historical comparison label is `昨`; weekends retain the existing `前` behavior.
+- Verification passed: holding settlement checks, `vue-tsc --noEmit`, Vite production build, `git diff --check`, and a 390px-wide local holdings render check. No APK build or publication was performed.
+
+## 2026-07-28 - Holding overnight valuation settlement pairing
+
+- Corrected the post-midnight holding comparison contract: an estimate and published return now produce `实差` only when both carry the same trading date. A new-calendar-day estimate can no longer be subtracted from the preceding day's official return.
+- Before the next market open, holding and watchlist state retain or recover the previous completed estimate/official-return pair, so the row shows `估值`, `昨`, and the matching `实差`. The new date estimate replaces it only after it can be matched with that date's published return.
+- `前` is reserved for Sunday only, where it denotes Friday's prior trading-day result. At every other point with a published real return, including weekday post-midnight, the label is `昨`; a same-day post-close publication is `真实`.
+- Added settlement regression coverage for both a cross-day mismatch (no `实差`) and the retained same-day prior settlement (`昨` with `实差`).
+
+## 2026-07-27 - Holding automatic valuation and official-NAV publication polling
+
+- Removed the holding-page valuation source button and selector popup. Holding refreshes now use the backend's automatic source contract: current-day Sina intraday valuation first, with Eastmoney's official NAV used after publication.
+- Added a weekday 15:00-20:00 Beijing 30-second Eastmoney all-market snapshot poll. The official daily-return response and its underlying history cache use the same short window, and a same-day snapshot is exposed as the current published NAV so holding rows can switch to `已更新` immediately after disclosure.

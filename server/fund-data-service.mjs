@@ -8,6 +8,8 @@ import {
   getCache,
   getFundList,
   getFundSnapshot,
+  getFundSnapshotMetadata,
+  shouldPollEastmoneyOfficialNav,
   loadFromFile,
   saveToFile,
   setCache
@@ -313,6 +315,7 @@ export function selectFundDailyReturns(items, marketDate, { delayedSettlement = 
 function historyTtlMs() {
   const market = getBeijingMarketState()
   if (market.isOpen) return 30 * 60 * 1000
+  if (shouldPollEastmoneyOfficialNav(market)) return 30 * 1000
   if (market.isWeekday && market.minutes >= 15 * 60 && market.minutes < 23 * 60) return 2 * 60 * 1000
   return 6 * 60 * 60 * 1000
 }
@@ -391,15 +394,29 @@ export async function getFundDailyReturns(code) {
   const history = await getFundHistory(code, 10)
   const profile = getFundProfile(code)
   const market = getFundEstimateMarketState(profile || {}).market
+  const returns = selectFundDailyReturns(history.items, marketDate, {
+    delayedSettlement: market === 'us' || market === 'overseas'
+  })
+  const snapshot = getFundSnapshot(code)
+  const snapshotNav = Number(snapshot?.nav)
+  const snapshotChange = Number(snapshot?.changePercent)
+  const snapshotCurrent = snapshot?.navDate === marketDate &&
+    Number.isFinite(snapshotNav) && snapshotNav > 0 && Number.isFinite(snapshotChange)
+    ? { date: marketDate, nav: snapshotNav, changeRate: snapshotChange }
+    : null
+  const snapshotMetadata = snapshotCurrent ? getFundSnapshotMetadata() : null
   return {
     code,
     name: history.name || getFundProfile(code)?.name || '',
-    source: history.source || 'eastmoney_lsjz',
-    updatedAt: history.updatedAt || history.cachedAt || null,
-    stale: Boolean(history.stale),
-    ...selectFundDailyReturns(history.items, marketDate, {
-      delayedSettlement: market === 'us' || market === 'overseas'
-    })
+    source: snapshotCurrent ? 'eastmoney_snapshot' : history.source || 'eastmoney_lsjz',
+    updatedAt: snapshotMetadata?.refreshedAt || history.updatedAt || history.cachedAt || null,
+    stale: snapshotCurrent ? false : Boolean(history.stale),
+    ...returns,
+    // The 30-second full-market snapshot is authoritative once Eastmoney has
+    // disclosed today's NAV. Make it both latest/current so clients can mark
+    // the holding as updated without waiting for a per-fund history refresh.
+    latest: snapshotCurrent || returns.latest,
+    current: snapshotCurrent || returns.current
   }
 }
 
@@ -925,6 +942,29 @@ export function parseEastmoneyLatestNav(source, code, profile = {}) {
   }
 }
 
+export function snapshotToEastmoneyOfficialNav(snapshot, code, profile = {}) {
+  const nav = numberOrNull(snapshot?.nav ?? snapshot?.previousNav)
+  const date = String(snapshot?.navDate || snapshot?.previousNavDate || '')
+  if (nav === null || nav <= 0 || !date) return null
+  const previousNav = numberOrNull(snapshot?.previousNav)
+  const change = snapshot?.navDate ? numberOrNull(snapshot?.changePercent) : null
+  return {
+    fundcode: code,
+    name: snapshot?.name || profile?.name || '',
+    dwjz: (previousNav ?? nav).toFixed(4),
+    gsz: nav.toFixed(4),
+    gszzl: change === null ? '--' : change.toFixed(2),
+    gztime: `${date} 15:00`,
+    source: 'eastmoney',
+    kind: 'official_nav',
+    realtime: false,
+    stale: false,
+    available: true,
+    note: '东方财富最新已公布净值',
+    fundType: snapshot?.type || profile?.type || ''
+  }
+}
+
 async function getTiantianEstimateSource(code, profile, now) {
   const response = await fetchUpstream(`https://fundcomapi.tiantianfunds.com/mm/newCore/FundValuationLast?FCODES=${code}&FIELDS=FCODE,SHORTNAME,GSZZL,GZTIME,GSZ,NAV,PDATE`, {
     headers: { ...DEFAULT_HEADERS, Referer: 'https://fund.eastmoney.com/' },
@@ -984,6 +1024,8 @@ async function getSinaEstimateSource(code, profile, now) {
 }
 
 async function getEastmoneyNavSource(code, profile) {
+  const snapshot = snapshotToEastmoneyOfficialNav(getFundSnapshot(code), code, profile)
+  if (snapshot) return snapshot
   const response = await fetchUpstream(`https://fund.eastmoney.com/pingzhongdata/${code}.js`, {
     headers: DEFAULT_HEADERS,
     timeoutMs: 8_000,
@@ -1008,10 +1050,15 @@ export async function getFundEstimateSources(code, now = new Date()) {
   ])
   const [tiantian, sina, eastmoney] = settled.map(result => result.status === 'fulfilled' ? result.value : null)
   const sources = { tiantian, sina, eastmoney }
-  const live = [tiantian, sina].filter(item => item?.kind === 'estimate' && item.available && !item.stale)
-  const recommended = live[0]?.source || eastmoney?.source || tiantian?.source || sina?.source || null
+  const live = [tiantian, sina].filter(item =>
+    item?.kind === 'estimate' && item.realtime && item.available && !item.stale
+  )
+  const official = [eastmoney, tiantian].find(item =>
+    item?.kind === 'official_nav' && item.available && !item.stale
+  )
+  const recommended = live[0]?.source || official?.source || eastmoney?.source || tiantian?.source || sina?.source || null
   const recommendationReason = live.length
     ? '优先使用当前交易日可用的盘中估值'
-    : eastmoney ? '盘中估值不可用，显示最新已公布净值作参考' : '暂无可用估值数据'
+    : official ? '盘中估值不可用，显示最新已公布净值作参考' : '暂无可用估值数据'
   return { code, profile, recommended, recommendationReason, sources }
 }

@@ -261,6 +261,19 @@ export function shouldFetchFundgzEstimate(market = getBeijingMarketState()) {
   )
 }
 
+/**
+ * Eastmoney's all-market NAV table is the official settlement source. Poll it
+ * only while same-day NAVs are normally being disclosed after the mainland
+ * close; the refresh routine itself coalesces overlapping requests.
+ */
+export function shouldPollEastmoneyOfficialNav(market = getBeijingMarketState()) {
+  return Boolean(
+    market.isWeekday &&
+    market.minutes >= 15 * 60 &&
+    market.minutes < 20 * 60
+  )
+}
+
 export function isSnapshotFreshEnoughForTrading(snapshotDate, now = new Date()) {
   if (!snapshotDate) return false
   const market = getBeijingMarketState(now)
