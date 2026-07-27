@@ -527,6 +527,7 @@ Append material implementation and release milestones here. This log does not co
 - Before the next market open, holding and watchlist state retain or recover the previous completed estimate/official-return pair, so the row shows `估值`, `昨`, and the matching `实差`. The new date estimate replaces it only after it can be matched with that date's published return.
 - `前` is reserved for Sunday only, where it denotes Friday's prior trading-day result. At every other point with a published real return, including weekday post-midnight, the label is `昨`; a same-day post-close publication is `真实`.
 - Added settlement regression coverage for both a cross-day mismatch (no `实差`) and the retained same-day prior settlement (`昨` with `实差`).
+- Released Android `1.0.118 (119)` and the paired static page. Public `/api/app/version` returns `available=true`; the HTTPS APK is 6,818,071 bytes with SHA-256 `c952f4e1f1785ff2b838177c2847388189be9e1413be4301b67d1c55fbc0cfed`, matching the signed local artifact. The public Holding bundle SHA-256 matches the local production build.
 
 ## 2026-07-27 - Holding automatic valuation and official-NAV publication polling
 
