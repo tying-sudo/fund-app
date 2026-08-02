@@ -9,6 +9,7 @@ import {
   getFundList,
   getFundSnapshot,
   getFundSnapshotMetadata,
+  isSnapshotFreshEnoughForTrading,
   shouldPollEastmoneyOfficialNav,
   loadFromFile,
   saveToFile,
@@ -312,6 +313,10 @@ export function selectFundDailyReturns(items, marketDate, { delayedSettlement = 
   }
 }
 
+export function isLatestFundReturnFresh(date, now = new Date()) {
+  return isSnapshotFreshEnoughForTrading(String(date || ''), now)
+}
+
 function historyTtlMs() {
   const market = getBeijingMarketState()
   if (market.isOpen) return 30 * 60 * 1000
@@ -405,6 +410,8 @@ export async function getFundDailyReturns(code) {
     ? { date: marketDate, nav: snapshotNav, changeRate: snapshotChange }
     : null
   const snapshotMetadata = snapshotCurrent ? getFundSnapshotMetadata() : null
+  const latest = snapshotCurrent || returns.latest
+  const current = snapshotCurrent || returns.current
   return {
     code,
     name: history.name || getFundProfile(code)?.name || '',
@@ -415,8 +422,12 @@ export async function getFundDailyReturns(code) {
     // The 30-second full-market snapshot is authoritative once Eastmoney has
     // disclosed today's NAV. Make it both latest/current so clients can mark
     // the holding as updated without waiting for a per-fund history refresh.
-    latest: snapshotCurrent || returns.latest,
-    current: snapshotCurrent || returns.current
+    latest,
+    current,
+    // A cached history row can remain readable for charts, but it must not
+    // be displayed as yesterday's holding P/L once it falls behind the most
+    // recent expected trading day.
+    latestFresh: isLatestFundReturnFresh(latest?.date)
   }
 }
 
@@ -477,6 +488,143 @@ export function parseFundHoldingsHtml(source, code) {
     reportDate,
     holdings: [...uniqueHoldings.values()].sort((a, b) => b.holdingRatio - a.holdingRatio).slice(0, 10)
   }
+}
+
+function normalizeCompactDate(value) {
+  const source = String(value || '').trim()
+  const compact = source.match(/^(\d{4})(\d{2})(\d{2})$/)
+  return compact ? `${compact[1]}-${compact[2]}-${compact[3]}` : source.replaceAll('/', '-')
+}
+
+function parseSinaSecuritySymbol(value, market) {
+  const symbol = String(value || '').trim()
+  const matched = symbol.match(/^(sh|sz|bj|hk)(.+)$/i)
+  if (matched) {
+    const prefix = matched[1].toLowerCase()
+    return {
+      stockCode: matched[2],
+      marketPrefix: prefix === 'sh' ? '1' : prefix === 'hk' ? '116' : '0'
+    }
+  }
+  return {
+    stockCode: symbol,
+    marketPrefix: String(market || '').toLowerCase() === 'hk' ? '116' : '0'
+  }
+}
+
+export function parseSinaHoldingsPayload(payload, code) {
+  const data = payload?.result?.data
+  const rows = Array.isArray(data?.data) ? data.data : []
+  const reportDate = normalizeCompactDate(data?.date?.date || rows[0]?.ENDDATE)
+  const previousReportDate = normalizeCompactDate(data?.date?.front) || null
+  const holdings = rows.flatMap(row => {
+    const { stockCode, marketPrefix } = parseSinaSecuritySymbol(row?.SYMBOL, row?.MARKET)
+    const stockName = String(row?.SKNAME || '').trim()
+    const holdingRatio = numberOrNull(row?.NAVRTO)
+    if (!stockCode || !stockName || holdingRatio === null || holdingRatio <= 0) return []
+    const quarterChange = numberOrNull(row?.DIFFNAVRTO)
+    return [{
+      fundCode: code,
+      stockCode,
+      stockName,
+      marketPrefix,
+      holdingRatio,
+      holdingShares: null,
+      holdingMarketValue: numberOrNull(row?.HOLDMKTCAP),
+      reportDate: reportDate || null,
+      quarterChange,
+      changeType: String(row?.DIFFNAVRTO || '').includes('新增')
+        ? 'new'
+        : holdingChangeType(quarterChange, Boolean(previousReportDate), true)
+    }]
+  })
+  return {
+    reportDate: reportDate || null,
+    previousReportDate,
+    holdings: holdings.sort((left, right) => right.holdingRatio - left.holdingRatio).slice(0, 10)
+  }
+}
+
+export function parseSinaBondHoldingsPayload(payload, code) {
+  const data = payload?.result?.data
+  const rows = Array.isArray(data?.data) ? data.data : []
+  const reportDate = normalizeCompactDate(data?.date?.date || rows[0]?.ENDDATE)
+  const previousReportDate = normalizeCompactDate(data?.date?.front) || null
+  const bonds = rows.flatMap(row => {
+    const { stockCode } = parseSinaSecuritySymbol(row?.SYMBOL, row?.MARKET)
+    const bondName = String(row?.SKNAME || '').trim()
+    const holdingRatio = numberOrNull(row?.NAVRTO)
+    if (!stockCode || !bondName || holdingRatio === null || holdingRatio <= 0) return []
+    const quarterChange = numberOrNull(row?.DIFFNAVRTO)
+    return [{
+      fundCode: code,
+      bondCode: stockCode,
+      bondName,
+      holdingRatio,
+      holdingMarketValue: numberOrNull(row?.HOLDMKTCAP),
+      reportDate: reportDate || null,
+      quarterChange,
+      changeType: String(row?.DIFFNAVRTO || '').includes('新增')
+        ? 'new'
+        : holdingChangeType(quarterChange, Boolean(previousReportDate), true)
+    }]
+  })
+  return {
+    reportDate: reportDate || null,
+    previousReportDate,
+    bonds: bonds.sort((left, right) => right.holdingRatio - left.holdingRatio).slice(0, 10)
+  }
+}
+
+export function parseSinaHeavyFundPayload(payload) {
+  const rows = payload?.result?.data?.data
+  if (!Array.isArray(rows)) return null
+  const target = rows
+    .filter(row => /^\d{6}$/.test(String(row?.FUNDCODE || '')))
+    .sort((left, right) => (numberOrNull(right?.NAVRTO) || 0) - (numberOrNull(left?.NAVRTO) || 0))[0]
+  return target ? {
+    targetCode: String(target.FUNDCODE),
+    targetName: String(target.FUNDNAME || ''),
+    holdingRatio: numberOrNull(target.NAVRTO),
+    reportDate: normalizeCompactDate(target.ENDDATE || payload?.result?.data?.date?.date) || null
+  } : null
+}
+
+async function fetchSinaPortfolio(code) {
+  const options = {
+    headers: { ...DEFAULT_HEADERS, Referer: 'https://finance.sina.com.cn/' },
+    timeoutMs: 6_000,
+    retries: 1,
+  }
+  const [stockResult, bondResult] = await Promise.allSettled([
+    fetchUpstream(`https://stock.finance.sina.com.cn/fundInfo/api/openapi.php/FdFundService.getHeavilyStock?symbol=${code}&num=20&page=1`, {
+      ...options, dedupeKey: `fund:sina-holdings:${code}`
+    }).then(response => response.json()).then(payload => parseSinaHoldingsPayload(payload, code)),
+    fetchUpstream(`https://stock.finance.sina.com.cn/fundInfo/api/openapi.php/FdFundService.getHeavilyBond?symbol=${code}&num=20&page=1`, {
+      ...options, dedupeKey: `fund:sina-bonds:${code}`
+    }).then(response => response.json()).then(payload => parseSinaBondHoldingsPayload(payload, code))
+  ])
+  const stocks = stockResult.status === 'fulfilled' ? stockResult.value : { reportDate: null, previousReportDate: null, holdings: [] }
+  const bonds = bondResult.status === 'fulfilled' ? bondResult.value : { reportDate: null, previousReportDate: null, bonds: [] }
+  return {
+    ...stocks,
+    reportDate: stocks.reportDate || bonds.reportDate,
+    previousReportDate: stocks.previousReportDate || bonds.previousReportDate,
+    bonds: bonds.bonds
+  }
+}
+
+async function fetchSinaLinkedEtfPortfolio(code) {
+  const response = await fetchUpstream(`https://fund.sina.cn/api/FdFundService/get_heavily_fund?symbol=${code}&num=20&page=1`, {
+    headers: { ...DEFAULT_HEADERS, Referer: 'https://finance.sina.cn/' },
+    timeoutMs: 6_000,
+    retries: 1,
+    dedupeKey: `fund:sina-heavy-fund:${code}`
+  })
+  const target = parseSinaHeavyFundPayload(await response.json())
+  if (!target || target.targetCode === code || !/ETF/i.test(target.targetName)) return null
+  const portfolio = await fetchSinaPortfolio(target.targetCode)
+  return portfolio.holdings.length || portfolio.bonds.length ? { ...portfolio, ...target } : null
 }
 
 export function parseFundHoldingPeriodsHtml(source, code) {
@@ -632,21 +780,34 @@ export async function fetchFundHoldingSnapshotsFromUpstream(code) {
 
 export async function getFundHoldings(code, { includeQuotes = false } = {}) {
   const stored = await getStoredFundHoldings(code, { includeQuotes })
-  if (stored?.holdings?.length) return stored
+  if (stored?.holdings?.length) {
+    if (!/ETF/i.test(String(stored.name || ''))) return stored
+    const targetCode = stored.targetCode || code
+    const bondPortfolio = await fetchSinaPortfolio(targetCode).catch(() => null)
+    return { ...stored, bonds: bondPortfolio?.bonds || [] }
+  }
   if (!codeIsValid(code)) throw new Error('基金代码必须是6位数字')
   const cacheKey = `fund:holdings:v2:${code}`
   let result = getCache(cacheKey)
   holdingsFileCache = loadPersistentCache(HOLDINGS_CACHE_FILE, holdingsFileCache)
   const persisted = getPersistentEntry(holdingsFileCache, code)
 
-  if (!result && persisted?.previousReportDate !== undefined && Date.now() - Date.parse(persisted.cachedAt) < 24 * 60 * 60 * 1000) {
+  const persistedNeedsEtfBonds = /ETF/i.test(String(getFundProfile(code)?.name || persisted?.name || '')) && !Array.isArray(persisted?.bonds)
+  if (!result && !persistedNeedsEtfBonds && persisted?.previousReportDate !== undefined && Date.now() - Date.parse(persisted.cachedAt) < 24 * 60 * 60 * 1000) {
     result = { ...persisted, cache: 'disk', stale: false }
     setCache(cacheKey, result, 24 * 60 * 60 * 1000)
   }
 
   if (!result) {
     try {
-      let parsed = await fetchF10Holdings(code)
+      const directSina = await fetchSinaPortfolio(code).catch(() => null)
+      const linkedSina = !directSina?.holdings?.length
+        ? await fetchSinaLinkedEtfPortfolio(code).catch(() => null)
+        : null
+      const sina = directSina?.holdings?.length ? directSina : linkedSina
+      let parsed = sina?.holdings?.length
+        ? { fundName: '', reportDate: sina.reportDate, holdings: sina.holdings }
+        : await fetchF10Holdings(code)
       let linked = null
       if (parsed.holdings.length === 0) linked = await resolveLinkedEtfHoldings(code, getFundProfile(code)?.name || '').catch(() => null)
       if (!linked && LINKED_ETF_FALLBACKS[code]) {
@@ -657,7 +818,7 @@ export async function getFundHoldings(code, { includeQuotes = false } = {}) {
       if (linked) parsed = linked
       parsed = await resolveSnapshotMarkets(parsed)
       if (parsed.holdings.length === 0) throw new Error('持仓数据为空')
-      const previousRaw = previousQuarter(parsed.reportDate)
+      const previousRaw = !sina?.holdings?.length && previousQuarter(parsed.reportDate)
         ? await fetchF10Holdings(linked?.targetCode || code, previousQuarter(parsed.reportDate).year, previousQuarter(parsed.reportDate).month).catch(() => ({ holdings: [], reportDate: null }))
         : { holdings: [], reportDate: null }
       const previous = await resolveSnapshotMarkets(previousRaw)
@@ -665,22 +826,23 @@ export async function getFundHoldings(code, { includeQuotes = false } = {}) {
         ? previous
         : { holdings: [], reportDate: null }
       const priorBySecurity = new Map(comparablePrevious.holdings.map(item => [`${item.marketPrefix}.${item.stockCode}`, item.holdingRatio]))
-      const holdings = parsed.holdings.map(item => ({
-        ...item,
-        quarterChange: priorBySecurity.has(`${item.marketPrefix}.${item.stockCode}`)
-          ? Number((item.holdingRatio - priorBySecurity.get(`${item.marketPrefix}.${item.stockCode}`)).toFixed(2))
-          : null
-      }))
+      const holdings = sina?.holdings?.length ? parsed.holdings : parsed.holdings.map(item => ({
+          ...item,
+          quarterChange: priorBySecurity.has(`${item.marketPrefix}.${item.stockCode}`)
+            ? Number((item.holdingRatio - priorBySecurity.get(`${item.marketPrefix}.${item.stockCode}`)).toFixed(2))
+            : null
+        }))
       result = {
         code,
         name: getFundProfile(code)?.name || parsed.fundName || '',
         reportDate: parsed.reportDate,
-        previousReportDate: comparablePrevious.reportDate,
-        source: linked ? 'eastmoney_f10_linked_etf' : 'eastmoney_f10',
-        targetCode: linked?.targetCode || null,
-        targetName: linked?.targetName || null,
+        previousReportDate: sina?.holdings?.length ? sina.previousReportDate : comparablePrevious.reportDate,
+        source: sina?.holdings?.length ? (sina.targetCode ? 'sina_heavily_stock_linked_etf' : 'sina_heavily_stock') : linked ? 'eastmoney_f10_linked_etf' : 'eastmoney_f10',
+        targetCode: sina?.targetCode || linked?.targetCode || null,
+        targetName: sina?.targetName || linked?.targetName || null,
         updatedAt: new Date().toISOString(),
         stale: false,
+        bonds: sina?.bonds || [],
         holdings
       }
       updatePersistentCache(HOLDINGS_CACHE_FILE, holdingsFileCache, code, result)

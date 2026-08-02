@@ -77,12 +77,28 @@ class JdGridImportTest(unittest.TestCase):
         self.import_rows(self.buy("manual:buy"))
         result = self.import_rows({
             "ledger_id": "jd:snapshot:000001", "code": "000001", "action": "seed",
-            "trade_date": "2026-07-24", "amount": 120, "nav": 1.2,
+            "trade_date": "2026-07-24", "amount": 120, "nav": 1.2, "shares": 100,
         })
 
         self.assertEqual(result["imported"], 0)
         self.assertEqual(result["skipped"], 1)
         self.assertEqual(len(positions.load_positions()["funds"]["000001"]["batches"]), 1)
+
+    def test_verified_timeline_replaces_an_earlier_snapshot_baseline(self):
+        self.import_rows({
+            "ledger_id": "jd:snapshot:000001", "code": "000001", "action": "seed",
+            "trade_date": "2026-07-24", "amount": 120, "nav": 1.2, "shares": 100,
+            "note": "京东导入·当前持仓基线",
+        })
+        verified = self.buy("jd:real:source", amount=100, nav=1)
+        verified["timeline_verified"] = True
+        result = self.import_rows(verified)
+
+        self.assertEqual(result["imported"], 1)
+        batches = positions.load_positions()["funds"]["000001"]["batches"]
+        self.assertEqual(len(batches), 1)
+        self.assertEqual(batches[0]["source"], "jd_timeline")
+        self.assertEqual(batches[0]["source_ledger_id"], "jd:real:source")
 
     def test_verified_timeline_rebuilds_old_jd_batches_but_preserves_manual_funds(self):
         verified_old = self.buy("jd:old:source", amount=100, nav=1)

@@ -15,6 +15,7 @@ declare module 'vue' {
     FundTrendChart: typeof import('./src/components/FundTrendChart.vue')['default']
     HoldingCard: typeof import('./src/components/HoldingCard.vue')['default']
     JdCookieImportDialog: typeof import('./src/components/JdCookieImportDialog.vue')['default']
+    JdImportProgress: typeof import('./src/components/JdImportProgress.vue')['default']
     MarketIndexBoard: typeof import('./src/components/MarketIndexBoard.vue')['default']
     MarketSwiper: typeof import('./src/components/MarketSwiper.vue')['default']
     OKXChart: typeof import('./src/components/OKXChart.vue')['default']

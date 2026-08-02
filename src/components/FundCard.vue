@@ -3,7 +3,7 @@
 // [WHAT] 显示基金名称、代码、类型、估值、涨跌幅，支持价格闪烁效果
 // [HOW] 支持点击跳转、右滑删除、长按设置提醒
 
-import type { WatchlistItem, DataSource } from '@/types/fund'
+import type { WatchlistItem } from '@/types/fund'
 import { DATA_SOURCE_CONFIG } from '@/types/fund'
 import { formatNetValue, formatPercent, getChangeStatus, getJdFundLink } from '@/utils/format'
 import { computed, ref, watch } from 'vue'
@@ -310,9 +310,7 @@ const hasSourceComparison = computed(() => {
         </div>
                                 <!-- 估值、昨日或真实涨跌幅、实差 -->
         <div class="fund-diff-info" v-if="hasDiffData">
-          <button type="button" class="valuation-source-trigger" title="切换估值源" @click="onSourceSelectClick">
-            估值 <van-icon name="arrow-down" size="9" />
-          </button>
+          <span class="diff-label">估值</span>
           <span :class="['diff-value', changeClass]">{{ displayChange }}</span>
           <span class="diff-separator">|</span>
           <span class="diff-label">{{ realChangeLabel }}</span>
@@ -497,21 +495,6 @@ const hasSourceComparison = computed(() => {
 .diff-label {
   color: var(--text-secondary);
   font-size: 10px;
-}
-
-.valuation-source-trigger {
-  display: inline-flex;
-  align-items: center;
-  gap: 2px;
-  min-height: 18px;
-  padding: 0 4px;
-  color: #4dbdf0;
-  font: inherit;
-  font-size: 10px;
-  line-height: 16px;
-  background: rgba(42, 157, 210, 0.1);
-  border: 1px solid rgba(62, 174, 225, 0.42);
-  border-radius: 4px;
 }
 
 .diff-value {

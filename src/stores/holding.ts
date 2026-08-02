@@ -24,11 +24,12 @@ import {
   saveJdSyncedSummary
 } from '@/utils/storage'
 
-import { fetchFundEstimateFast, fetchNetValueHistoryFast, fetchRealDayChange } from '@/api/fundFast'
+import { fetchFundEstimateFast, fetchFundEstimatesBatch, fetchNetValueHistoryFast, fetchRealDayChange } from '@/api/fundFast'
 import type { FundDailyReturnPoint, FundRealDayChange } from '@/api/fundFast'
 import { getFundTypes } from '@/api/fund'
 import { persistCache } from '@/api/tiantianApi'
 import { fetchLatestValuationSettlement, rememberValuationSettlement } from '@/api/valuationGrid'
+import { resolveWatchlistSnapshot } from '@/utils/watchlistSnapshot'
 
 // 新增模块导入
 import {
@@ -44,6 +45,7 @@ import {
   isTradingHours,
   shouldUseDelayedQdiiPublishedChange,
   selectLatestRealChange,
+  selectYesterdayReturnPoint,
   shouldRetainCurrentIntradayEstimate,
   round,
   PRECISION,
@@ -111,6 +113,9 @@ export const useHoldingStore = defineStore('holding', () => {
   const pendingAdjustments = ref<PendingAdjustment[]>([])
   const syncedAdjustments = ref<SyncedAdjustment[]>([])
   const jdSyncedSummary = ref<JdSyncedSummary | null>(null)
+  // This reactive Beijing date invalidates stale overnight account summaries
+  // without requiring a page reload.
+  const calendarDate = ref(getTodayStr())
 
   
   /** 是否正在刷新 */
@@ -309,7 +314,7 @@ export const useHoldingStore = defineStore('holding', () => {
     const totalProfitRate = totalCost > 0 ? round((totalProfit / totalCost) * 100, PRECISION.PERCENT) : 0
     const todayBaseValue = totalValue - todayProfit
     const todayProfitRate = todayBaseValue > 0 ? round((todayProfit / todayBaseValue) * 100, PRECISION.PERCENT) : 0
-    const currentJdSummary = jdSyncedSummary.value && isJdYesterdaySummaryCurrent(jdSyncedSummary.value, getTodayStr())
+    const currentJdSummary = jdSyncedSummary.value && isJdYesterdaySummaryCurrent(jdSyncedSummary.value, calendarDate.value)
       ? jdSyncedSummary.value
       : null
     const displayedYesterdayProfit = currentJdSummary?.yesterdayProfit ?? yesterdayProfit
@@ -446,6 +451,7 @@ export const useHoldingStore = defineStore('holding', () => {
   }
 
   async function refreshEstimatesOnce() {
+    refreshCalendarDay()
     if (holdings.value.length === 0) {
       isRefreshing.value = false
       return
@@ -462,7 +468,8 @@ export const useHoldingStore = defineStore('holding', () => {
     let failCount = 0
 
     try {
-      // [OPT] 流式更新：每只基金独立请求，完成后立即更新UI
+      const batchEstimates = await fetchFundEstimatesBatch(codes)
+      // 估值由一个批量请求并发获取；日终真实净值保留逐只缓存读取。
       const estimatePromises = codes.map(async (code, index) => {
         const fundStart = performance.now()
         
@@ -470,29 +477,47 @@ export const useHoldingStore = defineStore('holding', () => {
           const [estimateResult, realResult] = await Promise.allSettled([
             // Holdings always use the backend's automatic provider contract:
             // Sina for a current intraday estimate, then Eastmoney official NAV.
-            fetchFundEstimateFast(code),
+            Promise.resolve(batchEstimates.get(code)),
             fetchRealDayChange(code)
           ])
           const realData = realResult.status === 'fulfilled' ? realResult.value : null
-          if (realData) {
+          if (realData?.isFresh === false) {
+            // Never keep a multi-day historical NAV in a field labeled "昨".
+            const holdingIndex = holdings.value.findIndex((item) => item.code === code)
+            if (holdingIndex !== -1) {
+              const holding = holdings.value[holdingIndex]
+              holdings.value[holdingIndex] = {
+                ...holding,
+                realChange: undefined,
+                realChangeDate: undefined,
+                isRealChangeToday: false,
+                previousProfit: undefined,
+                previousProfitRate: undefined,
+                previousBaseValue: undefined
+              }
+            }
+          } else if (realData) {
             hydrateHoldingYesterdayProfit(code, realData)
           }
-          if (estimateResult.status !== 'fulfilled') throw estimateResult.reason
+          if (estimateResult.status !== 'fulfilled' || !estimateResult.value) throw estimateResult.status === 'rejected'
+            ? estimateResult.reason
+            : new Error(`估值数据为空: ${code}`)
 
           const data = estimateResult.value
 
           // A single atomic update prevents the previous official NAV from
           // briefly replacing the same-day estimate while refresh is running.
+          const usableRealData = realData?.isFresh === false ? null : realData
           updateHoldingWithNewEngine(
             code,
             data,
-            realData?.changeRate,
-            realData?.date,
-            realData?.nav,
-            realData?.previous,
-            realData?.isCurrentPublication
+            usableRealData?.changeRate,
+            usableRealData?.date,
+            usableRealData?.nav,
+            usableRealData?.previous,
+            usableRealData?.isCurrentPublication
           )
-          if (realData) {
+          if (realData?.isFresh !== false && realData) {
             await confirmPendingAdjustments(code, realData.date)
           }
           await hydrateHoldingSettlementIfMissing(code)
@@ -543,12 +568,8 @@ export const useHoldingStore = defineStore('holding', () => {
     if (index === -1) return
 
     const holding = holdings.value[index]
-    const previousPoint = dailyReturn.previous || (
-      dailyReturn.date < getTodayStr()
-        ? { nav: dailyReturn.nav, changeRate: dailyReturn.changeRate }
-        : null
-    )
-    const profit = calculateOfficialHoldingProfit(previousPoint, holding.shares)
+    const yesterdayPoint = selectYesterdayReturnPoint(dailyReturn, dailyReturn.previous, calendarDate.value)
+    const profit = calculateOfficialHoldingProfit(yesterdayPoint, holding.shares)
     if (!profit) return
 
     holdings.value[index] = {
@@ -624,8 +645,19 @@ export const useHoldingStore = defineStore('holding', () => {
       cachedChange: holding.realChange,
       cachedDate: holding.realChangeDate
     })
-    const effectiveRealChange = latestReal.change
-    const effectiveRealDate = latestReal.date
+    // Match the watchlist contract: a fresh all-market snapshot is an
+    // official NAV result even when the per-fund history feed has not caught
+    // up. It must restore the row below the JD trade actions.
+    const officialSnapshot = resolveWatchlistSnapshot({
+      estimate: data,
+      incomingChange: latestReal.change,
+      incomingDate: latestReal.date,
+      cachedChange: holding.realChange,
+      cachedDate: holding.realChangeDate
+    })
+    const effectiveRealChange = officialSnapshot.realChange
+    const effectiveRealDate = officialSnapshot.realChangeDate
+    const effectiveOfficialNav = Number(officialSnapshot.officialValue ?? realNav)
     const retainCachedIntradayEstimate = shouldRetainCurrentIntradayEstimate({
       incomingEstimateChange: data.gszzl,
       incomingEstimateTime: data.gztime,
@@ -650,7 +682,7 @@ export const useHoldingStore = defineStore('holding', () => {
       estimate,
       realChange: effectiveRealChange,
       realChangeDate: effectiveRealDate,
-      realNav,
+      realNav: effectiveOfficialNav,
       realChangeIsCurrentPublication,
       now
     }
@@ -706,7 +738,7 @@ export const useHoldingStore = defineStore('holding', () => {
       now
     })
     const officialChange = Number(effectiveRealChange)
-    const officialNav = Number(realNav)
+    const officialNav = effectiveOfficialNav
     const hasCurrentEstimate = hasUsableCurrentEstimate(estimate, today) ||
       retainedMarketEstimate ||
       (retainCachedIntradayEstimate && hasUsableEstimateChange(estimate.gszzl))
@@ -1034,6 +1066,14 @@ export const useHoldingStore = defineStore('holding', () => {
     })
   }
 
+  /** Advance the display day after Beijing midnight and invalidate old summary data. */
+  function refreshCalendarDay(today = getTodayStr()): boolean {
+    if (calendarDate.value === today) return false
+    calendarDate.value = today
+    updateHoldingDays()
+    return true
+  }
+
   // ========== 待确认调仓（加仓/减仓）管理 ==========
 
   /**
@@ -1272,6 +1312,7 @@ export const useHoldingStore = defineStore('holding', () => {
     hasHolding,
     getHoldingByCode,
     updateHoldingDays,
+    refreshCalendarDay,
     // Actions - 待确认调仓
     loadPendingAdjustments,
     addPendingAdjustment,

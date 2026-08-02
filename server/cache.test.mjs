@@ -15,13 +15,38 @@ import {
   parseSinaIndexQuotes,
   parseEastmoneySnapshot,
   parseSinaRealtimeEstimate,
+  shouldRefreshCachedFundEstimate,
   snapshotToEstimate,
   parseTencentIndexQuote,
   parseTencentIndexQuotes,
   parseTencentStockQuotes,
   parseNaverKoreanProfile,
-  parseYahooJapanProfile
+  parseYahooJapanProfile,
+  selectRetainedHongKongQuote
 } from './cache.mjs'
+
+test('retains a same-day Hong Kong change when a post-close provider resets to zero', () => {
+  const cached = { price: 447.2, changePercent: 0.95, marketDate: '2026-07-28', source: 'tencent' }
+  const retained = selectRetainedHongKongQuote(
+    '116.00700',
+    { price: 447.2, changePercent: 0, source: 'eastmoney' },
+    cached,
+    new Date('2026-07-28T08:30:00Z')
+  )
+  assert.equal(retained.changePercent, 0.95)
+  assert.equal(retained.retainedClose, true)
+})
+
+test('keeps a genuine Tencent flat close instead of an earlier intraday return', () => {
+  const selected = selectRetainedHongKongQuote(
+    '116.00700',
+    { price: 447.2, changePercent: 0, source: 'tencent' },
+    { price: 447.2, changePercent: 0.95, marketDate: '2026-07-28', source: 'tencent' },
+    new Date('2026-07-28T08:30:00Z')
+  )
+  assert.equal(selected.changePercent, 0)
+  assert.equal(selected.retainedClose, false)
+})
 
 test('parses regular full-market snapshot rows', () => {
   const source = 'var db={datas:[["000001","测试混合A","CSHHA","1.2345","2.3456","1.2000","2.3000","0.0345","2.88","开放申购","开放赎回"]],record:"1",showday:["2026-07-17","2026-07-16"]}'
@@ -95,6 +120,36 @@ test('keeps the same-day estimate active through the mainland lunch recess', () 
   assert.equal(lunch.isLunchBreak, true)
   assert.equal(lunch.isEstimateSession, true)
   assert.equal(shouldFetchFundgzEstimate(lunch), true)
+})
+
+test('invalidates a pre-open official snapshot when the live estimate session starts', () => {
+  const preOpenSnapshot = {
+    source: 'market_snapshot',
+    gztime: '2026-07-29 15:00',
+    gsz: '1.2345',
+    gszzl: '-0.50'
+  }
+
+  assert.equal(shouldRefreshCachedFundEstimate(preOpenSnapshot, {
+    canUseRealtime: false,
+    isMoneyMarket: false
+  }), false)
+  assert.equal(shouldRefreshCachedFundEstimate(preOpenSnapshot, {
+    canUseRealtime: true,
+    isMoneyMarket: false
+  }), true)
+  assert.equal(shouldRefreshCachedFundEstimate(preOpenSnapshot, {
+    canUseRealtime: true,
+    isMoneyMarket: true
+  }), false)
+  assert.equal(shouldRefreshCachedFundEstimate({
+    ...preOpenSnapshot,
+    source: 'sina_ds2',
+    gztime: '2026-07-30 09:41:00'
+  }, {
+    canUseRealtime: true,
+    isMoneyMarket: false
+  }), false)
 })
 
 test('uses only current-day Sina estimates as the intraday primary source', () => {

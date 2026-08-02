@@ -13,7 +13,7 @@ from pathlib import Path
 
 from valuation.core import beijing_now
 
-DATA_DIR = Path(__file__).parent / "data"
+DATA_DIR = Path(os.environ.get("VALUATION_GRID_DATA_DIR") or (Path(__file__).parent / "data"))
 POS_FILE = DATA_DIR / "positions.json"
 POS_BACKUP_FILE = DATA_DIR / "positions.backup.json"
 POS_LOCK_FILE = DATA_DIR / ".positions.lock"
@@ -1082,6 +1082,180 @@ def _is_jd_timeline_batch(batch: dict) -> bool:
     return batch.get("source") == "jd_timeline" or str(batch.get("note", "")).startswith("京东导入")
 
 
+def _is_jd_managed_batch(batch: dict) -> bool:
+    return str(batch.get("source", "")).startswith("jd_") or _is_jd_timeline_batch(batch)
+
+
+@position_write
+def sync_jd_grid_account(current_codes: list, snapshots: list, transactions: list,
+                         replace_transaction_codes: list | None = None) -> dict:
+    """Sync official holdings and audit-only trade rows without double-counting shares."""
+    data = load_positions()
+    funds = data.setdefault("funds", {})
+    allowed_codes = {
+        str(code).strip() for code in current_codes
+        if str(code).strip().isdigit() and len(str(code).strip()) == 6
+    }
+    snapshots_by_code = {
+        str(item.get("code", "")).strip(): item for item in snapshots
+        if str(item.get("code", "")).strip() in allowed_codes
+    }
+    replace_codes = {
+        str(code).strip() for code in (replace_transaction_codes or [])
+        if str(code).strip() in allowed_codes
+    }
+    results = []
+    imported = skipped = updated = 0
+
+    # Remove only entries wholly owned by an earlier JD sync. Manual grid
+    # positions are never deleted when a fund leaves the JD snapshot.
+    for code in list(funds):
+        fund = funds.get(code, {})
+        if code in allowed_codes or not (fund.get("jd_managed") or fund.get("jd_pending_position")):
+            continue
+        batches = fund.get("batches", [])
+        if batches and not all(_is_jd_managed_batch(batch) for batch in batches):
+            continue
+        del funds[code]
+
+    for code in sorted(allowed_codes):
+        snapshot = snapshots_by_code.get(code)
+        fund = funds.get(code)
+        existing_batches = fund.get("batches", []) if fund else []
+        manual_position = bool(existing_batches) and not all(_is_jd_managed_batch(batch) for batch in existing_batches)
+        detailed_position = bool(existing_batches) and all(_is_jd_timeline_batch(batch) for batch in existing_batches)
+        if snapshot and detailed_position:
+            # A complete JD timeline is more useful to the grid than one
+            # aggregate snapshot.  Retain it and store the official totals only
+            # as reconciliation metadata.  An incomplete later capture must not
+            # destroy an already verified batch history.
+            fund["jd_snapshot"] = {
+                "trade_date": snapshot["trade_date"],
+                "amount": round(float(snapshot["amount"]), 2),
+                "nav": round(float(snapshot["nav"]), 6),
+                "shares": round(float(snapshot["shares"]), 2),
+                "synced_at": beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            fund["jd_managed"] = True
+            fund["jd_pending_position"] = False
+            if snapshot.get("name"):
+                fund["fund_name"] = str(snapshot["name"]).strip()
+        elif snapshot and not manual_position:
+            if fund is None:
+                fund = _ensure_fund(data, code)
+            old_transactions = list(fund.get("jd_transactions", []))
+            old_sell_records = list(fund.get("sell_records", []))
+            old_batch = existing_batches[0] if len(existing_batches) == 1 and _is_jd_managed_batch(existing_batches[0]) else None
+            batch = {
+                "id": old_batch.get("id") if old_batch else _next_batch_id([], snapshot["trade_date"]),
+                "buy_date": snapshot["trade_date"],
+                "amount": round(float(snapshot["amount"]), 2),
+                "nav": round(float(snapshot["nav"]), 6),
+                "shares": round(float(snapshot["shares"]), 2),
+                "original_amount": round(float(snapshot["amount"]), 2),
+                "original_shares": round(float(snapshot["shares"]), 2),
+                "status": "holding",
+                "note": snapshot.get("note", "京东导入·当前持仓基线"),
+                "source": "jd_snapshot",
+                "source_ledger_id": snapshot["ledger_id"],
+            }
+            if old_batch and old_batch.get("peak_nav") is not None:
+                batch["peak_nav"] = old_batch["peak_nav"]
+            unchanged = bool(old_batch) and all(old_batch.get(key) == value for key, value in batch.items())
+            fund["batches"] = [batch]
+            fund["sell_records"] = old_sell_records if old_batch else []
+            fund["jd_transactions"] = old_transactions
+            fund["jd_managed"] = True
+            fund["jd_pending_position"] = False
+            if snapshot.get("name"):
+                fund["fund_name"] = str(snapshot["name"]).strip()
+            status = "skipped" if unchanged else "updated" if old_batch else "imported"
+            result = {"ledger_id": snapshot["ledger_id"], "code": code, "action": "seed", "status": status}
+            if unchanged:
+                result["reason"] = "duplicate"
+                skipped += 1
+            elif old_batch:
+                updated += 1
+            else:
+                imported += 1
+            results.append(result)
+        elif snapshot and manual_position:
+            results.append({"ledger_id": snapshot["ledger_id"], "code": code, "status": "skipped", "reason": "existing_manual_grid_position"})
+            skipped += 1
+        elif fund is None:
+            fund = _ensure_fund(data, code)
+            fund["jd_pending_position"] = True
+            fund["watch_note"] = "京东当日转入待份额确认"
+
+    incoming_ids_by_code = {}
+    for transaction in transactions:
+        code = str(transaction.get("code", "")).strip()
+        transaction_id = str(transaction.get("id", "")).strip()
+        if code in replace_codes and transaction_id:
+            incoming_ids_by_code.setdefault(code, set()).add(transaction_id)
+
+    # A verified full current-position cycle is authoritative for audit rows.
+    # Prune only those codes; an incomplete capture must never erase history.
+    for code in sorted(replace_codes):
+        fund = funds.get(code)
+        if not fund:
+            continue
+        records = list(fund.get("jd_transactions", []))
+        incoming_ids = incoming_ids_by_code.get(code, set())
+        retained = [item for item in records if item.get("id") in incoming_ids]
+        if len(retained) != len(records):
+            fund["jd_transactions"] = retained
+            removed = len(records) - len(retained)
+            updated += 1
+            results.append({
+                "code": code,
+                "action": "replace_audit",
+                "status": "updated",
+                "removed": removed,
+            })
+
+    for transaction in transactions:
+        code = str(transaction.get("code", "")).strip()
+        transaction_id = str(transaction.get("id", "")).strip()
+        if code not in allowed_codes or not transaction_id:
+            results.append({"id": transaction_id, "code": code, "status": "skipped", "reason": "not_current_holding"})
+            skipped += 1
+            continue
+        fund = _ensure_fund(data, code)
+        records = fund.setdefault("jd_transactions", [])
+        existing = next((item for item in records if item.get("id") == transaction_id), None)
+        normalized = {**transaction, "synced_at": beijing_now().strftime("%Y-%m-%d %H:%M:%S")}
+        if existing:
+            comparable = {key: value for key, value in existing.items() if key != "synced_at"}
+            incoming = {key: value for key, value in normalized.items() if key != "synced_at"}
+            if comparable == incoming:
+                results.append({"id": transaction_id, "code": code, "status": "skipped", "reason": "duplicate"})
+                skipped += 1
+                continue
+            existing.clear()
+            existing.update(normalized)
+            status = "updated"
+            updated += 1
+        else:
+            records.append(normalized)
+            status = "imported"
+            imported += 1
+        if transaction.get("fund_name") and not fund.get("fund_name"):
+            fund["fund_name"] = str(transaction["fund_name"]).strip()
+        records.sort(key=lambda item: (item.get("trade_time") or item.get("trade_date", ""), item.get("id", "")), reverse=True)
+        results.append({"id": transaction_id, "code": code, "action": transaction.get("type"), "status": status})
+
+    save_positions(data)
+    return {
+        "success": True,
+        "imported": imported,
+        "updated": updated,
+        "skipped": skipped,
+        "partial": 0,
+        "results": results,
+    }
+
+
 @position_write
 def import_jd_grid_transactions(transactions: list) -> dict:
     """Atomically import normalized JD buy/sell legs and retain their ledger ids."""
@@ -1146,13 +1320,21 @@ def import_jd_grid_transactions(transactions: list) -> dict:
         if action in {"buy", "seed"}:
             amount = float(item.get("amount", 0) or 0)
             nav = float(item.get("nav", 0) or 0)
+            snapshot_shares = float(item.get("shares", 0) or 0) if action == "seed" else 0
             if amount <= 0 or nav <= 0:
                 results.append({"ledger_id": ledger_id, "code": code, "status": "skipped", "reason": "missing_buy_value"})
                 ledger[ledger_id] = {"source": "jd", "outcome": "skipped", "processed_at": beijing_now().strftime("%Y-%m-%d %H:%M:%S")}
                 skipped += 1
                 continue
             batch = _add_batch_to_data(data, code, amount, nav, note, trade_date)
-            if item.get("timeline_verified"):
+            if action == "seed":
+                if snapshot_shares > 0:
+                    batch["shares"] = round(snapshot_shares, 2)
+                    batch["original_shares"] = round(snapshot_shares, 2)
+                    batch["original_amount"] = round(amount, 2)
+                batch["source"] = "jd_snapshot"
+                batch["source_ledger_id"] = ledger_id
+            elif item.get("timeline_verified"):
                 batch["source"] = "jd_timeline"
                 batch["source_ledger_id"] = ledger_id
             ledger[ledger_id] = {"source": "jd", "outcome": "imported", "processed_at": beijing_now().strftime("%Y-%m-%d %H:%M:%S")}

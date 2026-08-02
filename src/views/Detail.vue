@@ -8,15 +8,15 @@ import { useRoute, useRouter } from 'vue-router'
 import { useFundStore } from '@/stores/fund'
 import { useHoldingStore } from '@/stores/holding'
 import { useThemeStore } from '@/stores/theme'
-import { fetchStockHoldings, detectShareClass } from '@/api/fund'
-import { fetchFundEstimateFast, fetchStockQuotes, fetchRealDayChange, fetchNetValueHistoryFast } from '@/api/fundFast'
+import { fetchFundPortfolio, detectShareClass } from '@/api/fund'
+import { fetchFundEstimateFast, fetchFundEstimatesBatch, fetchStockQuotes, fetchRealDayChange, fetchNetValueHistoryFast } from '@/api/fundFast'
 import { fetchGridValuations } from '@/api/gridNative'
 import { fetchLatestValuationSettlement } from '@/api/valuationGrid'
 import { fetchSimilarFunds, type PeriodReturnExt, type SimilarFund } from '@/api/tiantianApi'
-import type { FundEstimate, StockHolding, FundShareClass, HoldingRecord } from '@/types/fund'
+import type { FundEstimate, StockHolding, BondHolding, FundShareClass, HoldingRecord } from '@/types/fund'
 import { getJdFundLink } from '@/utils/format'
 import { getBeijingDateString } from '@/utils/tradingDate'
-import { getValuationComparisonState, hasUsableCurrentEstimate, isFundTradingHours, isRetainedMarketEstimate, shouldUseGridEstimateFallback } from '@/utils/holdingCalculator'
+import { getValuationComparisonState, hasUsableCurrentEstimate, isFundTradingHours, isRetainedMarketEstimate, normalizeMarketDate, shouldUseGridEstimateFallback } from '@/utils/holdingCalculator'
 import { showToast } from 'vant'
 import FundPerformancePanel from '@/components/FundPerformancePanel.vue'
 
@@ -32,6 +32,7 @@ const fundCode = computed(() => route.params.code as string)
 // 数据状态
 const fundInfo = ref<FundEstimate | null>(null)
 const stockHoldings = ref<StockHolding[]>([])
+const bondHoldings = ref<BondHolding[]>([])
 const periodReturns = ref<PeriodReturnExt[]>([])
 const similarFunds = ref<SimilarFund[]>([])
 const isLoading = ref(true)
@@ -66,6 +67,7 @@ function derivePeriodReturnsFromHistory(history: Awaited<ReturnType<typeof fetch
 
 // [WHAT] 实时刷新
 let refreshTimer: ReturnType<typeof setInterval> | null = null
+let refreshInFlight: Promise<void> | null = null
 const lastUpdateTime = ref('')
 
 // [WHAT] 24小时模拟数据（基金用昨收和估值）
@@ -118,6 +120,7 @@ watch(fundCode, async (newCode, oldCode) => {
     // [WHAT] 清空旧数据
     fundInfo.value = null
     stockHoldings.value = []
+    bondHoldings.value = []
     periodReturns.value = []
     similarFunds.value = []
     isLoading.value = true
@@ -134,12 +137,16 @@ onUnmounted(() => {
 // The backend caches live estimates for 20 seconds. Keep this timer alive so
 // an overseas fund resumes automatically when its underlying market opens.
 function startAutoRefresh() {
-  refreshTimer = setInterval(async () => {
+  stopAutoRefresh()
+  refreshTimer = setInterval(() => {
+    if (document.hidden || refreshInFlight) return
     const isOpen = isFundTradingHours(fundInfo.value?.name)
     if (!isOpen) return
-    
-    await refreshEstimate()
-  }, 15000)
+
+    refreshInFlight = refreshEstimate().finally(() => {
+      refreshInFlight = null
+    })
+  }, 1_000)
 }
 
 function stopAutoRefresh() {
@@ -153,7 +160,7 @@ async function refreshEstimate() {
   try {
     // [WHAT] 并发刷新估值和真实涨跌幅
     const [estimate, realChange] = await Promise.all([
-      fetchFundEstimateFast(fundCode.value),
+      fetchFundEstimatesBatch([fundCode.value]).then(result => result.get(fundCode.value) || null),
       fetchRealDayChange(fundCode.value).catch(() => null)
     ])
     
@@ -264,14 +271,19 @@ async function loadFundData() {
     lastUpdateTime.value = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}:${now.getSeconds().toString().padStart(2, '0')}`
     
         // [WHY] 重仓股后台加载，不阻塞页面显示
-    fetchStockHoldings(fundCode.value)
-      .then(async holdings => {
-        console.log('重仓股:', holdings)
+    fetchFundPortfolio(fundCode.value)
+      .then(async portfolio => {
+        const holdings = portfolio.stocks
+        console.log('基金重仓:', portfolio)
+        const holdingsCode = fundCode.value
+        stockHoldings.value = holdings
+        bondHoldings.value = portfolio.bonds
         
         // [WHAT] 获取重仓股的实时涨跌幅（需带 marketPrefix 以区分沪深/港股/北交所）
         if (holdings.length > 0) {
           try {
             const quotes = await fetchStockQuotes(holdings)
+            if (fundCode.value !== holdingsCode) return
             
             // [WHAT] 将涨跌幅数据合并到重仓股列表
             holdings.forEach(holding => {
@@ -285,7 +297,10 @@ async function loadFundData() {
           }
         }
         
-        stockHoldings.value = holdings
+        if (fundCode.value === holdingsCode) {
+          stockHoldings.value = [...holdings]
+          bondHoldings.value = [...portfolio.bonds]
+        }
       })
       .catch(err => {
         console.warn('重仓股获取失败:', err)
@@ -349,13 +364,14 @@ const priceChange = computed(() => {
 
 // [WHAT] 涨跌幅：收盘后优先使用真实净值涨跌幅
 const priceChangePercent = computed(() => {
-  if (detailComparison.value.isCurrentReal && realDayChange.value) return realDayChange.value.changeRate
+  if (!hasCurrentEstimate.value && officialChange.value !== null) return officialChange.value
+  if (detailComparison.value.isCurrentReal && officialChange.value !== null) return officialChange.value
   return hasDisplayEstimate.value ? (parseFloat(fundInfo.value?.gszzl || '0') || 0) : 0
 })
 
 // [WHAT] 显示值：盘中显示估值，收盘后显示真实净值
 const displayValue = computed(() => {
-  if (detailComparison.value.isCurrentReal && realDayChange.value?.nav) return realDayChange.value.nav.toFixed(4)
+  if ((!hasCurrentEstimate.value || detailComparison.value.isCurrentReal) && officialNav.value !== null) return officialNav.value.toFixed(4)
   // A previous trading-day snapshot is displayed as the last NAV, not as a
   // current estimated value.
   return hasDisplayEstimate.value ? (fundInfo.value?.gsz || '--') : (fundInfo.value?.dwjz || '--')
@@ -450,20 +466,38 @@ const isTradingHours = computed(() => {
 })
 
 const hasCurrentEstimate = computed(() => hasUsableCurrentEstimate(fundInfo.value))
+const snapshotIsOfficialNav = computed(() => fundInfo.value?.source === 'market_snapshot')
+const officialDate = computed(() => realDayChange.value?.date || (
+  snapshotIsOfficialNav.value ? normalizeMarketDate(fundInfo.value?.gztime) : ''
+))
+const officialNav = computed<number | null>(() => {
+  const realNav = Number(realDayChange.value?.nav)
+  if (Number.isFinite(realNav) && realNav > 0) return realNav
+  const snapshotNav = Number(fundInfo.value?.gsz)
+  return snapshotIsOfficialNav.value && Number.isFinite(snapshotNav) && snapshotNav > 0 ? snapshotNav : null
+})
+const officialChange = computed<number | null>(() => {
+  const realChange = Number(realDayChange.value?.changeRate)
+  if (Number.isFinite(realChange)) return realChange
+  const snapshotChange = Number(fundInfo.value?.gszzl)
+  return snapshotIsOfficialNav.value && Number.isFinite(snapshotChange) ? snapshotChange : null
+})
 const detailComparison = computed(() => getValuationComparisonState({
-  realChange: realDayChange.value?.changeRate,
-  realChangeDate: realDayChange.value?.date,
+  realChange: officialChange.value,
+  realChangeDate: officialDate.value,
   estimateChange: fundInfo.value?.gszzl,
   estimateTime: fundInfo.value?.gztime,
   fundName: fundInfo.value?.name
 }))
-const hasCompletedEstimate = computed(() => detailComparison.value.hasActualDiff)
+const hasCompletedEstimate = computed(() => !snapshotIsOfficialNav.value && detailComparison.value.hasActualDiff)
 const hasDisplayEstimate = computed(() => hasCurrentEstimate.value || hasCompletedEstimate.value || (
   isRetainedMarketEstimate(fundInfo.value)
 ))
 const hasCurrentOfficialNav = computed(() => {
-  return detailComparison.value.isCurrentReal
+  return officialNav.value !== null && Boolean(officialDate.value) && !isTradingHours.value
 })
+const detailDataDate = computed(() => officialDate.value || normalizeMarketDate(fundInfo.value?.gztime) || '等待估值更新')
+const officialStatPrefix = computed(() => officialDate.value === getBeijingDateString() ? '最新' : '昨日')
 // [WHAT] 状态标签文本
 const statusTag = computed(() => {
   if (isTradingHours.value) return '估值中'
@@ -494,20 +528,18 @@ const periodReturnsExpanded = ref(true)
 
 const primaryStats = computed(() => [
   {
-    label: hasCurrentEstimate.value ? '最新净值' : hasCompletedEstimate.value ? '昨日净值' : '最近净值',
-    value: hasCurrentOfficialNav.value && realDayChange.value?.nav
-      ? realDayChange.value.nav.toFixed(4)
-      : (fundInfo.value?.dwjz || '--'),
+    label: `${officialStatPrefix.value}净值`,
+    value: officialNav.value !== null ? officialNav.value.toFixed(4) : (fundInfo.value?.dwjz || '--'),
     tone: ''
   },
   {
-    label: realDayChange.value?.date === getBeijingDateString() ? '最新涨幅' : hasCompletedEstimate.value ? '昨日涨幅' : '涨跌幅',
-    value: `${priceChangePercent.value > 0 ? '+' : ''}${priceChangePercent.value.toFixed(2)}%`,
-    tone: priceChangePercent.value > 0 ? 'up' : priceChangePercent.value < 0 ? 'down' : ''
+    label: `${officialStatPrefix.value}涨幅`,
+    value: officialChange.value !== null ? `${officialChange.value > 0 ? '+' : ''}${officialChange.value.toFixed(2)}%` : '--',
+    tone: officialChange.value !== null && officialChange.value > 0 ? 'up' : officialChange.value !== null && officialChange.value < 0 ? 'down' : ''
   },
-  { label: hasCurrentEstimate.value ? '估算净值' : hasCompletedEstimate.value ? '昨日估值' : '当日估值', value: hasDisplayEstimate.value ? (fundInfo.value?.gsz || '--') : '--', tone: '' },
+  { label: hasCurrentEstimate.value ? '估算净值' : `${officialStatPrefix.value}估值`, value: hasDisplayEstimate.value ? (fundInfo.value?.gsz || '--') : '--', tone: '' },
   {
-    label: hasCurrentEstimate.value ? '估算涨幅' : hasCompletedEstimate.value ? '昨日估算涨幅' : '当日涨幅',
+    label: hasCurrentEstimate.value ? '估算涨幅' : `${officialStatPrefix.value}估算涨幅`,
     value: hasDisplayEstimate.value && fundInfo.value?.gszzl ? `${Number(fundInfo.value.gszzl) > 0 ? '+' : ''}${Number(fundInfo.value.gszzl).toFixed(2)}%` : '--',
     tone: hasDisplayEstimate.value && Number(fundInfo.value?.gszzl) > 0 ? 'up' : hasDisplayEstimate.value && Number(fundInfo.value?.gszzl) < 0 ? 'down' : ''
   }
@@ -535,11 +567,11 @@ const visiblePeriods = computed(() => periodReturns.value.slice(0, 5))
           <span :class="['detail-status', statusTagClass]">{{ statusTag }}</span>
         </div>
         <div class="identity-meta">
-          <a :href="getJdFundLink(fundCode)" class="fund-code-link">#{{ fundCode }}</a>
+          <a :href="getJdFundLink(fundCode)" class="fund-code-link">{{ fundCode }}</a>
           <span class="identity-dot">·</span>
           <span>{{ shareClass }}类份额</span>
           <span class="identity-dot">·</span>
-          <span>{{ fundInfo?.gztime || lastUpdateTime || '等待估值更新' }}</span>
+          <span>{{ detailDataDate }}</span>
         </div>
       </section>
 
@@ -583,7 +615,7 @@ const visiblePeriods = computed(() => periodReturns.value.slice(0, 5))
       </section>
 
       <section v-else class="detail-panel">
-        <div v-if="stockHoldings.length" class="detail-holdings-table">
+        <div v-if="stockHoldings.length || bondHoldings.length" class="detail-holdings-table">
           <div class="detail-holding-row detail-holding-heading"><span>股票</span><span>涨跌幅</span><span>占比</span><span>季变</span></div>
           <div v-for="(stock, index) in stockHoldings.slice(0, 10)" :key="stock.stockCode" class="detail-holding-row">
             <div><b>{{ index + 1 }}. {{ stock.stockName }}</b><small>{{ stock.stockCode }} <i v-if="stock.sector" class="holding-sector">{{ stock.sector }}</i></small></div>
@@ -591,6 +623,15 @@ const visiblePeriods = computed(() => periodReturns.value.slice(0, 5))
             <span>{{ stock.holdingRatio.toFixed(2) }}%</span>
             <span :class="stock.quarterChange !== null && stock.quarterChange !== undefined ? (stock.quarterChange > 0 ? 'up' : stock.quarterChange < 0 ? 'down' : '') : ''">{{ stock.quarterChange !== null && stock.quarterChange !== undefined ? `${stock.quarterChange > 0 ? '+' : ''}${stock.quarterChange.toFixed(2)}%` : '--' }}</span>
           </div>
+          <template v-if="bondHoldings.length">
+            <div class="detail-bond-title">重仓债券</div>
+            <div class="detail-bond-row detail-holding-heading"><span>债券</span><span>占比</span><span>季变</span></div>
+            <div v-for="(bond, index) in bondHoldings.slice(0, 10)" :key="bond.bondCode" class="detail-bond-row">
+              <div><b>{{ index + 1 }}. {{ bond.bondName }}</b><small>{{ bond.bondCode }}</small></div>
+              <span>{{ bond.holdingRatio.toFixed(2) }}%</span>
+              <span :class="bond.quarterChange !== null && bond.quarterChange !== undefined ? (bond.quarterChange > 0 ? 'up' : bond.quarterChange < 0 ? 'down' : '') : ''">{{ bond.quarterChange !== null && bond.quarterChange !== undefined ? `${bond.quarterChange > 0 ? '+' : ''}${bond.quarterChange.toFixed(2)}%` : '--' }}</span>
+            </div>
+          </template>
         </div>
         <div v-else class="detail-empty">暂无重仓股数据</div>
       </section>
@@ -1321,6 +1362,7 @@ const visiblePeriods = computed(() => periodReturns.value.slice(0, 5))
 .detail-period strong,
 .trend-summary strong,
 .detail-holding-row > span,
+.detail-bond-row > span,
 .detail-info-grid b,
 .detail-info-grid a {
   overflow: hidden;
@@ -1336,11 +1378,13 @@ const visiblePeriods = computed(() => periodReturns.value.slice(0, 5))
 .detail-period strong.up,
 .trend-summary strong.up,
 .detail-holding-row > span.up,
+.detail-bond-row > span.up,
 .detail-similar-list strong.up { color: var(--color-up); }
 .detail-stat strong.down,
 .detail-period strong.down,
 .trend-summary strong.down,
 .detail-holding-row > span.down,
+.detail-bond-row > span.down,
 .detail-similar-list strong.down { color: var(--color-down); }
 
 .detail-period-grid {
@@ -1440,6 +1484,28 @@ const visiblePeriods = computed(() => periodReturns.value.slice(0, 5))
 .detail-holding-row small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .detail-holding-row b { color: var(--text-primary); font-size: 11.9px; }
 .detail-holding-row small { margin-top: 3px; color: var(--text-secondary); font-size: 9.35px; }
+.detail-bond-title {
+  padding: 13px 16px 9px;
+  border-top: 1px solid var(--border-color);
+  color: var(--text-primary);
+  font-size: 12.75px;
+  font-weight: 650;
+}
+.detail-bond-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) 58px 54px;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border-color);
+}
+.detail-bond-row:last-child { border-bottom: 0; }
+.detail-bond-row > div { min-width: 0; }
+.detail-bond-row > span { overflow: hidden; font-size: 12.75px; text-overflow: ellipsis; white-space: nowrap; }
+.detail-bond-row b,
+.detail-bond-row small { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.detail-bond-row b { color: var(--text-primary); font-size: 11.9px; }
+.detail-bond-row small { margin-top: 3px; color: var(--text-secondary); font-size: 9.35px; }
 .holding-sector { display: inline-block; margin-left: 5px; padding: 1px 4px; border: 1px solid var(--border-color); border-radius: 3px; color: var(--color-primary); font-style: normal; }
 .detail-empty { padding: 52px 16px; color: var(--text-secondary); font-size: 11.9px; text-align: center; }
 

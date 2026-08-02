@@ -2,16 +2,20 @@ import { Capacitor, registerPlugin } from '@capacitor/core'
 
 interface JdFundPlugin {
   openFundDetail(options: { code: string }): Promise<{ opened: 'jd-finance' }>
-  openFundTrade(options: { code: string, action: JdFundTradeAction, itemId?: string }): Promise<{ opened: 'jd-finance' }>
+  openFundTrade(options: { code: string, action: JdFundTradeAction }): Promise<{ opened: 'jd-finance' }>
 }
 
 const JdFund = registerPlugin<JdFundPlugin>('JdFund')
 
 export type JdFundTradeAction = 'buy' | 'sell' | 'convert'
 
-// JD Finance fund codes and trade product IDs normally share the 1 + code
-// pattern. These captured exceptions must stay explicit rather than inferred.
-const jdBuyItemIdOverrides: Readonly<Record<string, string>> = {
+// Offline fallback only. Android resolves the canonical purchase URL from JD's
+// public fund-detail API before opening it, because item IDs are not derivable
+// from fund codes.
+const capturedJdBuyItemIds: Readonly<Record<string, string>> = {
+  '001470': '105457',
+  '002112': '105109',
+  '010524': '113000',
   '100055': '107138'
 }
 
@@ -27,15 +31,19 @@ export function buildJdFundScheme(code: string): string {
   return `jdmobile://share?jumpType=7&jumpUrl=${encodeURIComponent(detailUrl)}`
 }
 
-export function resolveJdFundBuyItemId(code: string): string {
+export function resolveJdFundBuyItemId(code: string): string | null {
   const normalized = normalizeFundCode(code)
-  return jdBuyItemIdOverrides[normalized] ?? `1${normalized}`
+  return capturedJdBuyItemIds[normalized] ?? null
 }
 
 export function buildJdFundTradeUrl(code: string, action: JdFundTradeAction): string {
   const normalized = normalizeFundCode(code)
   if (action === 'buy') {
-    return `https://lc.jr.jd.com/finance/fund/fundtrade/index/?source=app&itemId=${resolveJdFundBuyItemId(normalized)}&version=3&fundUtmSource=310&fundUtmParam=add_jjccxq&fromJumpType=2&createOrdermaket=310`
+    const itemId = resolveJdFundBuyItemId(normalized)
+    if (itemId) {
+      return `https://lc.jr.jd.com/finance/fund/fundtrade/index/?source=app&itemId=${itemId}&version=3`
+    }
+    return `https://lc.jr.jd.com/finance/funddetail/home/?fundCode=${normalized}&fundUtmSource=340&fundUtmParam=AppShare`
   }
 
   const params = new URLSearchParams({
@@ -67,10 +75,7 @@ export async function openJdFundDetail(code: string): Promise<void> {
 export async function openJdFundTrade(code: string, action: JdFundTradeAction): Promise<void> {
   const normalized = normalizeFundCode(code)
   if (Capacitor.getPlatform() === 'android') {
-    const options = action === 'buy'
-      ? { code: normalized, action, itemId: resolveJdFundBuyItemId(normalized) }
-      : { code: normalized, action }
-    await JdFund.openFundTrade(options)
+    await JdFund.openFundTrade({ code: normalized, action })
     return
   }
   window.location.assign(buildJdFundTradeScheme(normalized, action))

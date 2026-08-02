@@ -3,7 +3,7 @@
 // [OPT] 使用缓存和惰性计算提升性能
 
 import type { HoldingRecord, FundEstimate, FundShareClass } from '@/types/fund'
-import { getBeijingDateString, getBeijingDayAndMinutes, getCalendarDayDifference } from './tradingDate.ts'
+import { addCalendarDays, getBeijingDateString, getBeijingDayAndMinutes, getCalendarDayDifference } from './tradingDate.ts'
 
 /** 计算结果 */
 export interface CalculationResult {
@@ -66,14 +66,30 @@ export function getTodayStr(baseDate?: Date): string {
   return getBeijingDateString(baseDate)
 }
 
-/** Keep a late-night JD account summary through the first post-midnight day. */
+/**
+ * A JD account summary is labelled "yesterday income", so after midnight it
+ * must describe the immediately preceding Beijing calendar day. A summary
+ * without JD's report date is trusted only on the day it was synchronized.
+ */
 export function isJdYesterdaySummaryCurrent(
   summary: { syncedOn: string; profitDate?: string },
   today = getTodayStr()
 ): boolean {
-  const reportedDate = summary.profitDate || summary.syncedOn
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(reportedDate) || !/^\d{4}-\d{2}-\d{2}$/.test(today)) return false
-  return reportedDate <= today && getCalendarDayDifference(reportedDate, today) <= 1
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(today)) return false
+  if (summary.profitDate) {
+    return /^\d{4}-\d{2}-\d{2}$/.test(summary.profitDate)
+      && summary.profitDate === addCalendarDays(today, -1)
+  }
+  return summary.syncedOn === today
+}
+
+/** Pick the official return that belongs to the card's "yesterday" label. */
+export function selectYesterdayReturnPoint<T extends { date: string }>(
+  latest: T,
+  previous: T | null,
+  today = getTodayStr()
+): T | null {
+  return latest.date < today ? latest : previous
 }
 
 /**
@@ -367,6 +383,14 @@ export interface ValuationComparisonState {
   realChangeLabel: '真实' | '昨' | '前' | null
 }
 
+function isRecentOfficialMarketDate(realDate: string, today: string, weekday: number): boolean {
+  const age = getCalendarDayDifference(realDate, today)
+  if (age < 0) return false
+  // Friday's close remains valid through the weekend and Monday pre-open.
+  const maxAge = weekday === 0 || weekday === 1 ? 3 : 1
+  return age <= maxAge
+}
+
 /**
  * Keep holding and watchlist valuation labels aligned. During a trading
  * session, the latest official change belongs to the previous trading day,
@@ -400,7 +424,8 @@ export function getValuationComparisonState({
   const estimateValue = Number(estimateChange)
   const isPresentNumber = (value: number | string | null | undefined, numericValue: number) =>
     value !== null && value !== undefined && value !== '' && Number.isFinite(numericValue)
-  const hasOfficialValue = isPresentNumber(realChange, realValue) && Boolean(realDate) && realDate <= today
+  const hasOfficialValue = isPresentNumber(realChange, realValue) && Boolean(realDate) &&
+    isRecentOfficialMarketDate(realDate, today, day)
   const hasComparableValues = hasOfficialValue && isPresentNumber(estimateChange, estimateValue)
   // A difference is meaningful only when both figures describe the same
   // completed trading day. A provider's post-midnight timestamp must never
@@ -419,9 +444,10 @@ export function getValuationComparisonState({
   // is Friday's prior trading day. On every other day, including the weekday
   // post-midnight window, that result is labeled "昨" until today's official
   // NAV arrives after close.
-  const realChangeLabel = realChangeAgeDays === null
-    ? null
-    : isSameDayAfterClose
+  // This label describes a daily-change slot, not a unit-NAV field. Keep it
+  // stable while an official response is temporarily unavailable so cards
+  // render "昨 --" instead of relabeling the percentage as "净值".
+  const realChangeLabel = isSameDayAfterClose && hasOfficialValue
       ? '真实'
       : day === 0 ? '前' : '昨'
 

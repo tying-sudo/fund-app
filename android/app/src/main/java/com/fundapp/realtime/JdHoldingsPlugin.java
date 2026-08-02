@@ -70,16 +70,20 @@ public class JdHoldingsPlugin extends Plugin {
     // the newna fund endpoints fail their CORS/origin validation.
     private static final String HOLDING_PAGE_URL = "https://roma.jd.com/fund/hold/list/pc/?channelfrom=grouppc&showPCfund=1&ua=jdjr-app";
     private static final String FUND_DETAIL_PAGE_URL = "https://roma.jd.com/fund/hold/detail/?extJson=%s";
-    // This is the same account-wide fund transaction page reached from the
-    // holding header's "昨日收益 -> 交易记录" entry.
+    // This page owns the decryption and pagination contract for the account
+    // timeline. queryTradeOrderList is encrypted in transit and must not be
+    // replayed or parsed directly by the importer.
     private static final String ACCOUNT_TRADE_PAGE_URL = "https://roma.jd.com/wealth/tradeorder/list?pageShowType=1&businessCode=FUND&pageShowTitle=%E5%9F%BA%E9%87%91%E4%BA%A4%E6%98%93";
     private static final int MATCH_PARENT = ViewGroup.LayoutParams.MATCH_PARENT;
     private static final int WRAP_CONTENT = ViewGroup.LayoutParams.WRAP_CONTENT;
-    private static final int DETAIL_TIMEOUT_SECONDS = 18;
+    private static final int DETAIL_TIMEOUT_SECONDS = 35;
     private static final int HOLDING_DETAIL_CONCURRENCY = 12;
-    private static final int HOLDING_TRADE_CONCURRENCY = 12;
-    private static final int TRADE_HISTORY_DAYS = 30;
-    private static final int ACCOUNT_TRADE_TIMEOUT_SECONDS = 35;
+    private static final int HOLDING_TRADE_CONCURRENCY = 4;
+    private static final int HOLDING_TRADE_MAX_ATTEMPTS = 2;
+    private static final int TRADE_HISTORY_YEARS = 10;
+    private static final int ACCOUNT_TRADE_TIMEOUT_SECONDS = 120;
+    private static final int ACCOUNT_TRADE_FIRST_PAGE_TIMEOUT_MILLIS = 20_000;
+    private static final int ACCOUNT_TRADE_STALL_TIMEOUT_MILLIS = 12_000;
 
     private final ExecutorService executor = Executors.newSingleThreadExecutor();
     private PluginCall pendingCall;
@@ -360,16 +364,63 @@ public class JdHoldingsPlugin extends Plugin {
     }
 
     /** The current-holding source varies by session type; transaction records never do. */
-    private JSObject readPortfolioWithAccountTrades(String sessionCookie, JSArray holdings) throws Exception {
+    private JSObject readPortfolioWithAccountTrades(String sessionCookie, JSArray rawHoldings) throws Exception {
+        JSArray holdings = new JSArray();
+        JSArray closedItems = new JSArray();
+        for (int index = 0; index < rawHoldings.length(); index++) {
+            JSONObject holding = rawHoldings.optJSONObject(index);
+            if (holding == null) continue;
+            if (holding.optBoolean("zeroPosition", false)) closedItems.put(holding);
+            else holdings.put(holding);
+        }
         JSObject result = new JSObject();
         result.put("items", holdings);
+        if (closedItems.length() > 0) result.put("closedItems", closedItems);
+        ExecutorService timelineReaders = Executors.newFixedThreadPool(2);
+        Future<AccountTradeResult> accountRead = timelineReaders.submit(() -> readHoldingCookieAccountTrades(sessionCookie, holdings));
+        Future<CurrentHoldingTradeResult> detailRead = timelineReaders.submit(() -> readCurrentHoldingTrades(sessionCookie, holdings));
+        AccountTradeResult accountResult = null;
+        String accountFailure = "";
+        CurrentHoldingTradeResult detailResult = CurrentHoldingTradeResult.empty();
         try {
-            result.put("adjustments", readHoldingCookieAccountTrades(sessionCookie, holdings));
-        } catch (Exception error) {
+            try {
+                accountResult = accountRead.get();
+            } catch (ExecutionException error) {
+                // The account-wide page owns completeness. Its failure keeps
+                // the current holding snapshot but disables timeline replace.
+                Throwable cause = error.getCause();
+                accountFailure = cause == null ? "京东交易记录读取失败" : textValue(cause.getMessage());
+            }
+            try {
+                detailResult = detailRead.get();
+            } catch (ExecutionException ignored) {
+                detailResult = CurrentHoldingTradeResult.failed("基金详情交易记录补全失败");
+            }
+        } catch (InterruptedException error) {
+            Thread.currentThread().interrupt();
+            throw new IllegalStateException("京东交易记录读取已中断", error);
+        } finally {
+            timelineReaders.shutdownNow();
+        }
+        if (accountResult == null) {
             // A valid current-holding snapshot must still reach the holding
             // list when JD's optional transaction page is temporarily slow.
             result.put("adjustments", new JSArray());
-            result.put("tradeWarning", "交易记录未完整读取，请稍后重新同步");
+            String reason = accountFailure.isEmpty() ? "账号交易记录未完整读取" : accountFailure;
+            result.put(
+                "tradeWarning",
+                reason + "；" + detailResult.diagnostic() + "；为避免错误覆盖，已保留现有批次"
+            );
+        } else {
+            JSArray merged = mergeAccountAndDetailTrades(accountResult.rows, detailResult.rows);
+            String diagnostic = "交易记录诊断：账号 " + accountResult.pageCount + " 页、原始 "
+                + accountResult.rawRows + " 条"
+                + (accountResult.allCount > 0 ? "（接口总数 " + accountResult.allCount + " 条）" : "")
+                + "、有效 " + accountResult.rows.length() + " 条；"
+                + detailResult.diagnostic();
+            result.put("adjustments", merged);
+            result.put("tradeDiagnostic", diagnostic);
+            if (!detailResult.warning.isEmpty()) result.put("tradeWarning", detailResult.warning);
         }
         reportProgress("normalizing", "京东持仓数据读取完成", 0, 0);
         return result;
@@ -560,7 +611,8 @@ public class JdHoldingsPlugin extends Plugin {
         String costAmount = findLabeledValue(minor == null ? null : minor.optJSONArray("dataList"), "持仓成本价");
         String costPrice = findLabeledValue(minor == null ? null : minor.optJSONArray("dataList"), "持仓成本单价");
         String amount = findLabeledValue(minor == null ? null : minor.optJSONArray("dataList"), "持有金额");
-        if (!hasCurrentPosition(amount, shares) || shares.isEmpty()) return null;
+        boolean zeroPosition = hasExplicitZeroPosition(amount, shares);
+        if ((!hasCurrentPosition(amount, shares) || shares.isEmpty()) && !zeroPosition) return null;
 
         JSObject holding = new JSObject();
         holding.put("code", code);
@@ -570,12 +622,14 @@ public class JdHoldingsPlugin extends Plugin {
         holding.put("profit", findLabeledValue(major == null ? null : major.optJSONArray("yieldList"), "持有收益"));
         holding.put("rate", findLabeledValue(major == null ? null : major.optJSONArray("yieldList"), "持有收益率"));
         holding.put("shares", shares);
+        holding.put("detailExtJson", extJson);
+        if (zeroPosition) holding.put("zeroPosition", true);
         if (!costAmount.isEmpty()) holding.put("costAmount", costAmount);
         if (!costPrice.isEmpty()) holding.put("costPrice", costPrice);
         return holding;
     }
 
-    private JSArray readCurrentHoldingTrades(String sessionCookie, JSArray holdings) throws Exception {
+    private CurrentHoldingTradeResult readCurrentHoldingTrades(String sessionCookie, JSArray holdings) throws Exception {
         JSArray adjustments = new JSArray();
         List<FundTradeRequest> requests = new ArrayList<>();
         for (int index = 0; index < holdings.length(); index++) {
@@ -585,7 +639,7 @@ public class JdHoldingsPlugin extends Plugin {
             if (!code.matches("\\d{6}") || extJson.isEmpty()) continue;
             requests.add(new FundTradeRequest(code, extJson));
         }
-        if (requests.isEmpty()) return adjustments;
+        if (requests.isEmpty()) return CurrentHoldingTradeResult.failed("基金详情交易记录缺少可用入口");
 
         int total = requests.size();
         ExecutorService tradeReaders = Executors.newFixedThreadPool(Math.min(HOLDING_TRADE_CONCURRENCY, total));
@@ -594,25 +648,55 @@ public class JdHoldingsPlugin extends Plugin {
         try {
             for (FundTradeRequest request : requests) {
                 reads.add(tradeReaders.submit(() -> {
+                    String lastError = "";
                     try {
+                        for (int attempt = 1; attempt <= HOLDING_TRADE_MAX_ATTEMPTS; attempt++) {
+                            try {
+                                return new FundTradeRows(
+                                    request.code,
+                                    readFundTradeRowsInIsolatedWebView(sessionCookie, request.code, request.extJson),
+                                    "",
+                                    attempt
+                                );
+                            } catch (Exception error) {
+                                lastError = textValue(error.getMessage());
+                            }
+                        }
                         return new FundTradeRows(
                             request.code,
-                            readFundTradeRowsInIsolatedWebView(sessionCookie, request.code, request.extJson)
+                            new JSONArray(),
+                            lastError.isEmpty() ? "基金详情交易记录读取失败" : lastError,
+                            HOLDING_TRADE_MAX_ATTEMPTS
                         );
                     } finally {
                         int current = completed.incrementAndGet();
-                        reportProgress("reading_trades", "正在并发读取京东交易记录（" + current + "/" + total + "）...", current, total);
+                        reportProgress("reading_trades", "正在读取京东基金详情交易记录（" + current + "/" + total + "）...", current, total);
                     }
                 }));
             }
 
             Set<String> seen = new HashSet<>();
+            List<String> failedCodes = new ArrayList<>();
+            int succeeded = 0;
+            int rawRows = 0;
+            int retried = 0;
             // Merge in holdings order so concurrent page completion does not
             // change the local audit record order or deduplication winner.
             for (Future<FundTradeRows> read : reads) {
                 FundTradeRows result = read.get();
+                if (!result.error.isEmpty()) {
+                    failedCodes.add(result.code);
+                    continue;
+                }
+                succeeded++;
+                rawRows += result.rows.length();
+                if (result.attempts > 1) retried++;
                 appendTradeRows(result.rows, result.code, adjustments, seen);
             }
+            String warning = failedCodes.isEmpty()
+                ? ""
+                : failedCodes.size() + " 只基金的详情交易记录补全失败，已保留账号完整流水";
+            return new CurrentHoldingTradeResult(adjustments, warning, total, succeeded, failedCodes.size(), rawRows, retried);
         } catch (InterruptedException error) {
             Thread.currentThread().interrupt();
             throw new IllegalStateException("京东交易记录读取已中断", error);
@@ -623,7 +707,72 @@ public class JdHoldingsPlugin extends Plugin {
         } finally {
             tradeReaders.shutdownNow();
         }
-        return adjustments;
+    }
+
+    /** Keep the account page as the timeline authority and use detail rows only to fill missing fields. */
+    private JSArray mergeAccountAndDetailTrades(JSArray accountRows, JSArray detailRows) {
+        JSArray merged = new JSArray();
+        for (int index = 0; index < accountRows.length(); index++) {
+            JSONObject row = accountRows.optJSONObject(index);
+            if (row != null) merged.put(row);
+        }
+        for (int index = 0; index < detailRows.length(); index++) {
+            JSONObject detail = detailRows.optJSONObject(index);
+            if (detail == null) continue;
+            int match = findMatchingTradeRow(merged, detail);
+            if (match >= 0) {
+                enrichTradeRow(merged.optJSONObject(match), detail);
+            } else {
+                merged.put(detail);
+            }
+        }
+        return merged;
+    }
+
+    private int findMatchingTradeRow(JSArray rows, JSONObject detail) {
+        String detailId = firstText(detail, "id");
+        for (int index = 0; index < rows.length(); index++) {
+            JSONObject candidate = rows.optJSONObject(index);
+            if (candidate != null && !detailId.isEmpty() && detailId.equals(firstText(candidate, "id"))) return index;
+        }
+
+        int match = -1;
+        for (int index = 0; index < rows.length(); index++) {
+            JSONObject candidate = rows.optJSONObject(index);
+            if (candidate == null || !sameTradeIdentity(candidate, detail)) continue;
+            if (match >= 0) return -1;
+            match = index;
+        }
+        return match;
+    }
+
+    private boolean sameTradeIdentity(JSONObject left, JSONObject right) {
+        for (String key : new String[] { "code", "type", "tradeDate" }) {
+            String leftValue = firstText(left, key);
+            String rightValue = firstText(right, key);
+            if (leftValue.isEmpty() || !leftValue.equals(rightValue)) return false;
+        }
+        for (String key : new String[] { "tradeTime", "targetCode", "amount" }) {
+            String leftValue = firstText(left, key);
+            String rightValue = firstText(right, key);
+            if (!leftValue.isEmpty() && !rightValue.isEmpty() && !leftValue.equals(rightValue)) return false;
+        }
+        return true;
+    }
+
+    private void enrichTradeRow(JSONObject target, JSONObject detail) {
+        if (target == null) return;
+        for (String key : new String[] { "shares", "targetShares", "status", "statusCode", "confirmTime" }) {
+            String current = firstText(target, key);
+            String replacement = firstText(detail, key);
+            if (current.isEmpty() && !replacement.isEmpty()) {
+                try {
+                    target.put(key, replacement);
+                } catch (Exception ignored) {
+                    // One malformed optional field must not discard the timeline.
+                }
+            }
+        }
     }
 
     /**
@@ -632,15 +781,13 @@ public class JdHoldingsPlugin extends Plugin {
      * portfolio no longer requires 12 serial detail-page navigations.
      */
     @SuppressLint("SetJavaScriptEnabled")
-    private JSArray readHoldingCookieAccountTrades(String sessionCookie, JSArray holdings) throws Exception {
+    private AccountTradeResult readHoldingCookieAccountTrades(String sessionCookie, JSArray holdings) throws Exception {
         Set<String> currentCodes = new HashSet<>();
         for (int index = 0; index < holdings.length(); index++) {
             JSONObject holding = holdings.optJSONObject(index);
             String code = holding == null ? "" : holding.optString("code", "").trim();
             if (code.matches("\\d{6}")) currentCodes.add(code);
         }
-        if (currentCodes.isEmpty()) return new JSArray();
-
         Activity activity = getActivity();
         if (activity == null || activity.isFinishing()) throw new IllegalStateException("无法打开京东交易记录页");
         AccountTradeCapture capture = new AccountTradeCapture();
@@ -670,17 +817,23 @@ public class JdHoldingsPlugin extends Plugin {
         if (!started.await(10, TimeUnit.SECONDS) || reader[0] == null) {
             throw new IllegalStateException("京东交易记录页启动超时");
         }
-        reportProgress("reading_trades", "正在读取近30天京东交易记录...", 0, 0);
+        reportProgress("reading_trades", "正在分页读取京东完整交易记录...", 0, 0);
         try {
             boolean completed = capture.done.await(ACCOUNT_TRADE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
             if (!completed || capture.failed || !capture.complete) {
                 String reason = capture.failureReason();
-                throw new IllegalStateException(reason.isEmpty() ? "京东交易记录读取超时" : reason);
+                String diagnostic = "（已读取 " + capture.pageCount() + " 页、原始 " + capture.rows().length() + " 条）";
+                throw new IllegalStateException((reason.isEmpty() ? "京东交易记录读取超时" : reason) + diagnostic);
             }
             JSArray adjustments = new JSArray();
             appendAccountTradeRows(capture.rows(), currentCodes, adjustments, new HashSet<>());
-            reportProgress("reading_trades", "近30天京东交易记录读取完成", 1, 1);
-            return adjustments;
+            reportProgress(
+                "reading_trades",
+                "京东账号交易记录读取完成：" + capture.pageCount() + " 页、" + capture.rows().length() + " 条",
+                capture.rows().length(),
+                capture.allCount()
+            );
+            return new AccountTradeResult(adjustments, capture.pageCount(), capture.rows().length(), capture.allCount());
         } finally {
             activity.runOnUiThread(() -> {
                 if (reader[0] != null) reader[0].removeJavascriptInterface("FundAppAccountTrade");
@@ -773,35 +926,43 @@ public class JdHoldingsPlugin extends Plugin {
 
     /** The selectors below are bound to JD's confirmed holding-detail controls. */
     private String detailTradeBootstrap(String fundCode) {
-        return "(function(){if(window.__fundAppDetailTradeHook)return;window.__fundAppDetailTradeHook=true;var c='" + fundCode + "',sent={},started=Date.now(),last=Date.now(),opened=false;"
+        return "(function(){if(window.__fundAppDetailTradeHook)return;window.__fundAppDetailTradeHook=true;var c='" + fundCode + "',sent={},started=Date.now(),last=Date.now(),opened=false,hasRows=false;"
             + "function emit(x){try{window.FundAppDetailTrade&&window.FundAppDetailTrade.receive(JSON.stringify(x))}catch(e){}}"
             + "function isTradeRow(x){return !!(x&&typeof x==='object'&&(x.bizTime||x.tradeTime||x.confirmTime||x.orderCreateTime||x.tradeDate)&&(x.tradeTypeCode||x.tradeTypeName||x.tradeName||x.operationName||x.businessName||x.businessType||x.orderType)&&(x.unit||x.confirmUnit||x.tradeUnit||x.confirmShare||x.tradeShare||x.fundShare||x.applyShare||x.share||x.shares||x.allAmount||x.confirmAmount||x.tradeAmount||x.applyAmount||x.amount||x.money))}"
             + "function rows(v,out){if(Array.isArray(v)){var matched=v.filter(isTradeRow);if(matched.length){out.push.apply(out,matched);return}v.forEach(function(x){rows(x,out)});return}if(v&&typeof v==='object')Object.keys(v).forEach(function(k){rows(v[k],out)})}"
             // JD has changed the decoded transaction endpoint name repeatedly.
             // Do not guess from the URL. Only actual order-shaped rows cross the
             // bridge; this avoids sending unrelated page JSON to the grid API.
-            + "function take(u,t){try{var v=JSON.parse(t),a=[];rows(v,a);if(!a.length)return;var k=JSON.stringify(a);if(sent[k])return;sent[k]=1;last=Date.now();emit({code:c,rows:a})}catch(e){}}"
+            + "function takeValue(v){try{var a=[];rows(v,a);if(!a.length)return;var k=JSON.stringify(a);if(sent[k])return;sent[k]=1;hasRows=true;last=Date.now();emit({code:c,rows:a})}catch(e){}}"
+            + "function take(u,t){try{takeValue(JSON.parse(t))}catch(e){}}"
             + "var open=XMLHttpRequest.prototype.open,send=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.open=function(){this.__fundAppUrl=String(arguments[1]||'');return open.apply(this,arguments)};XMLHttpRequest.prototype.send=function(){this.addEventListener('load',function(){take(this.__fundAppUrl||'',this.responseText||'')});return send.apply(this,arguments)};"
             + "if(window.fetch){var fetch0=window.fetch;window.fetch=function(){var u=String(arguments[0]||'');return fetch0.apply(this,arguments).then(function(r){r.clone().text().then(function(t){take(u,t)});return r})}}"
             + "function click(e){if(!e)return false;['pointerdown','mousedown','mouseup','click'].forEach(function(t){e.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window}))});return true}"
             + "function textButton(text){return [].slice.call(document.querySelectorAll('a,button,[role=button],div,span,p')).find(function(e){return (e.innerText||e.textContent||'').trim()===text})}"
-            + "var timer=setInterval(function(){var path=location.pathname||'',body=(document.body&&document.body.innerText)||'',more=textButton('加载更多'),tradePage=/交易类型|没有更多记录|暂无交易记录/.test(body)||!!more;if(tradePage){if(more){click(more);last=Date.now();return}if(/没有更多|已全部加载|暂无交易记录/.test(body)||Date.now()-last>1800){clearInterval(timer);emit({code:c,ready:true,done:true});return}}if(path.indexOf('/fund/hold/detail')>=0){var card=document.querySelector('.template-container[data-jue-name=\"fundTemplate1001Amount.jue\"]');if(!card)return;if(!window.__fundAppExpanded){var expand=card.querySelector('.arrow-container-down');if(expand){click(expand);window.__fundAppExpanded=true;return}}var minor=card.querySelector('.minor');if(!minor||!/持有份额|持仓成本价/.test(minor.innerText||''))return;if(!opened){var record=textButton('交易记录');if(record){opened=true;click(record);return}}if(Date.now()-started>12000){clearInterval(timer);emit({code:c,ready:false,reason:'Transaction record control was unavailable'});return}}if(Date.now()-started>12000){clearInterval(timer);emit({code:c,ready:false,reason:'Transaction page did not respond'});}},300)})();";
+            + "function captureExisting(){var keys=['allDataList','dataList','tradeOrderVoList','tradeList','transactionList','orderList'],all=document.querySelectorAll('*'),seenVm=[];for(var i=0;i<all.length;i++){for(var vm=all[i].__vue__,depth=0;vm&&depth<8;vm=vm.$parent,depth++){if(seenVm.indexOf(vm)>=0)continue;seenVm.push(vm);for(var j=0;j<keys.length;j++){var value=vm[keys[j]];if(Array.isArray(value))takeValue(value)}}}}"
+            + "var timer=setInterval(function(){captureExisting();var path=location.pathname||'',body=(document.body&&document.body.innerText)||'',more=textButton('加载更多'),tradePage=/交易类型|没有更多记录|暂无交易记录/.test(body)||!!more;if(tradePage){if(more){click(more);last=Date.now();return}if(/没有更多|已全部加载|暂无交易记录/.test(body)||(hasRows&&Date.now()-last>1800)){clearInterval(timer);emit({code:c,ready:true,done:true});return}}if(path.indexOf('/fund/hold/detail')>=0){var card=document.querySelector('.template-container[data-jue-name=\"fundTemplate1001Amount.jue\"]');if(!card)return;if(!window.__fundAppExpanded){var expand=card.querySelector('.arrow-container-down');if(expand){click(expand);window.__fundAppExpanded=true;return}}var minor=card.querySelector('.minor');if(!minor||!/持有份额|持仓成本价/.test(minor.innerText||''))return;if(!opened){var record=textButton('交易记录');if(record){opened=true;click(record);return}}if(Date.now()-started>26000){clearInterval(timer);emit({code:c,ready:false,reason:'Transaction record control was unavailable'});return}}if(Date.now()-started>26000){clearInterval(timer);emit({code:c,ready:false,reason:'Transaction page did not return structured records'});}},300)})();";
     }
 
-    /** Hooks the decoded browser payload rather than replaying JD's encrypted trade API. */
+    /** Capture rows only after JD's own page has decoded the account timeline. */
     private String accountTradeBootstrap(String earliestDate) {
-        return "(function(){if(window.__fundAppAccountTradeHook)return;window.__fundAppAccountTradeHook=true;var cutoff=" + JSONObject.quote(earliestDate) + ",sent={},started=Date.now(),last=started,hasRows=false,reached=false,parse0=JSON.parse;"
+        return "(function(){if(window.__fundAppAccountTradeHook)return;window.__fundAppAccountTradeHook=true;var cutoff=" + JSONObject.quote(earliestDate) + ",sent={},pages={},started=Date.now(),lastPageAt=started,pageCount=0,totalRows=0,allCount=0,hasRows=false,terminal=false,requestedFirst=false,lastVmPage=-1,lastVmRows=-1,parse0=JSON.parse;"
             + "function emit(x){try{window.FundAppAccountTrade&&window.FundAppAccountTrade.receive(JSON.stringify(x))}catch(e){}}"
-            + "function isTradeRow(x){return !!(x&&typeof x==='object'&&(x.bizTime||x.tradeTime||x.confirmTime||x.orderCreateTime||x.tradeDate)&&(x.tradeTypeCode||x.tradeTypeName||x.tradeName||x.operationName||x.businessName||x.businessType||x.orderType)&&(x.productId||x.fundCode||x.sourceFundCode||x.fromFundCode)&&(x.unit||x.confirmUnit||x.tradeUnit||x.confirmShare||x.tradeShare||x.fundShare||x.applyShare||x.share||x.shares||x.allAmount||x.confirmAmount||x.tradeAmount||x.applyAmount||x.amount||x.money))}"
+            + "function progress(page,rows,totalRows,allCount){emit({progress:true,page:page,rows:rows,totalRows:totalRows,allCount:allCount})}"
+            + "function isTradeRow(x){return !!(x&&typeof x==='object'&&(x.bizTime||x.tradeTime||x.confirmTime||x.orderCreateTime||x.tradeDate)&&(x.tradeTypeCode||x.tradeTypeName||x.tradeName||x.operationName||x.businessName||x.businessType||x.orderType)&&(x.productId||x.fundCode||x.sellProductId||x.sourceFundCode||x.fromFundCode)&&(x.unit||x.confirmUnit||x.tradeUnit||x.confirmShare||x.tradeShare||x.fundShare||x.applyShare||x.share||x.shares||x.allAmount||x.confirmAmount||x.tradeAmount||x.applyAmount||x.amount||x.money))}"
             + "function rows(v,out){if(Array.isArray(v)){var matched=v.filter(isTradeRow);if(matched.length){out.push.apply(out,matched);return}v.forEach(function(x){rows(x,out)});return}if(v&&typeof v==='object')Object.keys(v).forEach(function(k){rows(v[k],out)})}"
-            + "function day(x){var t=String(x&&(x.bizTime||x.tradeTime||x.orderCreateTime||x.orderCreateDate||x.createTime||x.confirmTime||x.tradeDate)||'');var m=/(\\d{4})[-/.]?(\\d{1,2})[-/.]?(\\d{1,2})/.exec(t);return m?m[1]+'-'+('0'+m[2]).slice(-2)+'-'+('0'+m[3]).slice(-2):''}"
-            + "function take(v){try{var a=[];rows(v,a);if(!a.length)return;var k=JSON.stringify(a);if(sent[k])return;sent[k]=1;var old=false;a.forEach(function(x){var d=day(x);if(d&&d<cutoff)old=true});if(old)reached=true;a=a.filter(function(x){var d=day(x);return d&&d>=cutoff});if(!a.length){last=Date.now();return}hasRows=true;last=Date.now();emit({rows:a})}catch(e){}}"
+            + "function day(x){var t=x&&(x.bizTime||x.tradeTime||x.orderCreateTime||x.orderCreateDate||x.createTime||x.confirmTime||x.tradeDate);if(typeof t==='number'||/^\\d{10,13}$/.test(String(t||''))){var n=Number(t);if(String(Math.trunc(n)).length===10)n*=1000;var d=new Date(n+28800000);return isNaN(d.getTime())?'':d.toISOString().slice(0,10)}var m=/(\\d{4})[-/.]?(\\d{1,2})[-/.]?(\\d{1,2})/.exec(String(t||''));return m?m[1]+'-'+('0'+m[2]).slice(-2)+'-'+('0'+m[3]).slice(-2):''}"
+            + "function payload(v,depth){if(!v||typeof v!=='object'||depth>8)return null;if(v.data&&Array.isArray(v.data.tradeOrderVoList))return {list:v.data.tradeOrderVoList,page:Number(v.data.pageNo||0),all:Number(v.allCount||v.data.allCount||0)};var keys=Object.keys(v);for(var i=0;i<keys.length;i++){var found=payload(v[keys[i]],depth+1);if(found)return found}return null}"
+            + "function emitRows(a){if(!a||!a.length)return;var k=JSON.stringify(a);if(sent[k])return;sent[k]=1;hasRows=true;a=a.filter(function(x){var d=day(x);return d&&d>=cutoff});if(a.length)emit({rows:a})}"
+            + "function take(v){try{var p=payload(v,0),a=[];if(p){a=p.list||[];var page=p.page||pageCount+1;if(pages[page])return;pages[page]=1;pageCount=Math.max(pageCount,page);lastPageAt=Date.now();var pageRows=a.length;totalRows+=pageRows;allCount=p.all||allCount;if(allCount?totalRows>=allCount:pageRows<20)terminal=true;progress(page,pageRows,totalRows,allCount)}else rows(v,a);emitRows(a)}catch(e){}}"
             + "JSON.parse=function(){var v=parse0.apply(this,arguments);take(v);return v};"
             + "var open=XMLHttpRequest.prototype.open,send=XMLHttpRequest.prototype.send;XMLHttpRequest.prototype.open=function(){this.__fundAppUrl=String(arguments[1]||'');return open.apply(this,arguments)};XMLHttpRequest.prototype.send=function(){this.addEventListener('load',function(){try{take(parse0(this.responseText||''))}catch(e){}});return send.apply(this,arguments)};"
             + "if(window.fetch){var fetch0=window.fetch;window.fetch=function(){return fetch0.apply(this,arguments).then(function(r){r.clone().text().then(function(t){try{take(parse0(t))}catch(e){}});return r})}}"
             + "function click(e){if(!e)return false;['pointerdown','mousedown','mouseup','click'].forEach(function(t){e.dispatchEvent(new MouseEvent(t,{bubbles:true,cancelable:true,view:window}))});return true}"
             + "function textButton(text){return [].slice.call(document.querySelectorAll('a,button,[role=button],div,span,p')).find(function(e){return (e.innerText||e.textContent||'').trim()===text})}"
-            + "var timer=setInterval(function(){if(reached){clearInterval(timer);emit({done:true});return}var body=(document.body&&document.body.innerText)||'',more=textButton('加载更多');if(more){click(more);last=Date.now();return}if(/没有更多|已全部加载|暂无交易记录/.test(body)||(hasRows&&Date.now()-last>2200)){clearInterval(timer);emit({done:true});return}if(Date.now()-started>32000){clearInterval(timer);emit({ready:false,reason:'京东交易记录读取超时'});return}try{window.scrollBy(0,window.innerHeight||600)}catch(e){}},350)})();";
+            + "function findVm(){var all=document.querySelectorAll('*');for(var i=0;i<all.length;i++){var vm=all[i].__vue__;for(var depth=0;vm&&depth<8;depth++,vm=vm.$parent){if(typeof vm.getTradeOrderData==='function')return vm}}return null}"
+            + "function takeExisting(vm){var list=Array.isArray(vm.allDataList)?vm.allDataList:[],page=Math.max(0,Number(vm.pageNo||0)),count=list.length,total=Math.max(0,Number(vm.allCount||0));if(total>allCount)allCount=total;if(page>pageCount)pageCount=page;if(count>totalRows)totalRows=count;for(var n=1;n<=page;n++)pages[n]=1;if(page!==lastVmPage||count!==lastVmRows){var fresh=count>lastVmRows&&lastVmRows>=0?list.slice(lastVmRows):list;lastVmPage=page;lastVmRows=count;lastPageAt=Date.now();emitRows(fresh);if(page>0||count>0)progress(Math.max(1,page),count,totalRows,allCount)}}"
+            + "function pump(){var vm=findVm();if(vm){takeExisting(vm);if(vm.isEnd){terminal=true;return}if(!vm.netWorkLoading){if(hasRows){try{vm.getTradeOrderData()}catch(e){}}else if(!requestedFirst){requestedFirst=true;try{vm.getTradeOrderData()}catch(e){}}}}var all=document.querySelectorAll('*');for(var i=0;i<all.length;i++){var el=all[i];if(el.scrollHeight>el.clientHeight+4){el.scrollTop=el.scrollHeight;try{el.dispatchEvent(new Event('scroll',{bubbles:true}))}catch(e){}}}try{window.scrollTo(0,Math.max(document.body.scrollHeight,document.documentElement.scrollHeight))}catch(e){}}"
+            + "var timer=setInterval(function(){var now=Date.now(),body=(document.body&&document.body.innerText)||'',more=textButton('加载更多');if(terminal||(hasRows&&/没有更多|已全部加载/.test(body))){clearInterval(timer);emit({done:true});return}if(/暂无交易记录/.test(body)&&!hasRows){clearInterval(timer);emit({done:true});return}if(!pageCount&&now-started>" + ACCOUNT_TRADE_FIRST_PAGE_TIMEOUT_MILLIS + "){clearInterval(timer);emit({ready:false,reason:'京东交易记录首批分页数据读取超时'});return}if(pageCount&&!terminal&&now-lastPageAt>" + ACCOUNT_TRADE_STALL_TIMEOUT_MILLIS + "){clearInterval(timer);emit({ready:false,reason:'京东交易记录分页停滞：第 '+pageCount+' 页后未返回新数据'});return}if(more)click(more);pump();if(now-started>115000){clearInterval(timer);emit({ready:false,reason:'京东完整交易记录分页读取超时'});return}},500)})();";
     }
 
     private void appendAccountTradeRows(JSONArray rows, Set<String> currentCodes, JSArray target, Set<String> seen) {
@@ -810,9 +971,21 @@ public class JdHoldingsPlugin extends Plugin {
             if (row == null || !isEffectiveTrade(row)) continue;
             String type = resolveTradeType(row);
             if (type == null) continue;
-            String code = resolveAccountTradeFundCode(row, currentCodes);
-            String targetCode = normalizeFundCode(firstText(row, "targetProductId", "targetFundCode", "toFundCode"));
-            if (!currentCodes.contains(code) && !("convert".equals(type) && currentCodes.contains(targetCode))) continue;
+            boolean capturedTransform = "TRANSFORM".equalsIgnoreCase(firstText(row, "tradeTypeCode"));
+            String code = capturedTransform
+                ? normalizeFundCode(firstText(row, "sellProductId", "sourceProductId", "fromProductId"))
+                : resolveAccountTradeFundCode(row, currentCodes);
+            if (!code.matches("\\d{6}")) code = resolveAccountTradeFundCode(row, currentCodes);
+            String targetCode = capturedTransform
+                ? normalizeFundCode(firstText(row, "productId", "targetProductId", "targetFundCode", "toFundCode"))
+                : normalizeFundCode(firstText(row, "targetProductId", "targetFundCode", "toFundCode"));
+            String rawTime = firstText(row, "bizTime", "tradeTime", "orderCreateTime", "orderCreateDate", "createTime", "confirmTime", "tradeDate");
+            String tradeDate = normalizeTradeDate(rawTime);
+            boolean todayInbound = isTodayTradeDate(tradeDate)
+                && ("add".equals(type) || ("convert".equals(type) && targetCode.matches("\\d{6}")));
+            if (!currentCodes.contains(code)
+                && !("convert".equals(type) && currentCodes.contains(targetCode))
+                && !todayInbound) continue;
             try {
                 row.put("fundCode", code);
                 appendTradeRows(new JSONArray().put(row), code, target, seen);
@@ -824,7 +997,7 @@ public class JdHoldingsPlugin extends Plugin {
 
     private String resolveAccountTradeFundCode(JSONObject row, Set<String> currentCodes) {
         String fallback = "";
-        for (String key : new String[] { "fundCode", "productId", "productCode", "fundId", "sourceFundCode", "fromFundCode", "sourceProductId", "fromProductId" }) {
+        for (String key : new String[] { "fundCode", "sellProductId", "sourceFundCode", "fromFundCode", "sourceProductId", "fromProductId", "productId", "productCode", "fundId" }) {
             String value = firstText(row, key);
             String normalized = normalizeFundCode(value);
             if (currentCodes.contains(normalized)) return normalized;
@@ -844,7 +1017,10 @@ public class JdHoldingsPlugin extends Plugin {
             if (row == null || !isEffectiveTrade(row)) continue;
             String type = resolveTradeType(row);
             if (type == null) continue;
-            String code = normalizeFundCode(firstText(row, "fundCode", "productId", "sourceFundCode", "fromFundCode"));
+            boolean capturedTransform = "convert".equals(type) && !firstText(row, "sellProductId").isEmpty();
+            String code = normalizeFundCode(capturedTransform
+                ? firstText(row, "sellProductId", "sourceProductId", "fromProductId")
+                : firstText(row, "fundCode", "productId", "sourceFundCode", "fromFundCode"));
             if (!code.matches("\\d{6}")) code = fundCode;
             // Use the order/business time first. The grid resolves its
             // confirmation NAV from this timestamp and the fund cut-off rule.
@@ -852,8 +1028,12 @@ public class JdHoldingsPlugin extends Plugin {
             String date = normalizeTradeDate(rawTime);
             if (date == null) continue;
             if (!isWithinTradeHistory(date)) continue;
-            String shares = firstText(row, "unit", "confirmUnit", "tradeUnit", "confirmShare", "tradeShare", "fundShare", "applyShare", "share", "shares");
-            String amount = firstText(row, "allAmount", "confirmAmount", "tradeAmount", "applyAmount", "amount", "money");
+            String shares = firstText(row, "confirmUnit", "tradeUnit", "confirmShare", "tradeShare", "fundShare", "applyShare", "share", "shares");
+            String amount = firstText(row, "confirmAmount", "tradeAmount", "applyAmount", "amount", "money");
+            String allAmount = firstText(row, "allAmount");
+            String unit = firstText(row, "unit");
+            if (shares.isEmpty() && "份".equals(unit)) shares = allAmount;
+            if (amount.isEmpty() && !"份".equals(unit)) amount = allAmount;
             String tradeTime = normalizeTradeTimestamp(rawTime);
             String id = firstText(row, "orderId", "bizOrderId", "tradeOrderId", "orderNo", "subOrderId", "id");
             if (id.isEmpty()) id = code + ":" + type + ":" + (tradeTime == null ? date : tradeTime) + ":" + shares + ":" + amount;
@@ -861,16 +1041,32 @@ public class JdHoldingsPlugin extends Plugin {
             JSObject item = new JSObject();
             item.put("id", id);
             item.put("code", code);
-            item.put("name", firstText(row, "productName", "fundName", "sourceFundName", "fromFundName"));
+            item.put("name", capturedTransform
+                ? firstText(row, "sellProductName", "sourceFundName", "fromFundName")
+                : firstText(row, "productName", "fundName", "sourceFundName", "fromFundName"));
             item.put("type", type);
             item.put("tradeDate", date);
             if (tradeTime != null) item.put("tradeTime", tradeTime);
             item.put("shares", shares);
             item.put("amount", amount);
-            item.put("status", firstText(row, "orderStatusDesc", "orderStatusName", "statusName", "tradeStatus", "status", "orderStatus"));
+            String statusName = firstText(row, "orderStatusDesc", "orderStatusName", "statusName", "tradeStatus", "status", "orderStatus");
+            String statusCode = firstText(row, "statusCode", "orderStatusCode", "tradeStatusCode");
+            item.put("status", statusName);
+            if (!statusName.isEmpty()) item.put("statusName", statusName);
+            if (!statusCode.isEmpty()) item.put("statusCode", statusCode);
+            String confirmationTime = firstText(row, "confirmationTime", "confirmTime", "confirmDate", "redeemTime", "expectedArrivalTime");
+            if (!confirmationTime.isEmpty()) item.put("confirmTime", confirmationTime);
+            String rawConfirmationTime = firstText(row, "confirmationTime");
+            String redeemTime = firstText(row, "redeemTime");
+            if (!rawConfirmationTime.isEmpty()) item.put("confirmationTime", rawConfirmationTime);
+            if (!redeemTime.isEmpty()) item.put("redeemTime", redeemTime);
             if ("convert".equals(type)) {
-                item.put("targetCode", normalizeFundCode(firstText(row, "targetProductId", "targetFundCode", "toFundCode")));
-                item.put("targetName", firstText(row, "targetProductName", "targetFundName", "toFundName"));
+                item.put("targetCode", normalizeFundCode(capturedTransform
+                    ? firstText(row, "productId", "targetProductId", "targetFundCode", "toFundCode")
+                    : firstText(row, "targetProductId", "targetFundCode", "toFundCode")));
+                item.put("targetName", capturedTransform
+                    ? firstText(row, "productName", "targetProductName", "targetFundName", "toFundName")
+                    : firstText(row, "targetProductName", "targetFundName", "toFundName"));
                 item.put("targetShares", firstText(row, "targetUnit", "targetShare", "targetShares", "targetFundShare", "toFundShare", "convertShare"));
             }
             target.put(item);
@@ -1045,6 +1241,10 @@ public class JdHoldingsPlugin extends Plugin {
     }
 
     private String resolveTradeType(JSONObject row) {
+        String typeCode = firstText(row, "tradeTypeCode").toUpperCase(Locale.ROOT);
+        if ("TRANSFER_IN".equals(typeCode)) return "add";
+        if ("TRANSFER_OUT".equals(typeCode)) return "reduce";
+        if ("TRANSFORM".equals(typeCode)) return "convert";
         String descriptor = (firstText(row, "tradeTypeCode") + " " + firstText(row, "tradeTypeName", "tradeName", "operationName", "businessName", "businessType", "orderType")).toLowerCase(Locale.ROOT);
         if (descriptor.contains("transform") || descriptor.contains("convert") || descriptor.contains("adjust_position") || descriptor.contains("转换") || descriptor.contains("调仓")) return "convert";
         if (descriptor.contains("sell") || descriptor.contains("redeem") || descriptor.contains("redemption") || descriptor.contains("赎回") || descriptor.contains("卖出") || descriptor.contains("转出")) return "reduce";
@@ -1053,12 +1253,20 @@ public class JdHoldingsPlugin extends Plugin {
     }
 
     private boolean isEffectiveTrade(JSONObject row) {
+        String statusCode = firstText(row, "statusCode", "orderStatusCode", "tradeStatusCode").toUpperCase(Locale.ROOT);
+        if (statusCode.startsWith("CANCEL") || statusCode.startsWith("FAIL") || statusCode.startsWith("REFUND") || statusCode.startsWith("CLOSE")) return false;
         String status = firstText(row, "orderStatusDesc", "orderStatusName", "statusName", "tradeStatus", "status", "orderStatus").toLowerCase(Locale.ROOT);
         return !(status.contains("cancel") || status.contains("fail") || status.contains("refund") || status.contains("关闭") || status.contains("取消") || status.contains("失败") || status.contains("退款"));
     }
 
     private String normalizeTradeDate(String value) {
         String text = textValue(value).replace('T', ' ');
+        Long epochMillis = parseTradeEpochMillis(text);
+        if (epochMillis != null) {
+            Calendar calendar = Calendar.getInstance(TimeZone.getTimeZone("Asia/Shanghai"));
+            calendar.setTimeInMillis(epochMillis);
+            return String.format(Locale.ROOT, "%04d-%02d-%02d", calendar.get(Calendar.YEAR), calendar.get(Calendar.MONTH) + 1, calendar.get(Calendar.DAY_OF_MONTH));
+        }
         java.util.regex.Matcher full = java.util.regex.Pattern.compile("^(\\d{4})[-/.](\\d{1,2})[-/.](\\d{1,2}).*").matcher(text);
         if (full.matches()) return formatTradeDate(Integer.parseInt(full.group(1)), Integer.parseInt(full.group(2)), Integer.parseInt(full.group(3)));
         java.util.regex.Matcher compact = java.util.regex.Pattern.compile("^(\\d{4})(\\d{2})(\\d{2}).*").matcher(text);
@@ -1081,6 +1289,14 @@ public class JdHoldingsPlugin extends Plugin {
         return null;
     }
 
+    private boolean isTodayTradeDate(String value) {
+        if (value == null) return false;
+        Calendar today = Calendar.getInstance(TimeZone.getTimeZone("Asia/Shanghai"));
+        String todayText = String.format(Locale.ROOT, "%04d-%02d-%02d",
+            today.get(Calendar.YEAR), today.get(Calendar.MONTH) + 1, today.get(Calendar.DAY_OF_MONTH));
+        return todayText.equals(value);
+    }
+
     private String formatTradeDate(int year, int month, int day) {
         Calendar calendar = Calendar.getInstance(TimeZone.getTimeZone("Asia/Shanghai"));
         calendar.setLenient(false);
@@ -1096,20 +1312,43 @@ public class JdHoldingsPlugin extends Plugin {
 
     private String normalizeTradeTimestamp(String value) {
         String text = textValue(value).replace('T', ' ');
+        Long epochMillis = parseTradeEpochMillis(text);
+        if (epochMillis != null) {
+            Calendar calendar = Calendar.getInstance(TimeZone.getTimeZone("Asia/Shanghai"));
+            calendar.setTimeInMillis(epochMillis);
+            return String.format(Locale.ROOT, "%04d-%02d-%02d %02d:%02d:%02d",
+                calendar.get(Calendar.YEAR), calendar.get(Calendar.MONTH) + 1, calendar.get(Calendar.DAY_OF_MONTH),
+                calendar.get(Calendar.HOUR_OF_DAY), calendar.get(Calendar.MINUTE), calendar.get(Calendar.SECOND));
+        }
         String date = normalizeTradeDate(text);
         if (date == null) return null;
         java.util.regex.Matcher matcher = java.util.regex.Pattern.compile(".*?(\\d{2}:\\d{2})(?::(\\d{2}))?.*").matcher(text);
         return matcher.matches() ? date + " " + matcher.group(1) + (matcher.group(2) == null ? "" : ":" + matcher.group(2)) : null;
     }
 
-    /** Include today and the preceding 29 Beijing calendar days. */
+    private Long parseTradeEpochMillis(String value) {
+        String text = textValue(value);
+        if (!text.matches("\\d{10}|\\d{13}")) return null;
+        try {
+            long timestamp = Long.parseLong(text);
+            if (text.length() == 10) timestamp *= 1000L;
+            Calendar calendar = Calendar.getInstance(TimeZone.getTimeZone("Asia/Shanghai"));
+            calendar.setTimeInMillis(timestamp);
+            int year = calendar.get(Calendar.YEAR);
+            return year >= 2000 && year <= 2100 ? timestamp : null;
+        } catch (NumberFormatException ignored) {
+            return null;
+        }
+    }
+
+    /** Match JD's transaction page: today through the preceding ten years. */
     private String getTradeHistoryStartDate() {
         Calendar calendar = Calendar.getInstance(TimeZone.getTimeZone("Asia/Shanghai"));
         calendar.set(Calendar.HOUR_OF_DAY, 0);
         calendar.set(Calendar.MINUTE, 0);
         calendar.set(Calendar.SECOND, 0);
         calendar.set(Calendar.MILLISECOND, 0);
-        calendar.add(Calendar.DAY_OF_YEAR, -(TRADE_HISTORY_DAYS - 1));
+        calendar.add(Calendar.YEAR, -TRADE_HISTORY_YEARS);
         return String.format(Locale.ROOT, "%04d-%02d-%02d", calendar.get(Calendar.YEAR), calendar.get(Calendar.MONTH) + 1, calendar.get(Calendar.DAY_OF_MONTH));
     }
 
@@ -1124,11 +1363,28 @@ public class JdHoldingsPlugin extends Plugin {
         return positiveNumber(amount) || positiveNumber(shares);
     }
 
+    /** Only a decoded JD detail with no positive value is eligible to close a local holding. */
+    private boolean hasExplicitZeroPosition(String amount, String shares) {
+        Double parsedAmount = parsedNumber(amount);
+        Double parsedShares = parsedNumber(shares);
+        if (parsedAmount == null && parsedShares == null) return false;
+        return (parsedAmount == null || Math.abs(parsedAmount) < 0.000001d)
+            && (parsedShares == null || Math.abs(parsedShares) < 0.000001d);
+    }
+
     private boolean positiveNumber(String value) {
+        Double parsed = parsedNumber(value);
+        return parsed != null && parsed > 0;
+    }
+
+    private Double parsedNumber(String value) {
         try {
-            return Double.parseDouble(textValue(value).replaceAll("[^0-9.\\-]", "")) > 0;
+            String normalized = textValue(value).replaceAll("[^0-9.\\-]", "");
+            if (normalized.isEmpty() || "-".equals(normalized) || ".".equals(normalized)) return null;
+            double parsed = Double.parseDouble(normalized);
+            return Double.isFinite(parsed) ? parsed : null;
         } catch (Exception ignored) {
-            return false;
+            return null;
         }
     }
 
@@ -1174,6 +1430,7 @@ public class JdHoldingsPlugin extends Plugin {
             if (pair.contains("=")) {
                 cookies.setCookie(LOGIN_URL, pair);
                 cookies.setCookie("https://roma.jd.com", pair);
+                cookies.setCookie("https://mix.jd.com", pair);
                 cookies.setCookie("https://ms.jr.jd.com", pair);
             }
         }
@@ -1305,29 +1562,38 @@ public class JdHoldingsPlugin extends Plugin {
         private boolean complete;
         private boolean failed;
         private String reason = "";
+        private int pageCount;
+        private int allCount;
 
-        synchronized void receive(String value) {
-            try {
-                JSONObject response = new JSONObject(value);
-                if (response.has("ready") && !response.optBoolean("ready", false)) {
-                    fail(response.optString("reason", "京东交易记录不可用"));
-                    return;
-                }
-                JSONArray responseRows = response.optJSONArray("rows");
-                if (responseRows != null) {
-                    for (int index = 0; index < responseRows.length(); index++) rows.put(responseRows.opt(index));
-                }
-                if (response.optBoolean("done", false)) {
-                    complete = true;
-                    done.countDown();
-                }
-            } catch (Exception error) {
-                fail("京东交易记录响应格式异常");
+        synchronized void receive(JSONObject response) {
+            if (response.has("ready") && !response.optBoolean("ready", false)) {
+                fail(response.optString("reason", "京东交易记录不可用"));
+                return;
+            }
+            JSONArray responseRows = response.optJSONArray("rows");
+            if (responseRows != null) {
+                for (int index = 0; index < responseRows.length(); index++) rows.put(responseRows.opt(index));
+            }
+            if (response.optBoolean("progress", false)) {
+                pageCount = Math.max(pageCount, response.optInt("page", 0));
+                allCount = Math.max(allCount, response.optInt("allCount", 0));
+            }
+            if (response.optBoolean("done", false)) {
+                complete = true;
+                done.countDown();
             }
         }
 
         synchronized JSONArray rows() {
             return rows;
+        }
+
+        synchronized int pageCount() {
+            return pageCount;
+        }
+
+        synchronized int allCount() {
+            return allCount;
         }
 
         synchronized void fail(String error) {
@@ -1341,7 +1607,7 @@ public class JdHoldingsPlugin extends Plugin {
         }
     }
 
-    private static class AccountTradeBridge {
+    private class AccountTradeBridge {
         private final AccountTradeCapture capture;
 
         AccountTradeBridge(AccountTradeCapture capture) {
@@ -1350,7 +1616,33 @@ public class JdHoldingsPlugin extends Plugin {
 
         @JavascriptInterface
         public void receive(String value) {
-            capture.receive(value);
+            try {
+                JSONObject response = new JSONObject(value);
+                if (response.optBoolean("progress", false)) {
+                    int page = Math.max(1, response.optInt("page", 1));
+                    int pageRows = Math.max(0, response.optInt("rows", 0));
+                    int totalRows = Math.max(0, response.optInt("totalRows", 0));
+                    int allCount = Math.max(0, response.optInt("allCount", 0));
+                    String totalText = allCount > 0 ? " / 共 " + allCount + " 条" : "";
+                    reportProgress(
+                        "reading_trades",
+                        "正在读取京东交易记录：第 " + page + " 页，本页 " + pageRows + " 条，累计 " + totalRows + " 条" + totalText,
+                        totalRows,
+                        allCount
+                    );
+                }
+                if (response.has("ready") && !response.optBoolean("ready", false)) {
+                    reportProgress(
+                        "reading_trades",
+                        response.optString("reason", "京东交易记录分页读取失败"),
+                        0,
+                        0
+                    );
+                }
+                capture.receive(response);
+            } catch (Exception error) {
+                capture.fail("京东交易记录分页进度格式异常");
+            }
         }
     }
 
@@ -1428,10 +1720,71 @@ public class JdHoldingsPlugin extends Plugin {
     private static class FundTradeRows {
         private final String code;
         private final JSONArray rows;
+        private final String error;
+        private final int attempts;
 
-        FundTradeRows(String code, JSONArray rows) {
+        FundTradeRows(String code, JSONArray rows, String error, int attempts) {
             this.code = code;
             this.rows = rows;
+            this.error = error == null ? "" : error;
+            this.attempts = attempts;
+        }
+    }
+
+    private static class AccountTradeResult {
+        private final JSArray rows;
+        private final int pageCount;
+        private final int rawRows;
+        private final int allCount;
+
+        AccountTradeResult(JSArray rows, int pageCount, int rawRows, int allCount) {
+            this.rows = rows;
+            this.pageCount = pageCount;
+            this.rawRows = rawRows;
+            this.allCount = allCount;
+        }
+    }
+
+    private static class CurrentHoldingTradeResult {
+        private final JSArray rows;
+        private final String warning;
+        private final int attempted;
+        private final int succeeded;
+        private final int failed;
+        private final int rawRows;
+        private final int retried;
+
+        CurrentHoldingTradeResult(
+            JSArray rows,
+            String warning,
+            int attempted,
+            int succeeded,
+            int failed,
+            int rawRows,
+            int retried
+        ) {
+            this.rows = rows;
+            this.warning = warning == null ? "" : warning;
+            this.attempted = attempted;
+            this.succeeded = succeeded;
+            this.failed = failed;
+            this.rawRows = rawRows;
+            this.retried = retried;
+        }
+
+        String diagnostic() {
+            String value = "详情 " + succeeded + "/" + attempted + " 只成功、失败 " + failed
+                + " 只、原始 " + rawRows + " 条、有效 " + rows.length() + " 条";
+            if (retried > 0) value += "、重试成功 " + retried + " 只";
+            return value;
+        }
+
+        static CurrentHoldingTradeResult empty() {
+            return new CurrentHoldingTradeResult(new JSArray(), "", 0, 0, 0, 0, 0);
+        }
+
+        static CurrentHoldingTradeResult failed(String warning) {
+            return new CurrentHoldingTradeResult(new JSArray(), warning, 0, 0, 0, 0, 0);
         }
     }
 

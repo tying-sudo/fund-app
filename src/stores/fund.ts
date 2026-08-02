@@ -7,6 +7,7 @@ import { ref, computed, onUnmounted } from 'vue'
 import type { WatchlistItem, FundEstimate, PeriodReturnItem, DataSource } from '@/types/fund'
 import { 
   fetchFundEstimateFast, 
+  fetchFundEstimatesBatch,
   fetchRealDayChange, 
   calculatePeriodReturns,
   fetchValuationEstimateBySource,
@@ -67,6 +68,7 @@ export const useFundStore = defineStore('fund', () => {
   
   /** 自动刷新定时器 */
   let refreshTimer: ReturnType<typeof setInterval> | null = null
+  let refreshInFlight: Promise<void> | null = null
 
   // ========== Getters ==========
   
@@ -116,7 +118,7 @@ export const useFundStore = defineStore('fund', () => {
     if (!settingsStore.autoRefresh) return 0
     
     return isTradingTime() 
-      ? settingsStore.tradingInterval * 1000 
+      ? 1_000
       : settingsStore.afterHoursInterval * 1000
   }
 
@@ -157,7 +159,15 @@ export const useFundStore = defineStore('fund', () => {
    * 刷新所有自选基金的估值
    * [WHY] 下拉刷新或定时刷新时调用
    */
-  async function refreshEstimates() {
+  function refreshEstimates(): Promise<void> {
+    if (refreshInFlight) return refreshInFlight
+    refreshInFlight = refreshEstimatesOnce().finally(() => {
+      refreshInFlight = null
+    })
+    return refreshInFlight
+  }
+
+  async function refreshEstimatesOnce() {
     if (watchlist.value.length === 0) {
       // [EDGE] 没有自选时也需要重置刷新状态
       isRefreshing.value = false
@@ -169,15 +179,17 @@ export const useFundStore = defineStore('fund', () => {
     
         try {
       // [WHAT] 并发请求所有基金估值 + 真实涨跌幅
-      const [estimateResults, realChangeResults] = await Promise.all([
-        Promise.all(codes.map(code => {
+      const defaultCodes = codes.filter(code => getFundDataSource(code) === 'tiantian')
+      const [batchEstimates, customEstimates, realChangeResults] = await Promise.all([
+        fetchFundEstimatesBatch(defaultCodes),
+        Promise.all(codes.map(async code => {
           const source = getFundDataSource(code)
-          return source === 'tiantian'
-            ? fetchFundEstimateFast(code).catch(() => null)
-            : fetchValuationEstimateBySource(code, source).catch(() => null)
+          if (source === 'tiantian') return null
+          return fetchValuationEstimateBySource(code, source).catch(() => null)
         })),
         Promise.all(codes.map(code => fetchRealDayChange(code).catch(() => null)))
       ])
+      const estimateResults = codes.map((code, index) => batchEstimates.get(code) || customEstimates[index])
       
       // [WHAT] 更新每只基金的估值数据
       estimateResults.forEach((data, index) => {
@@ -309,7 +321,7 @@ export const useFundStore = defineStore('fund', () => {
    * [WHAT] 将 API 返回的数据更新到 watchlist 中
    * [EDGE] QDII基金在非交易日时，估值日期可能不是今天，需要特殊处理
    */
-  function updateFundData(code: string, data: FundEstimate, realChangeResult?: { changeRate: number; date: string } | null) {
+  function updateFundData(code: string, data: FundEstimate, realChangeResult?: { changeRate: number; date: string; isFresh?: boolean } | null) {
     const index = watchlist.value.findIndex((item) => item.code === code)
     if (index > -1) {
       // [WHAT] 保留已有的 type 和 realChange，避免丢失
@@ -326,11 +338,11 @@ export const useFundStore = defineStore('fund', () => {
       let realChange: number | undefined
       let realChangeDate: string | undefined
       
-      if (realChangeResult && realChangeResult.changeRate !== undefined) {
+      const discardExpiredOfficial = realChangeResult?.isFresh === false
+      if (!discardExpiredOfficial && realChangeResult && realChangeResult.changeRate !== undefined) {
         realChange = realChangeResult.changeRate
         realChangeDate = realChangeResult.date
-        
-      } else {
+      } else if (!discardExpiredOfficial) {
         // 保留旧值
         realChange = existingRealChange
         realChangeDate = existingRealChangeDate
@@ -340,8 +352,8 @@ export const useFundStore = defineStore('fund', () => {
         estimate: data,
         incomingChange: realChange,
         incomingDate: realChangeDate,
-        cachedChange: existingRealChange,
-        cachedDate: existingRealChangeDate,
+        cachedChange: discardExpiredOfficial ? undefined : existingRealChange,
+        cachedDate: discardExpiredOfficial ? undefined : existingRealChangeDate,
         cachedOfficialValue: existingOfficialValue,
         cachedOfficialValueDate: existingOfficialValueDate
       })

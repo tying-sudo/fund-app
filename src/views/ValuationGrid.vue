@@ -1,13 +1,15 @@
 <script setup lang="ts">
 import { computed, nextTick, onActivated, onBeforeUnmount, onDeactivated, onMounted, reactive, ref, watch } from 'vue'
-import { closeToast, showConfirmDialog, showLoadingToast, showToast } from 'vant'
+import { showConfirmDialog, showToast } from 'vant'
 import { useRouter } from 'vue-router'
 import Sortable from 'sortablejs'
 import { useHoldingStore } from '@/stores/holding'
 import { getJdFundLink } from '@/utils/format'
-import { importJdHoldingsWithCookie } from '@/utils/jdHoldings'
-import { buildGridJdImportPayload } from '@/utils/gridJdImport'
+import { importJdHoldingsWithCookie, jdImportErrorMessage, toJdSyncProgressState, type JdSyncProgress } from '@/utils/jdHoldings'
+import { buildGridJdImportPayload, formatGridJdImportFeedback } from '@/utils/gridJdImport'
+import { fetchFundEstimatesBatch, fetchFundSnapshotEstimates } from '@/api/fundFast'
 import JdCookieImportDialog from '@/components/JdCookieImportDialog.vue'
+import JdImportProgress from '@/components/JdImportProgress.vue'
 import { mergeStrategyOrder, sortByStrategyOrder } from '@/utils/gridStrategyOrder'
 import {
   calculateGridConversionTransferIn,
@@ -67,6 +69,7 @@ const props = defineProps<{
 
 const router = useRouter()
 const holdingStore = useHoldingStore()
+const activePane = ref<'valuation' | 'strategy'>(props.mode)
 const state = ref<GridState>({ sectors: [] })
 const valuations = ref<Record<string, GridValuation>>({})
 const fitnessScores = ref<Record<string, GridFitness>>({})
@@ -105,6 +108,8 @@ const positionEditorOpen = ref(false)
 const positionSaving = ref(false)
 const jdImporting = ref(false)
 const showJdCookieDialog = ref(false)
+const jdSyncProgress = ref({ message: '正在读取京东当前持仓...', percentage: 8 })
+const jdImportFeedback = ref<{ message: string; hasWarning: boolean } | null>(null)
 const tradeImageInput = ref<HTMLInputElement | null>(null)
 const tradeImportOpen = ref(false)
 const tradeImportRecognizing = ref(false)
@@ -171,18 +176,24 @@ let valuationRefreshTimer: ReturnType<typeof window.setInterval> | undefined
 let valuationRefreshInFlight: Promise<void> | undefined
 let valuationLoadInFlight: Promise<void> | undefined
 const valuationRefreshIntervalMs = 15_000
+let liveEstimateTimer: ReturnType<typeof window.setInterval> | undefined
+let liveEstimateInFlight: Promise<void> | undefined
+const liveEstimateIntervalMs = 1_000
+let cloudSnapshotTimer: ReturnType<typeof window.setInterval> | undefined
+let cloudSnapshotInFlight: Promise<void> | undefined
+const cloudSnapshotIntervalMs = 60_000
+let cloudEstimateTimer: ReturnType<typeof window.setInterval> | undefined
+let cloudEstimateInFlight: Promise<void> | undefined
+const cloudEstimateIntervalMs = 15_000
 
 const valuationCacheKey = 'fund-app:native-valuation:v2'
 const legacyValuationCacheKey = 'fund-app:native-valuation:v1'
 const strategyCacheKey = 'fund-app:native-strategy:v1'
 const valuationCacheFreshMs = 2 * 60 * 1000
 
-const isValuation = computed(() => props.mode === 'valuation')
+const isValuation = computed(() => activePane.value === 'valuation')
 const isPageRefreshing = computed(() => refreshing.value || strategyRefreshing.value)
-const pageTitle = computed(() => isValuation.value ? '实时估值' : '低频网格')
-const allCodes = computed(() => [...new Set(
-  state.value.sectors.flatMap((sector) => sector.funds.map((fund) => fund.code).filter(Boolean))
-)])
+const pageTitle = computed(() => '估值与网格')
 const sortedSectors = computed(() => state.value.sectors.map((sector, index) => ({
   sector,
   index,
@@ -192,10 +203,35 @@ const sortedSectors = computed(() => state.value.sectors.map((sector, index) => 
     return rightChange - leftChange
   })
 })))
+const sectorCloudItems = computed(() => sortedSectors.value.map(({ sector, index }) => {
+  const quoteChanges = sector.funds
+    .map((fund) => valueFor(fund.code).estimation_change)
+    .filter((change): change is number => typeof change === 'number' && Number.isFinite(change))
+  const estimationChange = quoteChanges.length
+    ? quoteChanges.reduce((total, change) => total + change, 0) / quoteChanges.length
+    : null
+  const roundedChange = estimationChange === null ? null : Math.round(estimationChange * 100) / 100
+  return {
+    sector,
+    index,
+    estimationChange: roundedChange,
+    quotedCount: quoteChanges.length,
+    weight: Math.min(1.7, 1 + sector.funds.length * 0.08 + Math.min(Math.abs(roundedChange || 0), 5) * 0.06)
+  }
+}))
 const activeSector = computed(() => (
   sortedSectors.value.find(({ index }) => index === activeSectorIndex.value)
   || sortedSectors.value[0]
 ))
+const visibleValuationCodes = computed(() => [...new Set(
+  (activeSector.value?.sector.funds || []).map(fund => fund.code).filter(Boolean)
+)])
+const cloudValuationCodes = computed(() => [...new Set(
+  state.value.sectors.flatMap(sector => sector.funds.map(fund => fund.code).filter(Boolean))
+)])
+const liveEstimateCodes = computed(() => isValuation.value
+  ? visibleValuationCodes.value
+  : [...new Set(strategyRows.value.map(row => row.code).filter(Boolean))])
 watch(() => state.value.sectors.length, (length) => {
   if (!length) {
     activeSectorIndex.value = 0
@@ -429,11 +465,11 @@ async function saveState() {
 }
 
 async function refreshValuations() {
-  if (!allCodes.value.length) return
+  const codes = [...visibleValuationCodes.value]
+  if (!codes.length) return
   if (valuationRefreshInFlight) return valuationRefreshInFlight
 
   refreshing.value = true
-  const codes = [...allCodes.value]
   const refreshPromise = (async () => {
     try {
       const [items, scores] = await Promise.all([
@@ -462,6 +498,136 @@ async function refreshValuations() {
   return refreshPromise
 }
 
+function parseLiveNumber(value: unknown) {
+  if (typeof value === 'string' && !value.trim()) return null
+  const parsed = Number(value)
+  return Number.isFinite(parsed) ? parsed : null
+}
+
+function mergeFastEstimates(estimates: Map<string, { name?: string; gszzl?: string; gztime?: string; source?: string }>) {
+  const next = { ...valuations.value }
+  for (const [code, estimate] of estimates) {
+    const change = parseLiveNumber(estimate.gszzl)
+    if (change === null) continue
+    const current = next[code]
+    const incomingSource = estimate.source || current?._source
+    // A published snapshot is a fallback and must not replace a realtime value.
+    if (incomingSource === 'market_snapshot' && current?._source && current._source !== 'market_snapshot') continue
+    next[code] = mergeValuation(current, {
+      fund_code: code,
+      fund_name: estimate.name || current?.fund_name,
+      estimation_change: change,
+      _source: incomingSource,
+      _valuation_date: estimate.gztime || current?._valuation_date
+    })
+  }
+  valuations.value = next
+  rememberValuationFundNames()
+}
+
+async function refreshCloudSnapshots() {
+  const codes = [...cloudValuationCodes.value]
+  if (!isValuation.value || !codes.length) return
+  if (cloudSnapshotInFlight) return cloudSnapshotInFlight
+
+  const refreshPromise = (async () => {
+    try {
+      const snapshots = await fetchFundSnapshotEstimates(codes)
+      const next = { ...valuations.value }
+      for (const [code, snapshot] of snapshots) {
+        const change = parseLiveNumber(snapshot.changePercent)
+        if (change === null) continue
+        const current = next[code]
+        if (current?._source && current._source !== 'market_snapshot') continue
+        next[code] = mergeValuation(current, {
+          fund_code: code,
+          fund_name: snapshot.name || current?.fund_name,
+          estimation_change: change,
+          _source: 'market_snapshot',
+          _valuation_date: snapshot.navDate || current?._valuation_date
+        })
+      }
+      if (snapshots.size) {
+        valuations.value = next
+        rememberValuationFundNames()
+        writeValuationCache()
+      }
+    } catch {
+      // The active-sector stream remains available if snapshot hydration fails.
+    } finally {
+      cloudSnapshotInFlight = undefined
+    }
+  })()
+  cloudSnapshotInFlight = refreshPromise
+  return refreshPromise
+}
+
+async function refreshCloudEstimates() {
+  const codes = [...cloudValuationCodes.value]
+  if (!isValuation.value || !codes.length) return
+  if (cloudEstimateInFlight) return cloudEstimateInFlight
+
+  const refreshPromise = (async () => {
+    try {
+      const estimates = await fetchFundEstimatesBatch(codes, {
+        timeoutMs: 55_000,
+        fallbackToSingle: false
+      })
+      if (!estimates.size) return
+      mergeFastEstimates(estimates)
+      writeValuationCache()
+    } catch {
+      // Snapshot values remain visible while the full realtime frame recovers.
+    } finally {
+      cloudEstimateInFlight = undefined
+    }
+  })()
+  cloudEstimateInFlight = refreshPromise
+  return refreshPromise
+}
+
+async function refreshLiveEstimates() {
+  const codes = [...liveEstimateCodes.value]
+  if (!codes.length) return
+  if (liveEstimateInFlight) return liveEstimateInFlight
+
+  const refreshPromise = (async () => {
+    try {
+      const estimates = await fetchFundEstimatesBatch(codes)
+      if (isValuation.value) {
+        mergeFastEstimates(estimates)
+        if (estimates.size > 0 && state.value.sectors.length > 0) loadError.value = ''
+      } else {
+        signals.value = signals.value.map((signal) => {
+          const code = signal.fund_code.split('__')[0]
+          const estimate = estimates.get(code)
+          if (!estimate) return signal
+          const todayChange = parseLiveNumber(estimate.gszzl)
+          const currentNav = parseLiveNumber(estimate.gsz)
+          if (todayChange === null && currentNav === null) return signal
+          return {
+            ...signal,
+            market_analysis: {
+              ...signal.market_analysis,
+              ...(todayChange === null ? {} : { today_change: todayChange }),
+              ...(currentNav === null ? {} : { current_nav: currentNav })
+            }
+          }
+        })
+      }
+      if (estimates.size > 0) {
+        lastUpdatedAt.value = new Date().toLocaleTimeString('zh-CN', { hour: '2-digit', minute: '2-digit', second: '2-digit' })
+      }
+    } catch {
+      // Keep the latest successful frame visible while the fast channel recovers.
+    } finally {
+      liveEstimateInFlight = undefined
+    }
+  })()
+  liveEstimateInFlight = refreshPromise
+  return refreshPromise
+}
+
 async function loadValuation(force = false) {
   if (valuationLoadInFlight) return valuationLoadInFlight
 
@@ -470,6 +636,8 @@ async function loadValuation(force = false) {
   if (!force && cachedAt && Date.now() - cachedAt < valuationCacheFreshMs) {
     // Render cached values immediately, then let a fresh confidence/fitness
     // result replace that snapshot as soon as it arrives.
+    void refreshCloudSnapshots()
+    void refreshCloudEstimates()
     await refreshValuations()
     return
   }
@@ -481,6 +649,8 @@ async function loadValuation(force = false) {
       applyStateStrategyOrder(state.value)
       if (Object.keys(scores).length > 0) fitnessScores.value = scores
       rememberValuationFundNames()
+      void refreshCloudSnapshots()
+      void refreshCloudEstimates()
       await refreshValuations()
     } catch (error) {
       loadError.value = error instanceof Error ? error.message : '估值页面加载失败'
@@ -563,14 +733,58 @@ function startValuationStream() {
   }, valuationRefreshIntervalMs)
 }
 
+function stopLiveEstimateStream() {
+  if (!liveEstimateTimer) return
+  window.clearInterval(liveEstimateTimer)
+  liveEstimateTimer = undefined
+}
+
+function stopCloudStreams() {
+  if (cloudSnapshotTimer) window.clearInterval(cloudSnapshotTimer)
+  if (cloudEstimateTimer) window.clearInterval(cloudEstimateTimer)
+  cloudSnapshotTimer = undefined
+  cloudEstimateTimer = undefined
+}
+
+function startCloudStreams() {
+  if (!isValuation.value) return
+  void refreshCloudSnapshots()
+  void refreshCloudEstimates()
+  if (!cloudSnapshotTimer) {
+    cloudSnapshotTimer = window.setInterval(() => {
+      if (document.hidden || cloudSnapshotInFlight) return
+      void refreshCloudSnapshots()
+    }, cloudSnapshotIntervalMs)
+  }
+  if (!cloudEstimateTimer) {
+    cloudEstimateTimer = window.setInterval(() => {
+      if (document.hidden || cloudEstimateInFlight) return
+      void refreshCloudEstimates()
+    }, cloudEstimateIntervalMs)
+  }
+}
+
+function startLiveEstimateStream() {
+  if (liveEstimateTimer) return
+  void refreshLiveEstimates()
+  liveEstimateTimer = window.setInterval(() => {
+    if (document.hidden || liveEstimateInFlight) return
+    void refreshLiveEstimates()
+  }, liveEstimateIntervalMs)
+}
+
 function stopRefreshStreams() {
   stopStrategyStream()
   stopValuationStream()
+  stopLiveEstimateStream()
+  stopCloudStreams()
 }
 
 function startRefreshStream() {
   if (isValuation.value) startValuationStream()
   else startStrategyStream()
+  startLiveEstimateStream()
+  startCloudStreams()
 }
 
 function rememberValuationFundNames() {
@@ -690,8 +904,10 @@ async function loadPage(force = false) {
 }
 
 async function refreshPage() {
-  if (isValuation.value) await refreshValuations()
-  else await refreshStrategy(true)
+  await Promise.all([
+    isValuation.value ? refreshValuations() : refreshStrategy(true),
+    refreshLiveEstimates()
+  ])
 }
 
 async function onPullRefresh() {
@@ -825,6 +1041,7 @@ function holdingBatchCount(position?: GridPosition) {
 function signalStats(signal: GridSignal) {
   const analysis = signal.market_analysis
   return [
+    ['今日', analysis?.today_change],
     ['3日', analysis?.short_3d],
     ['5日', analysis?.short_5d],
     ['10日', analysis?.mid_10d],
@@ -865,6 +1082,37 @@ function sellRecords(position?: GridPosition) {
   return [...(position?.sell_records || [])].sort((left, right) =>
     (right.sell_date || '').localeCompare(left.sell_date || '')
   )
+}
+
+function sectorCloudTone(change: number | null) {
+  if (change === null || Math.abs(change) < 0.005) return 'flat'
+  return change > 0 ? 'gain' : 'loss'
+}
+
+function jdTransactions(position?: GridPosition) {
+  return [...(position?.jd_transactions || [])].sort((left, right) =>
+    (right.trade_time || right.trade_date || '').localeCompare(left.trade_time || left.trade_date || '')
+  )
+}
+
+function jdTradeTypeLabel(type: string) {
+  return {
+    buy: '买入',
+    sell: '卖出',
+    convert_in: '转换入',
+    convert_out: '转换出'
+  }[type] || type
+}
+
+function jdTradeStateLabel(state?: string, orderStatus?: string) {
+  if (state === 'confirmed') return orderStatus || '已确认'
+  if (state === 'pending') return orderStatus || '待确认'
+  return orderStatus || state || '--'
+}
+
+function jdTradeCounterparty(item: NonNullable<GridPosition['jd_transactions']>[number]) {
+  if (!item.counterparty_code && !item.counterparty_name) return '--'
+  return [item.counterparty_name, item.counterparty_code].filter(Boolean).join(' ')
 }
 
 function strategyParams(signal?: GridSignal | null) {
@@ -952,67 +1200,47 @@ function openJdGridCookieImport() {
   if (!jdImporting.value) showJdCookieDialog.value = true
 }
 
+function updateJdGridSyncProgress(progress: JdSyncProgress) {
+  jdSyncProgress.value = toJdSyncProgressState(progress)
+}
+
 async function importJdGridTransactions(cookie: string) {
   if (jdImporting.value) return
   jdImporting.value = true
+  jdImportFeedback.value = null
+  updateJdGridSyncProgress({ stage: 'reading_holdings', message: '正在读取京东当前持仓...' })
   try {
     const jdResult = await importJdHoldingsWithCookie(cookie, {
-      onProgress: (progress) => showLoadingToast({ message: progress.message, forbidClick: true, duration: 0 })
+      background: true,
+      onProgress: updateJdGridSyncProgress
     })
     // The audit list may intentionally retain incomplete JD rows for the
     // holding page. The grid must certify against the full Cookie timeline.
     const payload = buildGridJdImportPayload(jdResult.items, jdResult.timelineAdjustments)
     if (!payload.current_holding_codes.length) {
-      closeToast()
       showToast('京东账户暂无当前持仓基金')
       return
     }
-    showLoadingToast({ message: '正在导入网格买卖批次...', forbidClick: true, duration: 0 })
+    updateJdGridSyncProgress({ stage: 'saving', message: '正在写入京东网格持仓与交易记录...' })
     const imported = await importGridJdTransactions(payload)
-    closeToast()
+    updateJdGridSyncProgress({ stage: 'refreshing', message: '正在刷新低频网格策略...' })
     await refreshStrategy(true)
-    const details = [
-      imported.imported ? `导入 ${imported.imported} 笔` : '',
-      imported.partial ? `部分匹配 ${imported.partial} 笔` : '',
-      imported.skipped ? `跳过 ${imported.skipped} 笔` : ''
-    ].filter(Boolean).join('，')
-    const skippedReasons = Object.entries(imported.results
-      .filter((item) => item.status === 'skipped' && item.reason)
-      .reduce<Record<string, number>>((counts, item) => {
-        counts[item.reason!] = (counts[item.reason!] || 0) + 1
-        return counts
-      }, {}))
-      .map(([reason, count]) => `${gridJdSkipReason(reason)} ${count}笔`)
-      .join('，')
-    showToast(details
-      ? `京东网格同步完成：${details}${skippedReasons ? `（${skippedReasons}）` : ''}`
-      : '京东网格没有可导入的买卖批次')
-    if (imported.imported || imported.partial) positionEditorOpen.value = false
+    const feedback = formatGridJdImportFeedback(imported, {
+      verifiedCycles: payload.replace_transaction_codes.length,
+      snapshotFunds: payload.current_holdings.length,
+      tradeWarning: jdResult.tradeWarning,
+      tradeDiagnostic: jdResult.tradeDiagnostic
+    })
+    jdImportFeedback.value = feedback
+    updateJdGridSyncProgress({ stage: 'completed', message: '网格同步完成' })
+    jdImporting.value = false
+    showToast({ message: feedback.message, duration: feedback.hasWarning ? 6000 : 3000 })
+    if (feedback.hasChanges) positionEditorOpen.value = false
   } catch (error) {
-    closeToast()
-    showToast(error instanceof Error ? error.message : '京东网格导入失败')
+    showToast(jdImportErrorMessage(error))
   } finally {
     jdImporting.value = false
   }
-}
-
-function gridJdSkipReason(reason: string): string {
-  return {
-    duplicate: '已导入',
-    missing_buy_value: '缺少买入金额/净值',
-    missing_sell_shares: '缺少卖出份额',
-    no_matching_batches: '没有可匹配买入批次',
-    not_current_holding: '非当前持仓',
-    existing_grid_position: '已有网格持仓',
-    invalid_adjustment: '无效交易记录',
-    invalid_trade_date: '交易日期无效',
-    missing_conversion_source: '缺少转换转出数据',
-    missing_conversion_target: '缺少转换转入数据',
-    missing_current_cycle_transaction: '缺少本轮建仓真实交易记录',
-    missing_snapshot_cost: '缺少当前持仓成本/份额',
-    missing_snapshot_trade_date: '缺少真实交易日期',
-    missing_snapshot_value: '缺少当前持仓数据'
-  }[reason] || reason
 }
 
 function addBuyRow() {
@@ -1704,23 +1932,37 @@ async function deletePosition(fundKey: string) {
 }
 
 function goToStrategy() {
-  router.push('/low-frequency-grid')
+  activateWorkspace('strategy')
 }
 
-watch(() => props.mode, async () => {
+function activateWorkspace(pane: 'valuation' | 'strategy') {
+  const path = pane === 'valuation' ? '/realtime-valuation' : '/low-frequency-grid'
+  if (router.currentRoute.value.path !== path) router.replace(path)
+}
+
+watch(() => props.mode, async (mode) => {
+  activePane.value = mode
   hasLoaded.value = false
   stopRefreshStreams()
   destroyStrategySortable()
+  startLiveEstimateStream()
   await loadPage()
   await setupStrategySortable()
   startRefreshStream()
 })
+watch(activeSectorIndex, () => {
+  if (!isValuation.value || !hasLoaded.value) return
+  void refreshValuations()
+  void refreshLiveEstimates()
+})
 onMounted(async () => {
+  startLiveEstimateStream()
   await Promise.all([holdingStore.initHoldings(), loadPage()])
   await setupStrategySortable()
   startRefreshStream()
 })
 onActivated(() => {
+  startLiveEstimateStream()
   if (!hasLoaded.value) void loadPage()
   void setupStrategySortable()
   startRefreshStream()
@@ -1736,22 +1978,40 @@ onBeforeUnmount(() => {
 </script>
 
 <template>
-  <main class="grid-native-page" :class="{ 'strategy-source-page': !isValuation }">
-    <JdCookieImportDialog v-model:show="showJdCookieDialog" title="京东 Cookie 导入网格批次" @confirm="importJdGridTransactions" />
+  <main class="grid-native-page workspace-page" :class="{ 'strategy-source-page': !isValuation }">
+    <JdCookieImportDialog v-model:show="showJdCookieDialog" title="京东 Cookie 读取" confirm-text="读取并导入网格" @confirm="importJdGridTransactions" />
+    <JdImportProgress :show="jdImporting" title="京东网格导入" :message="jdSyncProgress.message" :percentage="jdSyncProgress.percentage" />
     <input ref="tradeImageInput" class="visually-hidden" type="file" accept="image/png,image/jpeg,image/webp" multiple @change="handleTradeImages">
     <van-pull-refresh v-model="pullRefreshing" class="grid-pull-refresh" @refresh="onPullRefresh">
-      <header class="grid-header">
-      <div class="grid-heading">
-        <span class="grid-eyebrow">基金宝</span>
-        <h1>{{ pageTitle }}</h1>
-      </div>
-      <div class="grid-header-actions">
-        <span class="update-status">{{ lastUpdatedAt ? `更新 ${lastUpdatedAt}` : '准备加载' }}</span>
-        <button class="icon-button" type="button" :disabled="loading || isPageRefreshing" title="刷新数据" @click="refreshPage">
-          <van-icon name="replay" :class="{ spinning: loading || isPageRefreshing }" />
-        </button>
-      </div>
+      <header class="grid-header workspace-header">
+        <div class="grid-heading">
+          <span class="grid-eyebrow">基金宝 / 工作台</span>
+          <h1>{{ pageTitle }}</h1>
+        </div>
+        <nav class="workspace-tabs" aria-label="估值与网格视图">
+          <button type="button" :class="{ active: isValuation }" @click="activateWorkspace('valuation')">
+            <van-icon name="chart-trending-o" />
+            <span>实时估值</span>
+          </button>
+          <button type="button" :class="{ active: !isValuation }" @click="activateWorkspace('strategy')">
+            <van-icon name="apps-o" />
+            <span>低频网格</span>
+          </button>
+        </nav>
+        <div class="grid-header-actions">
+          <span class="update-status">{{ lastUpdatedAt ? `更新 ${lastUpdatedAt}` : '准备加载' }}</span>
+          <button class="icon-button" type="button" :disabled="loading || isPageRefreshing" title="刷新数据" @click="refreshPage">
+            <van-icon name="replay" :class="{ spinning: loading || isPageRefreshing }" />
+          </button>
+        </div>
       </header>
+
+      <section class="workspace-overview" aria-label="估值与策略概览">
+        <div><span>当前视图</span><strong>{{ isValuation ? '实时估值' : '低频网格' }}</strong></div>
+        <div><span>跟踪基金</span><strong>{{ isValuation ? visibleValuationCodes.length : strategyRows.length }}</strong></div>
+        <div><span>数据节奏</span><strong>{{ isValuation ? '1 秒' : '20 秒' }}</strong></div>
+        <div v-if="!isValuation && portfolioBudget.max_invest"><span>可用预算</span><strong>{{ formatMoney(budgetAvailable, 0) }}</strong></div>
+      </section>
 
     <section v-if="isValuation" class="valuation-workspace">
       <div class="valuation-toolbar">
@@ -1773,19 +2033,21 @@ onBeforeUnmount(() => {
       </div>
 
       <template v-if="activeSector">
-        <div class="sector-tab-scroll" role="tablist" aria-label="估值板块">
+        <div class="sector-cloud" role="tablist" aria-label="估值板块云图">
           <button
-            v-for="{ sector, index } in sortedSectors"
-            :key="`${sector.name}-${index}`"
-            class="sector-tab"
-            :class="{ active: activeSectorIndex === index }"
+            v-for="item in sectorCloudItems"
+            :key="`${item.sector.name}-${item.index}`"
+            class="sector-cloud-item"
+            :class="[sectorCloudTone(item.estimationChange), { active: activeSectorIndex === item.index }]"
+            :style="{ flexGrow: item.weight }"
             type="button"
             role="tab"
-            :aria-selected="activeSectorIndex === index"
-            @click="activeSectorIndex = index"
+            :aria-selected="activeSectorIndex === item.index"
+            @click="activeSectorIndex = item.index"
           >
-            <span>{{ sector.name }}</span>
-            <small>{{ sector.funds.length }} 只</small>
+            <span class="sector-cloud-name">{{ item.sector.name }}</span>
+            <strong>{{ formatPercent(item.estimationChange) }}</strong>
+            <small>{{ item.sector.funds.length }} 只基金<span v-if="item.quotedCount"> · {{ item.quotedCount }} 报价</span></small>
           </button>
         </div>
 
@@ -1859,8 +2121,14 @@ onBeforeUnmount(() => {
           <p>{{ generatedAt ? `信号生成于 ${generatedAt}` : '策略信号与持仓状态' }}</p>
         </div>
         <div class="strategy-commands">
+          <button class="command-button jd-grid-import" type="button" :disabled="jdImporting" @click="openJdGridCookieImport"><van-icon :name="jdImporting ? 'loading' : 'balance-o'" /> 京东导入</button>
           <button class="command-button" type="button" @click="openPositionEditor()"><van-icon name="plus" /> 录入持仓</button>
         </div>
+      </div>
+
+      <div v-if="jdImportFeedback" :class="['jd-import-feedback', { warning: jdImportFeedback.hasWarning }]" role="status">
+        <van-icon :name="jdImportFeedback.hasWarning ? 'warning-o' : 'passed'" />
+        <span>{{ jdImportFeedback.message }}</span>
       </div>
 
       <div v-if="portfolioBudget.max_invest" class="budget-strip">
@@ -1986,6 +2254,22 @@ onBeforeUnmount(() => {
               </tbody>
             </table>
           </div>
+          <div v-if="jdTransactions(row.position).length" class="position-table-scroll jd-transaction-scroll">
+            <table class="position-table jd-transaction-table">
+              <thead><tr><th>京东交易批次</th><th>交易时间</th><th>金额</th><th>份额</th><th>净值</th><th>状态</th><th>关联基金</th></tr></thead>
+              <tbody>
+                <tr v-for="item in jdTransactions(row.position)" :key="item.id" :class="['jd-transaction-row', `state-${item.state || 'unknown'}`]">
+                  <td><b>{{ jdTradeTypeLabel(item.type) }}</b></td>
+                  <td>{{ item.trade_time || item.trade_date }}</td>
+                  <td>{{ Number.isFinite(item.amount) ? formatMoney(item.amount) : '--' }}</td>
+                  <td>{{ Number.isFinite(item.shares) ? Number(item.shares).toFixed(2) : '--' }}</td>
+                  <td>{{ Number.isFinite(item.nav) ? Number(item.nav).toFixed(4) : '--' }}</td>
+                  <td><span class="jd-trade-state">{{ jdTradeStateLabel(item.state, item.order_status) }}</span></td>
+                  <td>{{ jdTradeCounterparty(item) }}</td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
         </div>
       </article>
       </div>
@@ -2025,7 +2309,6 @@ onBeforeUnmount(() => {
         <div class="dialog-title">
           <span>录入持仓</span>
           <span class="dialog-actions">
-            <button class="icon-button quiet jd-import-button" type="button" title="输入京东 Cookie 导入真实买卖批次" aria-label="输入京东 Cookie 导入真实买卖批次" :disabled="jdImporting" @click="openJdGridCookieImport"><van-icon :name="jdImporting ? 'loading' : 'shop-o'" /></button>
             <button class="icon-button quiet" type="button" title="从交易截图导入" aria-label="从交易截图导入" @click="triggerTradeImageImport"><van-icon name="photo-o" /></button>
             <van-icon name="cross" role="button" tabindex="0" aria-label="关闭" @click="positionEditorOpen = false" />
           </span>
@@ -2202,11 +2485,12 @@ onBeforeUnmount(() => {
 .icon-button { display: inline-grid; width: 30px; height: 30px; place-items: center; border: 1px solid transparent; border-radius: 4px; color: var(--text-primary); background: transparent; cursor: pointer; }.icon-button:disabled { opacity: .45; }.icon-button.quiet { color: var(--text-secondary); }.icon-button.danger { color: #ef4444; }.spinning { animation: spin 1s linear infinite; } @keyframes spin { to { transform: rotate(360deg); } }
 .valuation-workspace, .strategy-workspace { max-width: 1120px; margin: 0 auto; }.valuation-toolbar, .strategy-toolbar { display: flex; justify-content: space-between; align-items: center; gap: 12px; padding: 16px 14px 10px; }.valuation-toolbar h2, .strategy-toolbar h2 { margin: 0; font-size: 16px; line-height: 22px; }.valuation-toolbar p, .strategy-toolbar p { margin: 2px 0 0; color: var(--text-secondary); font-size: 11px; }.command-button { display: inline-flex; align-items: center; justify-content: center; gap: 5px; min-height: 30px; padding: 0 10px; border: 1px solid var(--color-primary); border-radius: 4px; background: var(--color-primary); color: #fff; font-size: 12px; font-weight: 600; cursor: pointer; }.command-button.full { width: 100%; margin-top: 12px; }
 .load-error { margin: 0 14px 10px; padding: 8px 10px; border-left: 3px solid #ef4444; background: rgba(239,68,68,.08); color: #ef4444; font-size: 12px; }.loading-state, .empty-state { display: grid; place-items: center; gap: 8px; min-height: 170px; color: var(--text-secondary); font-size: 13px; text-align: center; }.empty-state p { margin: 0; color: var(--text-primary); }.empty-state span { font-size: 11px; }
-.sector-tab-scroll { display: flex; gap: 7px; overflow-x: auto; padding: 10px 12px; border-top: 8px solid var(--bg-secondary); border-bottom: 1px solid var(--border-color); overscroll-behavior-x: contain; scrollbar-width: thin; -webkit-overflow-scrolling: touch; }.sector-tab { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 6px; min-height: 30px; max-width: 180px; padding: 0 10px; overflow: hidden; border: 1px solid var(--border-color); border-radius: 4px; color: var(--text-secondary); background: var(--bg-secondary); font-size: 12px; font-weight: 600; cursor: pointer; }.sector-tab span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }.sector-tab small { flex: 0 0 auto; color: inherit; font-size: 10px; font-weight: 500; }.sector-tab.active { border-color: var(--color-primary); color: var(--color-primary); background: var(--color-primary-bg); }.sector-panel-header { display: flex; align-items: center; justify-content: space-between; min-height: 42px; padding: 0 12px; border-bottom: 1px solid var(--border-color); }.sector-panel-title { display: inline-flex; align-items: baseline; gap: 7px; min-width: 0; color: var(--text-primary); font-size: 14px; font-weight: 650; }.sector-panel-title small { color: var(--text-secondary); font-size: 10px; font-weight: 500; }.sector-actions { display: flex; align-items: center; gap: 2px; }.sector-empty { margin: 0; padding: 18px; color: var(--text-secondary); font-size: 12px; text-align: center; }
+.sector-cloud { display: flex; flex-wrap: wrap; gap: 7px; padding: 10px 12px; border-top: 8px solid var(--bg-secondary); border-bottom: 1px solid var(--border-color); background: var(--bg-primary); }.sector-cloud-item { display: grid; flex: 1 1 126px; min-width: min(126px, calc(50% - 4px)); min-height: 64px; padding: 8px 10px; overflow: hidden; border: 1px solid var(--border-color); border-radius: 5px; color: var(--text-primary); background: var(--bg-secondary); text-align: left; cursor: pointer; transition: border-color .18s ease, box-shadow .18s ease, transform .18s ease; }.sector-cloud-item:hover { transform: translateY(-1px); }.sector-cloud-item:focus-visible { outline: 2px solid var(--color-primary); outline-offset: 2px; }.sector-cloud-item.gain { border-color: rgba(239, 68, 68, .45); background: rgba(239, 68, 68, .10); }.sector-cloud-item.loss { border-color: rgba(22, 163, 74, .45); background: rgba(22, 163, 74, .10); }.sector-cloud-item.flat { background: var(--bg-secondary); }.sector-cloud-item.active { box-shadow: inset 0 0 0 1px var(--color-primary); }.sector-cloud-name { overflow: hidden; color: var(--text-primary); font-size: 12px; font-weight: 700; line-height: 17px; text-overflow: ellipsis; white-space: nowrap; }.sector-cloud-item strong { margin-top: 1px; font-size: 17px; font-weight: 750; line-height: 22px; font-variant-numeric: tabular-nums; }.sector-cloud-item.gain strong { color: #ef4444; }.sector-cloud-item.loss strong { color: #16a34a; }.sector-cloud-item.flat strong { color: var(--text-secondary); }.sector-cloud-item small { overflow: hidden; color: var(--text-secondary); font-size: 10px; line-height: 14px; text-overflow: ellipsis; white-space: nowrap; }.sector-panel-header { display: flex; align-items: center; justify-content: space-between; min-height: 42px; padding: 0 12px; border-bottom: 1px solid var(--border-color); }.sector-panel-title { display: inline-flex; align-items: baseline; gap: 7px; min-width: 0; color: var(--text-primary); font-size: 14px; font-weight: 650; }.sector-panel-title small { color: var(--text-secondary); font-size: 10px; font-weight: 500; }.sector-actions { display: flex; align-items: center; gap: 2px; }.sector-empty { margin: 0; padding: 18px; color: var(--text-secondary); font-size: 12px; text-align: center; }
 .valuation-table-scroll { overflow-x: auto; overscroll-behavior-x: contain; -webkit-overflow-scrolling: touch; }.valuation-table { width: 100%; min-width: 790px; border-collapse: collapse; font-size: 12px; }.valuation-table th { height: 32px; padding: 0 10px; color: var(--text-secondary); font-size: 10px; font-weight: 500; text-align: right; white-space: nowrap; background: var(--bg-secondary); border-bottom: 1px solid var(--border-color); }.valuation-table th:first-child { position: sticky; left: 0; z-index: 3; text-align: left; background: var(--bg-secondary); }.valuation-table td { height: 48px; padding: 0 10px; border-bottom: 1px solid var(--border-color); text-align: right; white-space: nowrap; }.table-help { display: inline-flex; align-items: center; gap: 3px; padding: 0; border: 0; color: inherit; background: transparent; font: inherit; cursor: pointer; }.fund-cell { position: sticky; left: 0; z-index: 2; width: 236px; min-width: 236px; max-width: 236px; box-sizing: border-box; text-align: left !important; background: var(--bg-primary); box-shadow: 1px 0 0 var(--border-color); }.fund-code { margin: 0 7px 0 0; padding: 0; border: 0; color: var(--text-secondary); background: transparent; font-size: 10px; cursor: pointer; vertical-align: middle; }.fund-name { display: inline-block; max-width: 164px; overflow: hidden; padding: 0; border: 0; color: var(--text-primary); background: transparent; font-size: 12px; font-weight: 600; line-height: 18px; text-align: left; text-overflow: ellipsis; white-space: nowrap; vertical-align: middle; }.fund-name-deep-link, .fund-name-remainder { padding: 0; border: 0; color: inherit; background: transparent; font: inherit; text-decoration: none; cursor: pointer; }.fund-name-deep-link:hover, .fund-name-remainder:hover { color: var(--color-primary); }.fitness { display: inline-flex; min-width: 24px; justify-content: center; padding: 1px 4px; border-radius: 3px; color: #fff; font-size: 9px; font-weight: 700; }.grade-a { background: #16a34a; }.grade-b { background: #65a30d; }.grade-c { background: #d97706; }.grade-d { background: #dc2626; }.numeric { font-variant-numeric: tabular-nums; }.up { color: var(--color-up) !important; }.down { color: var(--color-down) !important; }.flat { color: var(--text-secondary) !important; }.confidence { color: var(--text-primary); }.row-actions { min-width: 102px; }.row-actions .icon-button { width: 25px; height: 25px; }
 .fund-adder { display: grid; grid-template-columns: 104px minmax(130px, 1fr) auto; gap: 6px; padding: 9px 12px; background: var(--bg-secondary); }.fund-adder input, .native-dialog input { width: 100%; height: 32px; padding: 0 9px; border: 1px solid var(--border-color); border-radius: 4px; outline: none; color: var(--text-primary); background: var(--bg-primary); font-size: 12px; }.fund-adder input:focus, .native-dialog input:focus { border-color: var(--color-primary); }
 .regime-strip { display: flex; align-items: center; gap: 6px; margin: 0 14px 10px; padding: 8px 10px; border: 1px solid var(--border-color); border-radius: 5px; background: var(--bg-secondary); font-size: 11px; }.regime-strip > span { flex: 0 0 auto; color: var(--text-secondary); margin-right: 2px; white-space: nowrap; }.regime-strip button { flex: 0 0 auto; min-height: 26px; padding: 0 9px; border: 1px solid var(--border-color); border-radius: 4px; color: var(--text-secondary); background: transparent; font-size: 11px; line-height: 1; white-space: nowrap; cursor: pointer; }.regime-strip button.active { border-color: var(--color-primary); color: var(--color-primary); background: var(--color-primary-bg); }.regime-strip small { min-width: 0; overflow: hidden; margin-left: auto; color: var(--text-secondary); text-overflow: ellipsis; white-space: nowrap; }
 .budget-strip { display: flex; align-items: center; gap: 7px; padding: 5px 14px; border-bottom: 1px solid var(--border-color); color: var(--text-secondary); font-size: 10px; }.budget-strip b { color: #059669; }.budget-track { flex: 1; height: 4px; overflow: hidden; border-radius: 2px; background: var(--border-color); }.budget-track i { display: block; height: 100%; border-radius: inherit; background: #f59e0b; }.strategy-commands { display: flex; align-items: center; gap: 5px; }.signal-card { margin: 0 10px 9px; border: 1px solid var(--border-color); border-radius: 6px; background: var(--bg-secondary); overflow: hidden; }.signal-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 42px; padding: 0 12px; border-bottom: 1px solid var(--border-color); }.signal-name { color: var(--text-primary); font-size: 13px; font-weight: 650; }.owner-tag { display: inline-flex; margin-left: 5px; padding: 1px 5px; border-radius: 3px; color: #4338ca; background: #e0e7ff; font-size: 9px; font-weight: 650; }.signal-badge { flex: 0 0 auto; padding: 3px 7px; border-radius: 3px; font-size: 10px; font-weight: 650; }.signal-badge.buy { color: #047857; background: rgba(16,185,129,.16); }.signal-badge.sell { color: #dc2626; background: rgba(239,68,68,.14); }.signal-badge.alert { color: #b45309; background: rgba(245,158,11,.16); }.signal-badge.hold { color: var(--text-secondary); background: var(--bg-primary); }.signal-body { padding: 10px 12px; }.signal-reason, .decision-note { margin: 0; color: var(--text-secondary); font-size: 12px; line-height: 18px; }.decision-note { margin-top: 9px; font-size: 11px; }.signal-command { margin-top: 8px; padding: 7px 9px; border-radius: 4px; font-size: 12px; font-weight: 650; }.signal-command.buy { color: #047857; background: rgba(16,185,129,.12); }.signal-command.sell { color: #dc2626; background: rgba(239,68,68,.12); }.signal-command.alert { color: #b45309; background: rgba(245,158,11,.12); }.rebuy-panel { display: grid; gap: 6px; margin-top: 8px; padding: 8px 9px; border: 1px solid #c7d2fe; border-radius: 5px; color: #4338ca; background: #eef2ff; font-size: 11px; }.rebuy-panel div:first-child { display: grid; gap: 2px; }.rebuy-command { display: flex; align-items: center; justify-content: space-between; gap: 8px; }.rebuy-command button { min-height: 25px; padding: 0 8px; border: 0; border-radius: 4px; color: #fff; background: #4f46e5; font-size: 10px; font-weight: 650; }.signal-meta, .signal-stats { display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 9px; color: var(--text-secondary); font-size: 10px; }.inline-parameter, .summary-parameter, .watch-parameter { padding: 0; border: 0; color: inherit; background: transparent; font: inherit; cursor: pointer; }.inline-parameter, .summary-parameter { border-bottom: 1px dashed var(--text-secondary); }.summary-parameter b { color: var(--text-primary); font-variant-numeric: tabular-nums; }.watch-parameter { color: #4338ca; border-bottom: 1px dashed #4338ca; }.signal-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }.action-button { display: inline-flex; align-items: center; gap: 4px; min-height: 27px; padding: 0 8px; border: 1px solid var(--border-color); border-radius: 4px; color: var(--text-secondary); background: var(--bg-primary); font-size: 10px; cursor: pointer; }.action-button.sell, .action-button.danger { color: #dc2626; }.signal-stats { align-items: center; padding-top: 8px; border-top: 1px solid var(--border-color); }.signal-stats span { display: flex; gap: 5px; }.signal-stats b { color: var(--text-secondary); font-weight: 500; }.signal-stats em { font-style: normal; font-weight: 650; }.strategy-info-button { width: 18px; height: 18px; border: 1px solid var(--border-color); border-radius: 50%; color: var(--text-secondary); background: transparent; font-size: 10px; cursor: pointer; }.trend-chart { display: flex; align-items: stretch; gap: 3px; height: 76px; margin-top: 10px; padding: 2px 0; border-bottom: 1px solid var(--border-color); }.trend-day { display: grid; flex: 1; grid-template-rows: 18px 1fr 14px; align-items: end; min-width: 0; text-align: center; }.trend-day em { overflow: hidden; color: var(--text-secondary); font-size: 7px; font-style: normal; text-overflow: clip; white-space: nowrap; }.trend-day i { justify-self: center; width: min(100%, 13px); border-radius: 1px 1px 0 0; background: var(--text-secondary); }.trend-day.up i { background: var(--color-up); }.trend-day.down i { background: var(--color-down); }.trend-day small { overflow: hidden; color: var(--text-secondary); font-size: 7px; white-space: nowrap; }.position-summary { display: flex; flex-wrap: wrap; gap: 7px 12px; margin-top: 9px; padding: 8px; border: 1px solid var(--border-color); border-radius: 4px; color: var(--text-secondary); background: var(--bg-primary); font-size: 10px; }.position-summary span { white-space: nowrap; }.position-summary b { color: var(--text-primary); font-variant-numeric: tabular-nums; }.watch-summary { margin-top: 9px; padding: 8px; border: 1px solid #c7d2fe; border-radius: 4px; color: #4338ca; background: #eef2ff; font-size: 11px; line-height: 17px; }.position-table-scroll { overflow-x: auto; margin: 9px -12px -10px; }.position-table { width: 100%; min-width: 660px; border-collapse: collapse; color: var(--text-secondary); font-size: 10px; }.position-table th, .position-table td { padding: 6px 7px; border-top: 1px solid var(--border-color); text-align: left; white-space: nowrap; }.position-table th { color: var(--text-secondary); font-weight: 500; background: var(--bg-primary); }.position-table td:first-child { color: var(--text-primary); font-family: ui-monospace, monospace; font-size: 9px; }.sold-label td { color: var(--text-secondary) !important; font-family: inherit !important; background: var(--bg-primary); }.sold-row { color: var(--text-secondary); }.table-action { margin-right: 5px; padding: 1px 4px; border: 1px solid #f59e0b; border-radius: 3px; color: #b45309; background: transparent; font-size: 9px; cursor: pointer; }.table-action.sell, .table-action.danger { border-color: transparent; color: #dc2626; }.table-action.danger { color: #9ca3af; }
+.jd-import-feedback { display: flex; align-items: flex-start; gap: 7px; margin: 0 0 6px; padding: 8px 10px; border: 1px solid #a7f3d0; border-radius: 4px; color: #047857; background: #ecfdf5; font-size: 11px; line-height: 17px; overflow-wrap: anywhere; }.jd-import-feedback .van-icon { flex: 0 0 auto; margin-top: 2px; }.jd-import-feedback.warning { border-color: #fcd34d; color: #92400e; background: #fffbeb; }
 .native-dialog, .history-panel { padding: 16px; background: var(--bg-secondary); }.dialog-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; color: var(--text-primary); font-size: 15px; font-weight: 650; }.dialog-title :deep(.van-icon) { color: var(--text-secondary); cursor: pointer; }.info-dialog p, .form-hint { margin: 0; color: var(--text-secondary); font-size: 12px; line-height: 19px; }.parameter-menu { display: grid; gap: 8px; }.parameter-menu button { display: grid; grid-template-columns: minmax(0, 1fr) auto 16px; align-items: center; gap: 8px; min-height: 42px; padding: 0 10px; border: 1px solid var(--border-color); border-radius: 4px; color: var(--text-primary); background: var(--bg-primary); font-size: 12px; text-align: left; cursor: pointer; }.parameter-menu button b { overflow: hidden; max-width: 180px; color: var(--text-secondary); font-size: 10px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }.parameter-menu button :deep(.van-icon) { color: var(--text-secondary); }.batch-sell-context { display: flex; flex-wrap: wrap; gap: 5px 10px; padding: 8px; border: 1px solid var(--border-color); border-radius: 4px; color: var(--text-secondary); background: var(--bg-primary); font-size: 10px; font-variant-numeric: tabular-nums; }.batch-sell-context span { white-space: nowrap; }.strategy-info-dialog { display: grid; gap: 9px; }.strategy-rule { display: grid; grid-template-columns: 34px 1fr; gap: 8px; color: var(--text-secondary); font-size: 12px; line-height: 18px; }.strategy-rule b { align-self: start; padding: 1px 4px; border-radius: 3px; color: #4338ca; background: #eef2ff; font-size: 10px; text-align: center; }.form-dialog { display: grid; gap: 10px; }.form-dialog label { display: grid; gap: 5px; color: var(--text-secondary); font-size: 11px; }.form-dialog input { width: 100%; height: 34px; box-sizing: border-box; padding: 0 9px; border: 1px solid var(--border-color); border-radius: 4px; outline: none; color: var(--text-primary); background: var(--bg-primary); font-size: 13px; }.form-dialog input:focus { border-color: var(--color-primary); }.form-dialog .command-button { margin-top: 2px; }.history-list { max-height: 56vh; overflow-y: auto; }.history-row { display: grid; grid-template-columns: 1.2fr 1fr .8fr; min-height: 38px; align-items: center; border-bottom: 1px solid var(--border-color); color: var(--text-secondary); font-size: 12px; }.history-row b { text-align: right; font-variant-numeric: tabular-nums; }
 .dialog-actions { display: flex; align-items: center; gap: 3px; }.dialog-actions .icon-button { width: 28px; height: 28px; }
 .trade-import-dialog { display: flex; height: 100%; box-sizing: border-box; flex-direction: column; }.trade-import-context { display: flex; flex-wrap: wrap; gap: 5px 14px; margin-bottom: 8px; color: var(--text-secondary); font-size: 11px; }.trade-import-context b { color: var(--text-primary); }.loading-state.compact { min-height: 100px; }.trade-import-status { flex: 0 0 auto; padding-bottom: 8px; }.trade-import-list { flex: 1; min-height: 0; overflow-y: auto; border-top: 1px solid var(--border-color); }.trade-import-row { padding: 10px 0; border-bottom: 1px solid var(--border-color); }.trade-import-row.status-imported { opacity: .62; }.trade-import-row.status-failed { border-left: 3px solid #ef4444; padding-left: 8px; }.trade-import-row-head { display: grid; grid-template-columns: 24px 70px minmax(126px, 1fr) minmax(112px, .8fr) auto; align-items: end; gap: 6px; }.trade-import-row-head label, .trade-import-confirmation label { display: grid; gap: 3px; color: var(--text-secondary); font-size: 10px; }.trade-import-row-head select, .trade-import-row-head input, .trade-import-confirmation input, .trade-import-values input { width: 100%; height: 32px; box-sizing: border-box; padding: 0 7px; border: 1px solid var(--border-color); border-radius: 4px; outline: none; color: var(--text-primary); background: var(--bg-primary); font-size: 12px; }.trade-import-description { overflow: hidden; margin: 7px 0; color: var(--text-secondary); font-size: 10px; line-height: 15px; text-overflow: ellipsis; white-space: nowrap; }.trade-import-confirmation { display: flex; align-items: end; gap: 10px; margin: 7px 0; color: var(--text-secondary); font-size: 10px; }.trade-import-confirmation label { width: min(160px, 48%); }.trade-import-values { display: grid; grid-template-columns: repeat(auto-fit, minmax(108px, 1fr)); gap: 6px; }.trade-import-values label { display: grid; gap: 4px; color: var(--text-secondary); font-size: 10px; }.import-state { font-size: 10px; white-space: nowrap; }.import-state.success { color: #059669; }.import-state.failed { color: #dc2626; }
@@ -2297,7 +2581,7 @@ onBeforeUnmount(() => {
   color: var(--text-secondary);
   border-color: var(--border-color);
 }
-@media (max-width: 520px) { .grid-header { padding-right: 10px; padding-left: 10px; }.grid-heading h1 { font-size: 16px; }.update-status { display: none; }.valuation-toolbar, .strategy-toolbar { padding-right: 10px; padding-left: 10px; }.fund-adder { grid-template-columns: 88px 1fr auto; padding-right: 10px; padding-left: 10px; }.fund-adder input:nth-child(2) { min-width: 0; }.fund-adder .command-button { padding-right: 8px; padding-left: 8px; }.sector-tab-scroll { padding-right: 10px; padding-left: 10px; }.sector-panel-header { padding-right: 8px; padding-left: 8px; }.signal-card { margin-right: 8px; margin-left: 8px; }.source-grid-workspace .regime-strip { gap: 4px; padding: 6px; }.source-grid-workspace .regime-strip > span { margin-right: 0; font-size: 9px; }.source-grid-workspace .regime-strip button { min-height: 24px; padding: 0 5px; font-size: 10px; }.source-grid-workspace .regime-strip small { font-size: 9px; } }
+@media (max-width: 520px) { .grid-header { padding-right: 10px; padding-left: 10px; }.grid-heading h1 { font-size: 16px; }.update-status { display: none; }.valuation-toolbar, .strategy-toolbar { padding-right: 10px; padding-left: 10px; }.fund-adder { grid-template-columns: 88px 1fr auto; padding-right: 10px; padding-left: 10px; }.fund-adder input:nth-child(2) { min-width: 0; }.fund-adder .command-button { padding-right: 8px; padding-left: 8px; }.sector-cloud { gap: 6px; padding-right: 10px; padding-left: 10px; }.sector-cloud-item { min-height: 60px; padding: 7px 8px; }.sector-cloud-item strong { font-size: 16px; }.sector-panel-header { padding-right: 8px; padding-left: 8px; }.signal-card { margin-right: 8px; margin-left: 8px; }.source-grid-workspace .regime-strip { gap: 4px; padding: 6px; }.source-grid-workspace .regime-strip > span { margin-right: 0; font-size: 9px; }.source-grid-workspace .regime-strip button { min-height: 24px; padding: 0 5px; font-size: 10px; }.source-grid-workspace .regime-strip small { font-size: 9px; } }
 .sold-table-heading th { color: var(--text-secondary); background: var(--bg-primary); font-size: 10px; font-weight: 500; }
 .sensitivity-value { display: block; color: var(--color-primary); font-size: 16px; font-weight: 700; text-align: center; font-variant-numeric: tabular-nums; }
 .sensitivity-actions { display: flex; gap: 8px; }
@@ -2334,6 +2618,12 @@ onBeforeUnmount(() => {
 .fund-name-full { min-width: 184px; max-width: 260px; text-align: left !important; white-space: normal !important; }
 .fund-name-full button { width: 100%; overflow: hidden; padding: 0; border: 0; color: var(--text-primary); background: transparent; font: inherit; font-weight: 600; line-height: 18px; text-align: left; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }
 .fund-name-full button:hover { color: var(--color-primary); }
+.jd-transaction-scroll { margin-top: 12px; }
+.source-grid-workspace .jd-transaction-scroll { margin-top: 12px; }
+.jd-transaction-table { min-width: 720px; }
+.jd-transaction-row.state-pending .jd-trade-state { color: #b45309; }
+.jd-transaction-row.state-confirmed .jd-trade-state { color: #047857; }
+.jd-trade-state { font-weight: 650; }
 </style>
 
 <style scoped>
@@ -2511,4 +2801,32 @@ onBeforeUnmount(() => {
 .signal-card-ghost { opacity: .35; }
 .signal-card-dragging { border-color: #f59e0b; box-shadow: 0 8px 22px rgba(15, 23, 42, .2); }
 .drag-indicator { display: inline-flex; align-items: center; color: var(--text-secondary); font-size: 14px; }
+</style>
+
+<style scoped>
+.workspace-page { background: var(--bg-primary); }
+.workspace-header { display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 10px; align-items: center; }
+.workspace-tabs { grid-column: 1 / -1; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 4px; padding: 4px; border: 1px solid var(--border-color); border-radius: 6px; background: var(--bg-primary); }
+.workspace-tabs button { display: inline-flex; min-width: 0; height: 32px; align-items: center; justify-content: center; gap: 6px; border: 0; border-radius: 4px; color: var(--text-secondary); background: transparent; font: inherit; font-size: 12px; cursor: pointer; }
+.workspace-tabs button.active { color: #fff; background: var(--color-primary); box-shadow: 0 1px 2px rgba(15, 23, 42, .16); }
+.workspace-overview { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); max-width: 1120px; gap: 1px; margin: 10px auto 0; overflow: hidden; border: 1px solid var(--border-color); border-radius: 6px; background: var(--border-color); }
+.workspace-overview > div { display: grid; min-width: 0; min-height: 58px; align-content: center; gap: 4px; padding: 8px 12px; background: var(--bg-secondary); }
+.workspace-overview > div:last-child { grid-column: span 3; }
+.workspace-overview span { overflow: hidden; color: var(--text-secondary); font-size: 10px; text-overflow: ellipsis; white-space: nowrap; }
+.workspace-overview strong { overflow: hidden; color: var(--text-primary); font-size: 14px; font-variant-numeric: tabular-nums; text-overflow: ellipsis; white-space: nowrap; }
+
+@media (min-width: 760px) {
+  .workspace-header { grid-template-columns: minmax(180px, 1fr) minmax(330px, auto) minmax(120px, 1fr); }
+  .workspace-tabs { grid-column: auto; }
+  .workspace-overview { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+  .workspace-overview > div:last-child { grid-column: auto; }
+}
+
+@media (max-width: 520px) {
+  .workspace-header { padding-top: calc(8px + env(safe-area-inset-top, 0px)); }
+  .workspace-tabs { order: 3; }
+  .workspace-tabs button { height: 30px; font-size: 11px; }
+  .workspace-overview { margin: 8px 10px 0; }
+  .workspace-overview > div { min-height: 52px; padding: 7px 9px; }
+}
 </style>

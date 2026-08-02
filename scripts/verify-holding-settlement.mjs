@@ -8,6 +8,7 @@ import {
 } from '../src/utils/tradingDate.ts'
 import { calculateHoldingProfit, calculateOfficialHoldingProfit, getValuationComparisonState, hasUsableCurrentEstimate, hasUsableEstimateChange, isDelayedSettlementQdiiFund, isFundPreOpen, isFundTradingHours, isJdYesterdaySummaryCurrent, isLunchBreak, isRetainedMarketEstimate, selectLatestRealChange, shouldRetainCompletedEstimate, shouldRetainCurrentDayEstimate, shouldRetainCurrentIntradayEstimate, shouldUseDelayedQdiiPublishedChange, shouldUseGridEstimateFallback } from '../src/utils/holdingCalculator.ts'
 import { deriveHoldingImportBasis } from '../src/utils/holdingImport.ts'
+import { resolveWatchlistSnapshot } from '../src/utils/watchlistSnapshot.ts'
 
 const history = [
   { date: '2026-07-21', netValue: 1.024, totalValue: 0, changeRate: 0.3 },
@@ -27,9 +28,10 @@ assert.equal(calculateSubscriptionShares(10_000, 10_000, 1.2), 0)
 assert.equal(getCalendarDayDifference('2026-07-10', '2026-07-20'), 10)
 assert.equal(getBeijingDateString(new Date('2026-07-15T16:30:00.000Z')), '2026-07-16')
 assert.equal(isJdYesterdaySummaryCurrent({ syncedOn: '2026-07-27' }, '2026-07-27'), true)
-assert.equal(isJdYesterdaySummaryCurrent({ syncedOn: '2026-07-27' }, '2026-07-28'), true)
+assert.equal(isJdYesterdaySummaryCurrent({ syncedOn: '2026-07-27' }, '2026-07-28'), false)
 assert.equal(isJdYesterdaySummaryCurrent({ syncedOn: '2026-07-27' }, '2026-07-29'), false)
 assert.equal(isJdYesterdaySummaryCurrent({ syncedOn: '2026-07-27', profitDate: '2026-07-26' }, '2026-07-28'), false)
+assert.equal(isJdYesterdaySummaryCurrent({ syncedOn: '2026-07-27', profitDate: '2026-07-27' }, '2026-07-28'), true)
 
 const fridayAfterClose = getValuationComparisonState({
   realChange: -6.89,
@@ -104,7 +106,36 @@ const weekdayPreOpenStalePublication = getValuationComparisonState({
   now: new Date('2026-07-27T17:20:00.000Z')
 })
 assert.equal(weekdayPreOpenStalePublication.realChangeLabel, '昨')
-assert.equal(weekdayPreOpenStalePublication.hasActualDiff, true)
+assert.equal(weekdayPreOpenStalePublication.isCurrentReal, false)
+assert.equal(weekdayPreOpenStalePublication.hasActualDiff, false)
+
+const intradayWithoutOfficialReturn = getValuationComparisonState({
+  realChange: undefined,
+  realChangeDate: undefined,
+  estimateChange: -1.25,
+  estimateTime: '2026-07-28 10:00',
+  now: new Date('2026-07-28T02:00:00.000Z')
+})
+assert.equal(intradayWithoutOfficialReturn.isTrading, true)
+assert.equal(intradayWithoutOfficialReturn.realChangeLabel, '昨')
+assert.equal(intradayWithoutOfficialReturn.hasActualDiff, false)
+
+const delayedHistoryWithFreshSnapshot = resolveWatchlistSnapshot({
+  estimate: {
+    source: 'market_snapshot',
+    gztime: '2026-07-28 15:00',
+    gszzl: '-9.39',
+    gsz: '1.8199'
+  },
+  incomingChange: undefined,
+  incomingDate: undefined
+})
+assert.deepEqual(delayedHistoryWithFreshSnapshot, {
+  realChange: -9.39,
+  realChangeDate: '2026-07-28',
+  officialValue: '1.8199',
+  officialValueDate: '2026-07-28'
+})
 
 assert.deepEqual(selectLatestRealChange({
   incomingChange: -2.15,

@@ -10,9 +10,11 @@ import {
 
 const PERFORMANCE_REFRESH_MS = 30 * 60 * 1000
 const PERFORMANCE_RANGES = new Map([
-  ['y', 31],
-  ['3y', 93],
-  ['6y', 186]
+  ['y', { days: 31, sinaPeriod: 3 }],
+  ['3y', { days: 93, sinaPeriod: 4 }],
+  ['6y', { days: 186, sinaPeriod: 5 }],
+  ['1n', { days: 366, sinaPeriod: 6 }],
+  ['3n', { days: 1_100, sinaPeriod: 8 }]
 ])
 const performanceMemoryCache = new Map()
 const intradayMemoryCache = new Map()
@@ -48,8 +50,8 @@ function normalizeComparisonPoints(fund, average, index, days) {
 }
 
 export function parseFundPerformancePayload(source, range) {
-  const days = PERFORMANCE_RANGES.get(range)
-  if (!days) return []
+  const config = PERFORMANCE_RANGES.get(range)
+  if (!config) return []
   const matched = String(source || '').match(/var\s+Data_grandTotal\s*=\s*(.*?);/s)
   if (!matched?.[1]) return []
   let series
@@ -63,26 +65,72 @@ export function parseFundPerformancePayload(source, range) {
   const average = series.find(item => String(item?.name || '').includes('同类'))?.data || series[1]?.data || []
   const index = series.find(item => String(item?.name || '').includes('沪深300'))?.data || series[2]?.data || []
   if (!Array.isArray(fund) || fund.length < 2) return []
-  return normalizeComparisonPoints(fund, average, index, days)
+  return normalizeComparisonPoints(fund, average, index, config.days)
+}
+
+function parseSinaReturnSeries(items) {
+  return new Map((Array.isArray(items) ? items : []).flatMap(item => {
+    const compact = String(item?.tradedate || '').match(/^(\d{4})(\d{2})(\d{2})$/)
+    const value = numberOrNull(item?.growthrate)
+    return compact && value !== null ? [[`${compact[1]}-${compact[2]}-${compact[3]}`, value]] : []
+  }))
+}
+
+export function parseSinaPerformancePayload(payload, range) {
+  if (!PERFORMANCE_RANGES.has(range)) return []
+  const data = payload?.result?.data
+  const fund = parseSinaReturnSeries(data?.thefund)
+  if (fund.size < 2) return []
+  const average = parseSinaReturnSeries(data?.similaravg)
+  const comparisonIndex = Array.isArray(data?.index)
+    ? data.index.find(item => String(item?.name || '').includes('沪深300')) || data.index[0]
+    : null
+  const index = parseSinaReturnSeries(comparisonIndex?.rate)
+  return [...fund.entries()].map(([date, fundReturn]) => ({
+    date,
+    fundReturn,
+    avgReturn: average.get(date) ?? null,
+    indexReturn: index.get(date) ?? null
+  }))
+}
+
+async function fetchSinaFundPerformance(code, range) {
+  const sinaPeriod = PERFORMANCE_RANGES.get(range)?.sinaPeriod
+  if (!sinaPeriod) return []
+  const response = await fetchUpstream(`https://stock.finance.sina.com.cn/fundInfo/api/openapi.php/FdFundService.getCumulativeReturnPic?symbol=${code}&t=${sinaPeriod}`, {
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+      'Referer': 'https://finance.sina.com.cn/'
+    },
+    timeoutMs: 6_000,
+    retries: 1,
+    dedupeKey: `fund:sina-performance:${code}:${range}`
+  })
+  return parseSinaPerformancePayload(await response.json(), range)
 }
 
 async function refreshFundPerformance(code, range) {
-  const response = await fetchUpstream(`https://fund.eastmoney.com/pingzhongdata/${code}.js`, {
-    headers: {
-      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-      'Referer': 'https://fund.eastmoney.com/'
-    },
-    timeoutMs: 8_000,
-    retries: 1,
-    dedupeKey: `fund:performance:${code}:${range}`
-  })
-  const points = parseFundPerformancePayload(await response.text(), range)
+  let source = 'sina_cumulative_return'
+  let points = await fetchSinaFundPerformance(code, range).catch(() => [])
+  if (points.length < 2) {
+    source = 'eastmoney_pingzhongdata'
+    const response = await fetchUpstream(`https://fund.eastmoney.com/pingzhongdata/${code}.js`, {
+      headers: {
+        'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+        'Referer': 'https://fund.eastmoney.com/'
+      },
+      timeoutMs: 8_000,
+      retries: 1,
+      dedupeKey: `fund:performance:${code}:${range}`
+    })
+    points = parseFundPerformancePayload(await response.text(), range)
+  }
   if (points.length < 2) throw new Error('业绩对比数据为空')
   const result = {
     code,
     range,
     points,
-    source: 'eastmoney_pingzhongdata',
+    source,
     updatedAt: new Date().toISOString()
   }
   performanceMemoryCache.set(`${code}:${range}`, result)
@@ -207,13 +255,33 @@ export function calculateIntradayProgress(points, market, tradingDate) {
   return calculated.sort((left, right) => left.time.localeCompare(right.time))
 }
 
-function normalizeCurve(code, curve) {
+export function compactIntradayPoints(points, limit = 480) {
+  const source = Array.isArray(points) ? points : []
+  const target = Math.max(2, Math.floor(Number(limit) || 480))
+  if (source.length <= target) return source
+
+  const compacted = []
+  const lastIndex = source.length - 1
+  for (let index = 0; index < target; index++) {
+    const sourceIndex = Math.round(index * lastIndex / (target - 1))
+    const point = source[sourceIndex]
+    if (point && compacted.at(-1) !== point) compacted.push(point)
+  }
+  if (compacted.at(-1) !== source[lastIndex]) compacted.push(source[lastIndex])
+  return compacted
+}
+
+function normalizeCurve(code, curve, { since = '', limit = 480 } = {}) {
   if (!curve) return null
+  const allPoints = calculateIntradayProgress(curve.points, curve.market || 'cn', curve.tradingDate)
+  const selectedPoints = since ? allPoints.filter(point => point.time > since) : allPoints
   return {
     code,
     tradingDate: curve.tradingDate,
     market: curve.market || 'cn',
-    points: calculateIntradayProgress(curve.points, curve.market || 'cn', curve.tradingDate),
+    points: compactIntradayPoints(selectedPoints, limit),
+    incremental: Boolean(since),
+    totalPointCount: allPoints.length,
     finalized: Boolean(curve.finalized),
     source: curve.source || 'realtime_estimate',
     lastPointAt: curve.lastPointAt || null,
@@ -254,7 +322,7 @@ function shouldFinalizeCurve(curve, market) {
  * Records validated real-time anchors. The API calculates bounded per-second
  * progress between anchors without changing their actual endpoint values.
  */
-export async function getFundIntradayCurve(code, now = new Date()) {
+export async function getFundIntradayCurve(code, now = new Date(), options = {}) {
   if (!/^\d{6}$/.test(code)) throw new Error('基金代码必须是6位数字')
   const profile = getFundProfile(code) || {}
   const market = getFundEstimateMarketState(profile, now)
@@ -286,11 +354,13 @@ export async function getFundIntradayCurve(code, now = new Date()) {
     intradayMemoryCache.set(code, latest)
   }
 
-  return normalizeCurve(code, latest) || {
+  return normalizeCurve(code, latest, options) || {
     code,
     tradingDate: '',
     market: market.market || 'cn',
     points: [],
+    incremental: Boolean(options.since),
+    totalPointCount: 0,
     finalized: false,
     source: '',
     lastPointAt: null,

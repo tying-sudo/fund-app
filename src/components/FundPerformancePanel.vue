@@ -70,7 +70,7 @@ const legendItems = computed(() => period.value === '1d'
   : [
       { key: 'fund' as const, label: '本基金', value: latestPoint.value?.fundReturn ?? null, color: fundLineColor.value },
       { key: 'average' as const, label: '同类平均', value: latestPoint.value?.avgReturn ?? null, color: '#31a7ba' },
-      { key: 'index' as const, label: '沪深300', value: latestPoint.value?.indexReturn ?? null, color: '#7d899d' }
+      { key: 'index' as const, label: '对比指数', value: latestPoint.value?.indexReturn ?? null, color: '#7d899d' }
     ])
 
 function toTimestamp(date: string): UTCTimestamp | null {

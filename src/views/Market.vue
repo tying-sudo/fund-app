@@ -553,7 +553,7 @@ watch([allSectorType, allSectorSort, allSectorOrder], () => {
               <div v-for="item in 8" :key="item" class="market-ranking-row market-ranking-skeleton"><span /><span /><span /></div>
             </template>
             <button v-for="item in ranking" :key="item.code" class="market-ranking-row" type="button" @click="goToDetail(item.code)">
-              <span class="fund-name-cell"><strong>{{ item.name }}</strong><small>#{{ item.code }} · {{ rankingDate(item) }}</small></span>
+              <span class="fund-name-cell"><strong>{{ item.name }}</strong><small>{{ item.code }} · {{ rankingDate(item) }}</small></span>
               <span :class="valueClass(item.dailyReturn)">{{ percent(item.dailyReturn) }}</span>
               <span :class="['ranking-year-value', valueClass(item.yearReturn)]">{{ percent(item.yearReturn) }}</span>
             </button>

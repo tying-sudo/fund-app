@@ -2,7 +2,7 @@
 // [WHAT] 提供基金实时估值、基金搜索、历史净值、重仓股等接口
 // [DEPS] 依赖天天基金公开接口，禁止高频请求
 
-import type { FundEstimate, FundInfo, NetValueRecord, StockHolding, MarketIndex, FundRankItem, FundFeeInfo, FundShareClass } from '@/types/fund'
+import type { FundEstimate, FundInfo, NetValueRecord, StockHolding, BondHolding, MarketIndex, FundRankItem, FundFeeInfo, FundShareClass } from '@/types/fund'
 import { API_BASE_URL, USE_PROXY } from '@/config/api'
 import { fetchFundEstimateFast, fetchFundEstimatesBatch } from './fundFast'
 
@@ -387,12 +387,12 @@ export async function fetchNetValueHistory(
  *        4. 批量获取股票实时涨跌幅
  * @param code 基金代码
  */
-export async function fetchStockHoldings(code: string): Promise<StockHolding[]> {
+export async function fetchFundPortfolio(code: string): Promise<{ stocks: StockHolding[]; bonds: BondHolding[] }> {
   try {
-    const response = await fetchWithTimeout(`${API_BASE_URL}/api/funds/${code}/holdings?quotes=1`, {}, 7000)
+    const response = await fetchWithTimeout(`${API_BASE_URL}/api/funds/${code}/holdings?quotes=1`, {}, 12000)
     if (response.ok) {
       const payload = await response.json()
-      const holdings: StockHolding[] = (payload?.data?.holdings || []).map((item: any) => ({
+      const stocks: StockHolding[] = (payload?.data?.holdings || []).map((item: any) => ({
         stockCode: item.stockCode || '',
         stockName: item.stockName || '',
         holdingRatio: Number(item.holdingRatio) || 0,
@@ -403,12 +403,24 @@ export async function fetchStockHoldings(code: string): Promise<StockHolding[]> 
         quarterChange: Number.isFinite(Number(item.quarterChange)) ? Number(item.quarterChange) : null,
         sector: typeof item.sector === 'string' && item.sector ? item.sector : null
       })).filter((item: StockHolding) => item.stockCode && item.stockName && item.holdingRatio > 0)
-      if (holdings.length > 0) return holdings
+      const bonds: BondHolding[] = (payload?.data?.bonds || []).map((item: any) => ({
+        bondCode: item.bondCode || item.stockCode || '',
+        bondName: item.bondName || item.stockName || '',
+        holdingRatio: Number(item.holdingRatio) || 0,
+        holdingAmount: item.holdingMarketValue ? String(item.holdingMarketValue) : '0',
+        reportDate: item.reportDate || null,
+        quarterChange: Number.isFinite(Number(item.quarterChange)) ? Number(item.quarterChange) : null
+      })).filter((item: BondHolding) => item.bondCode && item.bondName && item.holdingRatio > 0)
+      if (stocks.length > 0 || bonds.length > 0) return { stocks, bonds }
     }
   } catch {
     // 后端不可用时继续使用原 JSONP 流程。
   }
-  return fetchStockHoldingsFromJsonp(code)
+  return { stocks: await fetchStockHoldingsFromJsonp(code), bonds: [] }
+}
+
+export async function fetchStockHoldings(code: string): Promise<StockHolding[]> {
+  return (await fetchFundPortfolio(code)).stocks
 }
 
 function fetchStockHoldingsFromJsonp(code: string): Promise<StockHolding[]> {
@@ -907,7 +919,18 @@ export async function fetchKLineData(code: string, days = 120): Promise<KLineDat
 // ========== 实时分时数据 API ==========
 
 // [WHAT] 分时数据缓存，避免频繁请求
-const timeShareCache: Map<string, { data: TimeShareData[]; timestamp: number }> = new Map()
+const timeShareCache: Map<string, { data: TimeShareData[]; timestamp: number; tradingDate: string }> = new Map()
+
+function compactTimeShareData(items: TimeShareData[], limit = 960): TimeShareData[] {
+  if (items.length <= limit) return items
+  const compacted: TimeShareData[] = []
+  const lastIndex = items.length - 1
+  for (let index = 0; index < limit; index++) {
+    const item = items[Math.round(index * lastIndex / (limit - 1))]
+    if (item && compacted.at(-1) !== item) compacted.push(item)
+  }
+  return compacted
+}
 
 /**
  * 获取基金当日分时数据
@@ -923,19 +946,26 @@ export async function fetchTimeShareData(code: string): Promise<TimeShareData[]>
   }
 
   try {
-    const response = await fetchWithTimeout(`${API_BASE_URL}/api/funds/${encodeURIComponent(code)}/intraday`, {
+    const since = cached?.data.at(-1)?.time || ''
+    const params = since ? `?since=${encodeURIComponent(since)}` : ''
+    const response = await fetchWithTimeout(`${API_BASE_URL}/api/funds/${encodeURIComponent(code)}/intraday${params}`, {
       cache: 'no-store'
     }, 5_000)
     if (!response.ok) return []
     const payload = await response.json()
-    const result = (payload?.data?.points || [])
+    const incoming = (payload?.data?.points || [])
       .map((point: any) => ({
         time: String(point?.time || ''),
         value: Number(point?.value),
         change: Number(point?.change)
       }))
       .filter((point: TimeShareData) => point.time && Number.isFinite(point.value) && Number.isFinite(point.change))
-    timeShareCache.set(code, { data: result, timestamp: Date.now() })
+    const tradingDate = String(payload?.data?.tradingDate || '')
+    const sameTradingDate = cached && cached.tradingDate === tradingDate
+    const result = sameTradingDate
+      ? compactTimeShareData([...new Map([...cached.data, ...incoming].map(point => [point.time, point])).values()])
+      : incoming
+    timeShareCache.set(code, { data: result, timestamp: Date.now(), tradingDate })
     return result
   } catch {}
 
@@ -1700,7 +1730,7 @@ export async function fetchAccumulatedReturn(
   range = '1n', 
   _indexCode = '000300'
 ): Promise<AccumulatedReturnData[]> {
-  const rangeDays: Record<string, number> = { y: 31, '3y': 93, '6y': 186 }
+  const rangeDays: Record<string, number> = { y: 31, '3y': 93, '6y': 186, '1n': 366, '3n': 1100 }
   if (!rangeDays[range]) return []
   try {
     const response = await fetchWithTimeout(`${API_BASE_URL}/api/funds/${encodeURIComponent(code)}/performance?range=${encodeURIComponent(range)}`, {

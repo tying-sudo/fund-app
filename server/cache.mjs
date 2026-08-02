@@ -964,6 +964,22 @@ export function parseSinaRealtimeEstimate(payload, code, fallback, listEntry, ma
   }
 }
 
+/**
+ * A pre-open request can cache yesterday's official NAV snapshot for much
+ * longer than the few minutes remaining before the market opens. Once a live
+ * estimate session starts, that snapshot must be bypassed immediately so the
+ * first holding refresh after 09:30 can resolve an intraday estimate.
+ */
+export function shouldRefreshCachedFundEstimate(cached, {
+  canUseRealtime = false,
+  isMoneyMarket = false
+} = {}) {
+  return Boolean(cached) &&
+    cached.source === 'market_snapshot' &&
+    canUseRealtime &&
+    !isMoneyMarket
+}
+
 export async function fetchFundEstimates(codes, now = new Date()) {
   const results = {}
 
@@ -976,18 +992,17 @@ export async function fetchFundEstimates(codes, now = new Date()) {
 
   await Promise.all(uniqueCodes.map(async code => {
     const cacheKey = `estimate:${code}`
-    const cached = getCache(cacheKey)
-    if (cached) {
-      if (!cached.unavailable) results[code] = cached
-      return
-    }
-
     const listEntry = fundByCode.get(code)
     const estimateMarket = getFundEstimateMarketState(listEntry, now)
     const canUseRealtime = shouldFetchFundgzEstimateForFund(listEntry, now) && hasFreshSnapshot
     const snapshot = getFundSnapshot(code)
     const fallback = snapshotToEstimate(code, snapshot, listEntry, now)
     const isMoneyMarket = Boolean(snapshot?.isMoneyMarket || listEntry?.type?.includes('货币'))
+    const cached = getCache(cacheKey)
+    if (cached && !shouldRefreshCachedFundEstimate(cached, { canUseRealtime, isMoneyMarket })) {
+      if (!cached.unavailable) results[code] = cached
+      return
+    }
 
     if (canUseRealtime && !isMoneyMarket) {
       try {
@@ -1014,7 +1029,7 @@ export async function fetchFundEstimates(codes, now = new Date()) {
           fundType: fallback?.fundType || listEntry?.type || '',
           isMoneyMarket: false
         }
-        setCache(cacheKey, result, 20 * 1000)
+        setCache(cacheKey, result, 10 * 1000)
         results[code] = result
         return
       } catch (error) {
@@ -1046,8 +1061,43 @@ export async function fetchStockQuotes(secids) {
       console.error(`[Stock Quotes] Tencent fallback failed: ${error.message}`)
     }
   }
+  const hongKongSecids = secids.filter(secid => String(secid).startsWith('116.'))
+  if (hongKongSecids.length) {
+    let tencentHongKongQuotes = {}
+    try {
+      // The delayed Eastmoney list can reset Hong Kong percentages to zero
+      // after 16:00. Keep the source distinct so a genuine Tencent 0.00%
+      // close is never replaced by an earlier intraday value.
+      tencentHongKongQuotes = await fetchTencentStockQuotes(hongKongSecids)
+    } catch (error) {
+      console.error(`[Stock Quotes] Hong Kong close fallback failed: ${error.message}`)
+    }
+    for (const secid of hongKongSecids) {
+      const code = String(secid).slice(4)
+      const cacheKey = `stock-quote:hk-close:${code}`
+      const cached = getCache(cacheKey)
+      const selected = selectRetainedHongKongQuote(secid, tencentHongKongQuotes[code] || results[code], cached)
+      if (selected) results[code] = selected
+      if (selected && (Number(selected.changePercent) !== 0 || !cached)) {
+        setCache(cacheKey, selected, 24 * 60 * 60 * 1000)
+      }
+    }
+  }
   await enrichOverseasQuoteProfiles(results, secids)
   return results
+}
+
+export function selectRetainedHongKongQuote(secid, incoming, cached, now = new Date()) {
+  if (!String(secid || '').startsWith('116.')) return incoming || null
+  const market = getHongKongMarketState(now)
+  const incomingChange = Number(incoming?.changePercent)
+  const cachedChange = Number(cached?.changePercent)
+  const cachedDate = String(cached?.marketDate || '')
+  const canRetain = incoming?.source === 'eastmoney' && market.isAfterClose && cachedDate === market.date &&
+    Number.isFinite(cachedChange) && cachedChange !== 0 && incomingChange === 0
+  if (canRetain) return { ...cached, retainedClose: true, source: cached.source || 'retained_hk_close' }
+  if (!incoming || !Number.isFinite(incomingChange)) return cachedDate === market.date ? cached : null
+  return { ...incoming, marketDate: market.date, retainedClose: false }
 }
 
 function tencentSymbolForSecid(secid) {

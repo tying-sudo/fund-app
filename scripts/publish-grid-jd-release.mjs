@@ -108,41 +108,43 @@ const apkName = `fund-app-${version}-${versionCode}.apk`
 const manifest = {
   version,
   versionCode,
-  minimumVersion: '1.0.71',
+  minimumVersion: '1.0.127',
   forceUpdate: false,
-  title: '京东网格持仓导入修复',
+  title: '京东网格批次与盘中估值修复',
   releaseNotes: [
-    '京东近30天没有买卖流水时，会以当前仍持有基金的份额和成本净值建立网格基准批次',
-    '仅导入京东当前仍持有基金的流水，避免已清仓基金重新出现',
-    '京东流水去重后原子写入网格批次，重复同步不会重复生成记录'
+    '补抓京东账号首屏交易，详情页限制并发并自动重试，显示页数、原始行数和失败统计',
+    '只有与当前份额严格对账的完整周期才覆盖网格批次，旧待确认交易不会恢复已清仓基金',
+    '修复开盘后仍命中昨日净值缓存导致持仓页盘中估值显示为空的问题'
   ],
   apkFileName: apkName,
   sha256: await sha256(apkPath),
   sizeBytes: apkInfo.size,
   publishedAt: new Date().toISOString()
 }
-manifest.title = '京东本轮建仓交易导入与确认规则'
-manifest.releaseNotes = [
-  '只导入当前持仓基金最近一次清仓后的真实买入、卖出和转换记录',
-  '交易列表持续分页读取；中间页面没有可识别记录也不会停止',
-  '调仓标签按京东确认窗口自动消失：15点前次日12点、15点后次日15点；后者收益从再下一交易日计算'
-]
-
-manifest.title = '京东交易金额时间确认净值导入'
-manifest.releaseNotes = [
-  '修复网格历史净值遇到上游空数据时返回空曲线的问题，自动回退到持仓净值服务',
-  '历史净值按 500 条分页补全，旧买入记录可从公开完整净值序列取得确认日净值并推算份额',
-  '完整导入京东交易记录页的买入、卖出和转换，后端继续核对当前持仓与完整时间线'
-]
 
 const privateKey = privateKeyPath ? await readFile(privateKeyPath) : null
 const client = await connect(privateKey)
 try {
   const sftp = await sftpFor(client)
+  const backendFiles = ['cache.mjs']
+  const backendBackup = `${proxyRoot}/.grid-jd-backup-${releaseStamp}`
+  await exec(client, `install -d -m 0755 ${backendBackup}`)
+  for (const file of backendFiles) {
+    await exec(client, `cp -p ${proxyRoot}/${file} ${backendBackup}/${file}`)
+    await upload(sftp, join(root, 'server', file), `${proxyRoot}/${file}.uploading`)
+    await exec(client, `mv ${proxyRoot}/${file}.uploading ${proxyRoot}/${file}`)
+  }
+  try {
+    await exec(client, `cd ${proxyRoot} && node --check cache.mjs && systemctl restart fund-proxy`)
+    await waitForHealth(client, 'curl --fail --silent --show-error http://127.0.0.1/api/health >/dev/null')
+  } catch (error) {
+    for (const file of backendFiles) await exec(client, `cp -p ${backendBackup}/${file} ${proxyRoot}/${file}`)
+    await exec(client, 'systemctl restart fund-proxy').catch(() => {})
+    throw error
+  }
+
   const gridFiles = ['app.py', 'positions.py', 'valuation/providers.py']
   const gridBackup = `${gridRemote}/.jd-import-backup-${releaseStamp}`
-  const proxyFiles = ['server.mjs', 'fund-data-service.mjs']
-  const proxyBackup = `${proxyRoot}/.history-nav-backup-${releaseStamp}`
   await exec(client, `install -d -m 0755 ${gridBackup}`)
   for (const file of gridFiles) {
     const backupFile = `${gridBackup}/${file}`
@@ -160,21 +162,6 @@ try {
     throw error
   }
 
-  await exec(client, `install -d -m 0755 ${proxyBackup}`)
-  for (const file of proxyFiles) {
-    await exec(client, `cp -p ${proxyRoot}/${file} ${proxyBackup}/${file}`)
-    await upload(sftp, join(root, 'server', file), `${proxyRoot}/${file}.uploading`)
-    await exec(client, `mv ${proxyRoot}/${file}.uploading ${proxyRoot}/${file}`)
-  }
-  try {
-    await exec(client, `cd ${proxyRoot} && node --check server.mjs && node --check fund-data-service.mjs && systemctl restart fund-proxy`)
-    await waitForHealth(client, 'curl --fail --silent --show-error http://127.0.0.1:3000/api/health >/dev/null')
-  } catch (error) {
-    for (const file of proxyFiles) await exec(client, `cp -p ${proxyBackup}/${file} ${proxyRoot}/${file}`)
-    await exec(client, 'systemctl restart fund-proxy').catch(() => {})
-    throw error
-  }
-
   await exec(client, `rm -rf ${webNext}; install -d -m 0755 ${webNext}`)
   const webFiles = await collect(join(root, 'dist'))
   const webDirs = [...new Set(webFiles.map((file) => dirname(relative(join(root, 'dist'), file))))]
@@ -189,7 +176,7 @@ try {
   await exec(client, `cp -p ${proxyRoot}/data/app-version.json ${proxyRoot}/data/app-version.json.previous-${releaseStamp} && mv ${remoteApk}.uploading ${remoteApk} && ln -sfn ${apkName} ${downloadRoot}/fund-app-latest.apk && printf %s ${base64(JSON.stringify(manifest))} | base64 -d > ${proxyRoot}/data/app-version.json && chown -R fundproxy:fundproxy ${webNext} ${downloadRoot} ${proxyRoot}/data && chmod -R a+rX ${downloadRoot}`)
   await exec(client, `if [ -d ${webRoot} ]; then mv ${webRoot} ${webPrevious}; fi; mv ${webNext} ${webRoot}`)
   await exec(client, `curl --fail --silent --show-error http://127.0.0.1:8000/v1/health >/dev/null && curl --fail --silent --show-error http://127.0.0.1/api/app/version >/dev/null && curl --fail --silent --show-error --head http://127.0.0.1/downloads/fund-app-latest.apk >/dev/null`)
-  console.log(JSON.stringify({ success: true, version, versionCode, apkName, sha256: manifest.sha256, sizeBytes: manifest.sizeBytes, webPrevious, gridBackup, proxyBackup }))
+  console.log(JSON.stringify({ success: true, version, versionCode, apkName, sha256: manifest.sha256, sizeBytes: manifest.sizeBytes, webPrevious, backendBackup, gridBackup }))
 } finally {
   client.end()
 }

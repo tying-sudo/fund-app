@@ -1,7 +1,7 @@
 <script setup lang="ts">
 import { ref, watch } from 'vue'
 
-const props = defineProps<{ show: boolean; title?: string }>()
+const props = defineProps<{ show: boolean; title?: string; confirmText?: string }>()
 const emit = defineEmits<{ 'update:show': [value: boolean]; confirm: [cookie: string] }>()
 const storageKey = 'fund-app:jd-cookie:v1'
 
@@ -39,8 +39,8 @@ function clearCookie() {
           <button type="button" class="icon-button" title="关闭" aria-label="关闭" @click="emit('update:show', false)"><van-icon name="cross" size="20" /></button>
         </span>
       </div>
-      <van-field v-model="cookie" label="Cookie" type="textarea" rows="4" maxlength="16384" autocomplete="off" autocapitalize="off" spellcheck="false" placeholder="pt_key=...; pt_pin=..." />
-      <div class="dialog-actions"><van-button block type="primary" :disabled="!cookie.trim()" @click="submit">读取持仓</van-button></div>
+      <van-field v-model="cookie" label="Cookie" type="textarea" rows="4" maxlength="16384" autocomplete="off" autocapitalize="off" :spellcheck="false" placeholder="pt_key=...; pt_pin=..." />
+      <div class="dialog-actions"><van-button block type="primary" :disabled="!cookie.trim()" @click="submit">{{ confirmText || '读取持仓' }}</van-button></div>
     </section>
   </van-popup>
 </template>

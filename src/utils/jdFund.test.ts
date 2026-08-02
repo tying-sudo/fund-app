@@ -15,8 +15,8 @@ test('rejects malformed fund codes', () => {
 
 test('builds captured JD Finance trade URLs for every holding action', () => {
   assert.equal(
-    buildJdFundTradeUrl('017472', 'buy'),
-    'https://lc.jr.jd.com/finance/fund/fundtrade/index/?source=app&itemId=1017472&version=3&fundUtmSource=310&fundUtmParam=add_jjccxq&fromJumpType=2&createOrdermaket=310'
+    buildJdFundTradeUrl('002112', 'buy'),
+    'https://lc.jr.jd.com/finance/fund/fundtrade/index/?source=app&itemId=105109&version=3'
   )
   assert.equal(
     buildJdFundTradeUrl('017472', 'sell'),
@@ -29,10 +29,28 @@ test('builds captured JD Finance trade URLs for every holding action', () => {
   assert.match(decodeURIComponent(buildJdFundTradeScheme('017472', 'convert')), /curType=transfer/)
 })
 
-test('uses the captured JD Finance product ID for 100055 buy', () => {
-  assert.equal(resolveJdFundBuyItemId('100055'), '107138')
+test('uses captured JD Finance product IDs when they differ from 1 + fund code', () => {
+  const capturedProductIds = {
+    '001470': '105457',
+    '002112': '105109',
+    '010524': '113000',
+    '100055': '107138'
+  }
+
+  for (const [fundCode, itemId] of Object.entries(capturedProductIds)) {
+    assert.equal(resolveJdFundBuyItemId(fundCode), itemId)
+    assert.equal(
+      buildJdFundTradeUrl(fundCode, 'buy'),
+      `https://lc.jr.jd.com/finance/fund/fundtrade/index/?source=app&itemId=${itemId}&version=3`
+    )
+    assert.doesNotMatch(buildJdFundTradeUrl(fundCode, 'buy'), new RegExp(`itemId=1${fundCode}(?:&|$)`))
+  }
+})
+
+test('does not invent a JD product ID for an uncaptured fund', () => {
+  assert.equal(resolveJdFundBuyItemId('017472'), null)
   assert.equal(
-    buildJdFundTradeUrl('100055', 'buy'),
-    'https://lc.jr.jd.com/finance/fund/fundtrade/index/?source=app&itemId=107138&version=3&fundUtmSource=310&fundUtmParam=add_jjccxq&fromJumpType=2&createOrdermaket=310'
+    buildJdFundTradeUrl('017472', 'buy'),
+    'https://lc.jr.jd.com/finance/funddetail/home/?fundCode=017472&fundUtmSource=340&fundUtmParam=AppShare'
   )
 })

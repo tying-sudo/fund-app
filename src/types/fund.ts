@@ -248,6 +248,16 @@ export interface StockHolding {
   sector?: string | null
 }
 
+/** 基金披露的重仓债券，和股票行情字段分开建模。 */
+export interface BondHolding {
+  bondCode: string
+  bondName: string
+  holdingRatio: number
+  holdingAmount: string
+  reportDate?: string | null
+  quarterChange?: number | null
+}
+
 /**
  * 自选基金项（包含实时估值）
  * [WHAT] 自选列表中展示的基金数据，合并了基本信息和实时估值
@@ -381,6 +391,10 @@ export interface SyncedAdjustment {
   targetShares?: number
   /** Third-party order status, for example paid or completed. */
   status?: string
+  /** Stable JD order state, for example PAY_SUCC, COMPLETE or CANCELED. */
+  statusCode?: string
+  /** Expected or actual time at which JD confirms the fund shares. */
+  confirmTime?: string
   syncedAt: number
 }
 

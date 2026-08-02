@@ -209,7 +209,10 @@ app.get('/api/funds/:code/intraday', async (req, res) => {
   if (!/^\d{6}$/.test(code)) return res.status(400).json({ error: '基金代码必须是6位数字' })
   try {
     res.set('Cache-Control', 'no-store, max-age=0')
-    res.json({ data: await getFundIntradayCurve(code) })
+    res.json({ data: await getFundIntradayCurve(code, new Date(), {
+      since: String(req.query.since || ''),
+      limit: 480
+    }) })
   } catch (error) {
     res.status(502).json({ error: error.message })
   }

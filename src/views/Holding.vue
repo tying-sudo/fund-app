@@ -17,14 +17,15 @@ import { showConfirmDialog, showToast, showLoadingToast, closeToast, showDialog 
 import { formatMoney, formatPercent, getChangeStatus, getJdFundLink } from '@/utils/format'
 import MarketIndexBoard from '@/components/MarketIndexBoard.vue'
 import JdCookieImportDialog from '@/components/JdCookieImportDialog.vue'
+import JdImportProgress from '@/components/JdImportProgress.vue'
 import { type FundInfo, type HoldingRecord, type FundShareClass, type FundFeeInfo, type JdHoldingSnapshot, type PendingAdjustment, type SyncedAdjustment } from '@/types/fund'
 
 import { getTodayStr, getValuationComparisonState, isEstimateDateToday, isTradingHours as isBeijingTradingHours, PRECISION, round } from '@/utils/holdingCalculator'
-import { getAdjustmentConfirmationAt, getSettlementNavStartDate } from '@/utils/tradingDate'
+import { addCalendarDays, getAdjustmentConfirmationAt, getSettlementNavStartDate } from '@/utils/tradingDate'
 import { buildJdHoldingSnapshot, deriveHoldingImportBasis, parseHoldingImportNumber } from '@/utils/holdingImport'
 import { openAlipayFundDetail } from '@/utils/alipayFund'
 import { buildJdFundTradeScheme, openJdFundDetail, openJdFundTrade, type JdFundTradeAction } from '@/utils/jdFund'
-import { filterRecentJdAdjustments, hasReachedJdConfirmationWindow, importJdHoldingsWithCookie, isJdAdjustmentRecent, type JdHoldingItem, type JdSyncProgress } from '@/utils/jdHoldings'
+import { getJdAdjustmentTagLabel, getSafeJdClosedHoldingCodes, importJdHoldingsWithCookie, jdImportErrorMessage, shouldShowJdAdjustmentTag, toJdSyncProgressState, type JdClosedHoldingItem, type JdHoldingItem, type JdSyncProgress } from '@/utils/jdHoldings'
 
 // 集成风控系统和日志模块
 import { getRiskController } from '@/utils/riskControl'
@@ -37,6 +38,7 @@ const settingsStore = useSettingsStore()
 const marketIndexBoard = ref<{ refresh: () => Promise<void> } | null>(null)
 let autoRefreshTimer: ReturnType<typeof setTimeout> | null = null
 let autoRefreshActive = false
+let calendarRolloverTimer: ReturnType<typeof setTimeout> | null = null
 const confirmationClock = ref(Date.now())
 let confirmationClockTimer: ReturnType<typeof setInterval> | null = null
 const jdTradeActions: ReadonlyArray<{ value: JdFundTradeAction, label: string }> = [
@@ -51,7 +53,7 @@ function scheduleAutoRefresh() {
   if (!autoRefreshActive || !settingsStore.autoRefresh) return
 
   const intervalSeconds = isBeijingTradingHours()
-    ? settingsStore.tradingInterval
+    ? 1
     : settingsStore.afterHoursInterval
   autoRefreshTimer = setTimeout(async () => {
     try {
@@ -73,6 +75,33 @@ function stopAutoRefresh() {
   autoRefreshActive = false
   if (autoRefreshTimer) clearTimeout(autoRefreshTimer)
   autoRefreshTimer = null
+}
+
+function millisecondsUntilNextBeijingMidnight(now = Date.now()) {
+  const nextDate = addCalendarDays(getTodayStr(new Date(now)), 1)
+  const nextMidnight = Date.parse(`${nextDate}T00:00:00+08:00`)
+  return Math.max(1_000, nextMidnight - now + 50)
+}
+
+function scheduleCalendarRollover() {
+  if (calendarRolloverTimer) clearTimeout(calendarRolloverTimer)
+  calendarRolloverTimer = setTimeout(async () => {
+    const changed = holdingStore.refreshCalendarDay()
+    if (changed && !document.hidden) {
+      await holdingStore.refreshEstimates().catch(() => undefined)
+    }
+    scheduleCalendarRollover()
+  }, millisecondsUntilNextBeijingMidnight())
+}
+
+function stopCalendarRollover() {
+  if (calendarRolloverTimer) clearTimeout(calendarRolloverTimer)
+  calendarRolloverTimer = null
+}
+
+function onDocumentVisibilityChange() {
+  if (document.hidden || !holdingStore.refreshCalendarDay()) return
+  void holdingStore.refreshEstimates().catch(() => undefined)
 }
 
 function startConfirmationClock() {
@@ -254,8 +283,8 @@ const currentPendingAdjustments = computed<PendingAdjustment[]>(() =>
 /** JD records are audit-only and never enter the pending settlement engine. */
 const currentSyncedAdjustments = computed<SyncedAdjustment[]>(() =>
   holdingStore.syncedAdjustments.filter(
-    (item: SyncedAdjustment) => isJdAdjustmentRecent(item)
-      && (item.code === tradeFundCode.value || (item.type === 'convert' && item.targetCode === tradeFundCode.value))
+    (item: SyncedAdjustment) => item.code === tradeFundCode.value
+      || (item.type === 'convert' && item.targetCode === tradeFundCode.value)
   )
 )
 
@@ -597,17 +626,22 @@ const isPullRefreshing = ref(false)
 // [WHAT] 页面挂载时初始化数据
 onMounted(async () => {
   await holdingStore.initHoldings()
+  holdingStore.refreshCalendarDay()
   startAutoRefresh()
+  scheduleCalendarRollover()
   startConfirmationClock()
   // [WHAT] 点击外部关闭下拉菜单
   document.addEventListener('click', closeAllDropdowns)
+  document.addEventListener('visibilitychange', onDocumentVisibilityChange)
 })
 
 // [WHAT] 页面卸载时移除事件监听
 onUnmounted(() => {
   stopAutoRefresh()
+  stopCalendarRollover()
   stopConfirmationClock()
   document.removeEventListener('click', closeAllDropdowns)
+  document.removeEventListener('visibilitychange', onDocumentVisibilityChange)
 })
 
 // [WHAT] 汇总统计样式
@@ -653,14 +687,17 @@ function getSyncedTags(holding: any): { label: string; title: string; type: 'add
   const seen = new Set<string>()
   return holdingStore.syncedAdjustments
     .filter((item: SyncedAdjustment) => (item.code === holding.code || (item.type === 'convert' && item.targetCode === holding.code))
-      && isJdAdjustmentRecent(item)
-      && !hasReachedJdConfirmationWindow(item, now))
+      && shouldShowJdAdjustmentTag(item, now))
     .flatMap((item: SyncedAdjustment) => {
-      if (seen.has(item.type)) return []
-      seen.add(item.type)
+      const label = getJdAdjustmentTagLabel(item, holding.code)
+      if (!label || seen.has(label)) return []
+      seen.add(label)
+      const direction = item.type === 'convert'
+        ? (item.code === holding.code ? '转出' : '转入')
+        : ''
       return [{
-        label: getSyncedAdjustmentLabel(item),
-        title: `${item.tradeTime || item.tradeDate} · ${item.status || '已同步'}`,
+        label,
+        title: `${item.tradeTime || item.tradeDate}${direction ? ` · ${direction}` : ''} · ${item.status || item.statusCode || '等待份额确认'}`,
         type: item.type
       }]
     })
@@ -811,7 +848,7 @@ const hasDiffData = (holding: any) => {
 
 // [WHAT] 真实涨跌幅标签（盘中显示"昨"，盘后根据数据日期显示"真实"或"昨"）
 const getRealChangeLabel = (holding: any) => {
-  return getComparisonState(holding).realChangeLabel || '净值'
+  return getComparisonState(holding).realChangeLabel || '昨'
 }
 
 const getDisplayEstimateChange = (holding: any) => {
@@ -1322,35 +1359,7 @@ const jdImportedAdjustments = ref<SyncedAdjustment[]>([])
 const jdSyncProgress = ref({ message: '正在打开京东金融...', percentage: 5 })
 
 function updateJdSyncProgress(progress: JdSyncProgress | { stage: string; message: string; current?: number; total?: number }) {
-  const ratio = progress.total && progress.total > 0
-    ? Math.min(1, Math.max(0, (progress.current || 0) / progress.total))
-    : 0
-  const percentage = progress.stage === 'reading_holdings'
-    ? 12 + Math.round(ratio * 43)
-    : progress.stage === 'reading_trades'
-      ? 55 + Math.round(ratio * 25)
-      : ({ login: 8, normalizing: 82, saving: 88, refreshing: 95, completed: 100 } as Record<string, number>)[progress.stage] || 8
-  jdSyncProgress.value = {
-    message: progress.message,
-    percentage
-  }
-}
-
-function jdImportErrorMessage(error: unknown): string {
-  const message = String((error as { message?: unknown })?.message || '').trim()
-  if (!message) return '京东持仓读取失败，请检查网络后重试'
-  // Capacitor may prefix a native rejection with a Java exception class. Keep
-  // the localized native reason visible instead of treating that prefix as an
-  // English-only failure and hiding the actionable message.
-  const chineseReason = message.match(/[\u3400-\u9fff][\s\S]*/)?.[0]?.trim()
-  if (chineseReason) return chineseReason
-  if (/[A-Za-z]/.test(message)) {
-    if (/(cookie|login|sign.?in|unauthorized|forbidden|expired)/i.test(message)) {
-      return '京东 Cookie 已过期或无效，请更新后重试'
-    }
-    return '京东持仓读取失败，请检查 Cookie 和网络后重试'
-  }
-  return message
+  jdSyncProgress.value = toJdSyncProgressState(progress)
 }
 
 // [NEW] 手动补全相关状态
@@ -1590,7 +1599,7 @@ async function importJdHoldings(cookie: string) {
     const syncedAt = Date.now()
     updateJdSyncProgress({ stage: 'saving', message: '正在写入京东当前持仓...' })
     const importedHoldings = await saveJdCurrentHoldings(result.items, syncedAt)
-    jdImportedAdjustments.value = filterRecentJdAdjustments(result.adjustments).map((item) => ({
+    jdImportedAdjustments.value = result.timelineAdjustments.map((item) => ({
       ...item,
       source: 'jd' as const,
       name: item.name || holdingStore.getHoldingByCode(item.code)?.name || item.code,
@@ -1599,7 +1608,8 @@ async function importJdHoldings(cookie: string) {
       targetShares: parseHoldingImportNumber(item.targetShares) ?? undefined,
       syncedAt
     }))
-    if (result.items.length === 0) {
+    const closedHoldings = await removeJdClosedHoldings(result.closedItems, result.items, result.timelineAdjustments)
+    if (result.items.length === 0 && result.closedItems.length === 0) {
       showToast('京东账户未返回当前持仓')
       return
     }
@@ -1624,12 +1634,14 @@ async function importJdHoldings(cookie: string) {
     const details = [
       importedHoldings.added > 0 ? `新增 ${importedHoldings.added} 只持仓` : '',
       importedHoldings.updated > 0 ? `校准 ${importedHoldings.updated} 只已有持仓` : '',
-      `${synced.adjustments} 条本轮建仓调仓记录`,
+      closedHoldings.removed > 0 ? `清仓删除 ${closedHoldings.removed} 只基金` : '',
+      `${synced.adjustments} 条近30天交易审计记录`,
       synced.summary && result.summary ? `昨日收益 ${formatMoney(result.summary.yesterdayProfit)}` : '',
       result.tradeWarning || '',
-      importedHoldings.failed > 0 ? `${importedHoldings.failed} 只持仓写入失败` : ''
+      importedHoldings.failed > 0 ? `${importedHoldings.failed} 只持仓写入失败` : '',
+      closedHoldings.failed > 0 ? `${closedHoldings.failed} 只清仓删除失败` : ''
     ].filter(Boolean).join('，')
-    if (importedHoldings.added > 0) {
+    if (importedHoldings.added > 0 || importedHoldings.updated > 0 || closedHoldings.removed > 0) {
       void holdingStore.refreshEstimates().catch((error) => {
         console.error('[京东持仓] 后台刷新估值失败:', error)
       })
@@ -1640,6 +1652,32 @@ async function importJdHoldings(cookie: string) {
   } finally {
     isJdImporting.value = false
   }
+}
+
+async function removeJdClosedHoldings(
+  closedItems: JdClosedHoldingItem[],
+  currentItems: JdHoldingItem[],
+  adjustments: Parameters<typeof getSafeJdClosedHoldingCodes>[2]
+): Promise<{ removed: number; skipped: number; failed: number }> {
+  const removableCodes = new Set(getSafeJdClosedHoldingCodes(
+    closedItems,
+    currentItems,
+    adjustments,
+    holdingStore.holdingCodes
+  ))
+  let removed = 0
+  const skipped = Math.max(0, closedItems.length - removableCodes.size)
+  let failed = 0
+  for (const code of removableCodes) {
+    try {
+      if (await holdingStore.removeHolding(code)) removed++
+      else failed++
+    } catch (error) {
+      failed++
+      console.error(`[京东持仓] ${code} 清仓删除失败:`, error)
+    }
+  }
+  return { removed, skipped, failed }
 }
 
 function createJdHoldingRecord(item: JdHoldingItem, snapshot: JdHoldingSnapshot): HoldingRecord | null {
@@ -1951,29 +1989,7 @@ function closeImportDialog() {
 <template>
   <div class="holding-page">
     <JdCookieImportDialog v-model:show="showJdCookieDialog" title="京东 Cookie 读取" @confirm="importJdHoldings" />
-    <van-popup
-      :show="isJdImporting"
-      class="jd-sync-progress"
-      :close-on-click-overlay="false"
-      :closeable="false"
-      :safe-area-inset-bottom="true"
-    >
-      <section class="jd-sync-progress-content" aria-live="polite">
-        <van-loading size="28px" color="#1989fa" />
-        <div class="jd-sync-progress-title">京东账户读取</div>
-        <div class="jd-sync-progress-message">{{ jdSyncProgress.message }}</div>
-        <div
-          class="jd-sync-progress-track"
-          role="progressbar"
-          aria-label="京东持仓读取进度"
-          aria-valuemin="0"
-          aria-valuemax="100"
-          :aria-valuenow="jdSyncProgress.percentage"
-        >
-          <span class="jd-sync-progress-fill" :style="{ width: `${jdSyncProgress.percentage}%` }"></span>
-        </div>
-      </section>
-    </van-popup>
+    <JdImportProgress :show="isJdImporting" :message="jdSyncProgress.message" :percentage="jdSyncProgress.percentage" />
 
     <!-- 隐藏的文件输入 -->
     <input
@@ -2637,7 +2653,7 @@ function closeImportDialog() {
         <div class="synced-adjustments" v-if="currentSyncedAdjustments.length > 0">
           <div class="pending-title synced-title">
             <van-icon name="records-o" />
-            <span>京东已同步调仓（最近5天 · {{ currentSyncedAdjustments.length }}）</span>
+            <span>京东已同步调仓（近30天审计 · {{ currentSyncedAdjustments.length }}）</span>
             <span class="pending-tip">仅记录，不修改持仓</span>
           </div>
           <div class="pending-list">
@@ -2880,64 +2896,6 @@ function closeImportDialog() {
 
 .holding-global-refresh {
   min-height: calc(100vh - var(--holding-tabbar-height) - env(safe-area-inset-top, 0px));
-}
-
-.jd-sync-progress {
-  width: min(280px, calc(100vw - 48px));
-  box-sizing: border-box;
-  overflow: hidden;
-  padding: 0;
-  border-radius: 8px;
-}
-
-.jd-sync-progress-content {
-  display: grid;
-  grid-template-columns: minmax(0, 1fr);
-  gap: 10px;
-  box-sizing: border-box;
-  width: 100%;
-  padding: 24px;
-  text-align: center;
-}
-
-.jd-sync-progress :deep(.van-loading) {
-  justify-self: center;
-  margin: 0;
-}
-
-.jd-sync-progress-title {
-  color: var(--text-primary);
-  font-size: 15px;
-  font-weight: 600;
-  line-height: 22px;
-}
-
-.jd-sync-progress-message {
-  min-height: 40px;
-  margin: 0;
-  color: var(--text-secondary);
-  font-size: 12px;
-  line-height: 20px;
-  overflow-wrap: anywhere;
-}
-
-.jd-sync-progress-track {
-  position: relative;
-  width: 100%;
-  height: 5px;
-  margin-top: 2px;
-  overflow: hidden;
-  background: var(--border-color, rgba(255, 255, 255, 0.18));
-  border-radius: 999px;
-}
-
-.jd-sync-progress-fill {
-  display: block;
-  height: 100%;
-  min-width: 2px;
-  background: #1989fa;
-  border-radius: inherit;
-  transition: width 180ms ease-out;
 }
 
 /* 与自选页 .top-header 对齐，避免在页面容器上重复叠加安全区。 */

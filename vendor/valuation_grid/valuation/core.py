@@ -469,6 +469,20 @@ def load_state() -> dict:
     return seeded
 
 
+def _next_state_revision(current: Optional[dict]) -> str:
+    """Generate a strictly monotonic revision for optimistic state writes."""
+    now = beijing_now()
+    current_revision = current.get("updated_at") if isinstance(current, dict) else None
+    if isinstance(current_revision, str):
+        try:
+            previous = datetime.strptime(current_revision, "%Y-%m-%d %H:%M:%S.%f")
+            if now <= previous:
+                now = previous + timedelta(microseconds=1)
+        except ValueError:
+            pass
+    return now.strftime("%Y-%m-%d %H:%M:%S.%f")
+
+
 def save_state(state: dict, expected_updated_at: Optional[str] = None) -> bool:
     _ensure_data_dir()
 
@@ -486,7 +500,7 @@ def save_state(state: dict, expected_updated_at: Optional[str] = None) -> bool:
                 if not _backup_state(current):
                     return False
 
-            state["updated_at"] = beijing_now().strftime("%Y-%m-%d %H:%M:%S.%f")
+            state["updated_at"] = _next_state_revision(current)
             state.setdefault("version", 1)
             tmp_file = STATE_FILE.with_suffix(".tmp")
             with open(tmp_file, "w", encoding="utf-8") as f:

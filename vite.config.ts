@@ -35,9 +35,10 @@ export default defineConfig({
         rewrite: (path: string) => path.replace(/^\/api\/fundmobapi/, ''),
         secure: true
       },
-      // [FIX] 开发环境：后端 API 代理到生产环境(tyingfund.com -> Cloudflare Tunnel -> 10.0.10.20:3000)
+      // Local development uses the matching local API by default. Set
+      // VITE_API_PROXY_TARGET explicitly when testing another environment.
       '/api': {
-        target: process.env.VITE_API_PROXY_TARGET || 'https://tyingfund.com',
+        target: process.env.VITE_API_PROXY_TARGET || 'http://127.0.0.1:3001',
         changeOrigin: true,
         secure: true
       },

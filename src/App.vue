@@ -70,8 +70,8 @@ watch(
       market: 'market',
       holding: 'holding',
       analysis: 'analysis',
-      realtimeValuation: 'realtimeValuation',
-      lowFrequencyGrid: 'lowFrequencyGrid'
+      realtimeValuation: 'valuationWorkspace',
+      lowFrequencyGrid: 'valuationWorkspace'
     }
     if (name && tabMap[name as string]) {
       activeTab.value = tabMap[name as string]
@@ -87,8 +87,7 @@ function onTabChange(name: string | number) {
     market: '/market',
       holding: '/',
       analysis: '/analysis',
-      realtimeValuation: '/realtime-valuation',
-      lowFrequencyGrid: '/low-frequency-grid'
+      valuationWorkspace: '/realtime-valuation'
   }
   if (routeMap[name as string]) {
     router.push(routeMap[name as string])
@@ -102,7 +101,7 @@ function onTabChange(name: string | number) {
     <!-- [FIX] 启用 keep-alive 缓存主页面，避免频繁切换时重新加载 -->
     <router-view v-slot="{ Component }">
       <keep-alive include="Holding,Home,Market,Analysis,ValuationGrid">
-        <component :is="Component" :key="String(route.name)" />
+        <component :is="Component" :key="['realtimeValuation', 'lowFrequencyGrid'].includes(String(route.name)) ? 'valuation-workspace' : String(route.name)" />
       </keep-alive>
     </router-view>
 
@@ -115,8 +114,7 @@ function onTabChange(name: string | number) {
       <van-tabbar-item name="holding" icon="balance-list-o">持仓</van-tabbar-item>
       <van-tabbar-item name="home" icon="home-o">自选</van-tabbar-item>
       <van-tabbar-item name="market" icon="chart-trending-o">行情</van-tabbar-item>
-      <van-tabbar-item name="realtimeValuation" icon="chart-trending-o">估值</van-tabbar-item>
-      <van-tabbar-item name="lowFrequencyGrid" icon="apps-o">网格</van-tabbar-item>
+      <van-tabbar-item name="valuationWorkspace" icon="apps-o">估值网格</van-tabbar-item>
       <van-tabbar-item name="analysis" icon="bar-chart-o">分析</van-tabbar-item>
     </van-tabbar>
   </div>

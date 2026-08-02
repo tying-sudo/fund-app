@@ -10,7 +10,11 @@ import {
   parseFundHistoryPayload,
   parseFundHoldingsHtml,
   parseFundHoldingPeriodsHtml,
+  parseSinaBondHoldingsPayload,
+  parseSinaHeavyFundPayload,
+  parseSinaHoldingsPayload,
   parseSinaEstimatePayload,
+  isLatestFundReturnFresh,
   selectFundDailyReturns,
   snapshotToEastmoneyOfficialNav,
   selectVerifiedOverseasMarket
@@ -103,6 +107,13 @@ test('keeps the prior NAV return stable until Beijing midnight', () => {
   const afterMidnight = selectFundDailyReturns(items, '2026-07-23')
   assert.equal(afterMidnight.current, null)
   assert.equal(afterMidnight.previous.date, '2026-07-22')
+})
+
+test('does not present an expired historical NAV row as yesterday data', () => {
+  const atWednesdayPreOpen = new Date('2026-07-28T18:30:00Z')
+
+  assert.equal(isLatestFundReturnFresh('2026-07-28', atWednesdayPreOpen), true)
+  assert.equal(isLatestFundReturnFresh('2026-07-24', atWednesdayPreOpen), false)
 })
 
 test('keeps the latest trading-day return through a weekend', () => {
@@ -198,6 +209,54 @@ test('normalizes both Sina estimate variants', () => {
   assert.equal(parsed.sina_ds2.gsz, '1.3182')
   assert.equal(parsed.sina_ds2.gszzl, '-6.04')
   assert.equal(parsed.sina_ds3.gszzl, '-5.40')
+})
+
+test('parses Sina heavy holdings with disclosure dates and quarter changes', () => {
+  const parsed = parseSinaHoldingsPayload({ result: { data: {
+    date: { date: '20260630', front: '20260331' },
+    data: [{
+      ENDDATE: '20260630', SKNAME: '兆易创新', HOLDMKTCAP: '69523575.00',
+      NAVRTO: '0.34', SYMBOL: 'sh603986', DIFFNAVRTO: '0.13', MARKET: 'cn'
+    }, {
+      ENDDATE: '20260630', SKNAME: '佰维存储', HOLDMKTCAP: '25347986.28',
+      NAVRTO: '0.12', SYMBOL: 'sh688525', DIFFNAVRTO: '新增', MARKET: 'cn'
+    }]
+  } } }, '008888')
+
+  assert.equal(parsed.reportDate, '2026-06-30')
+  assert.equal(parsed.previousReportDate, '2026-03-31')
+  assert.deepEqual(parsed.holdings[0], {
+    fundCode: '008888', stockCode: '603986', stockName: '兆易创新', marketPrefix: '1',
+    holdingRatio: 0.34, holdingShares: null, holdingMarketValue: 69523575,
+    reportDate: '2026-06-30', quarterChange: 0.13, changeType: 'increased'
+  })
+  assert.equal(parsed.holdings[1].changeType, 'new')
+})
+
+test('parses Sina ETF bond holdings without treating them as stocks', () => {
+  const parsed = parseSinaBondHoldingsPayload({ result: { data: {
+    date: { date: '20260630', front: '' },
+    data: [{
+      ENDDATE: '20260630', SKNAME: '华峰转债', HOLDMKTCAP: '1619028.39',
+      NAVRTO: '0.03', SYMBOL: 'sh118071', DIFFNAVRTO: '新增'
+    }]
+  } } }, '588710')
+
+  assert.deepEqual(parsed.bonds[0], {
+    fundCode: '588710', bondCode: '118071', bondName: '华峰转债', holdingRatio: 0.03,
+    holdingMarketValue: 1619028.39, reportDate: '2026-06-30', quarterChange: null, changeType: 'new'
+  })
+})
+
+test('resolves the underlying ETF from Sina linked-fund holdings', () => {
+  const target = parseSinaHeavyFundPayload({ result: { data: { data: [{
+    FUNDCODE: '588710', FUNDNAME: '华泰柏瑞上证科创板半导体材料设备主题ETF',
+    NAVRTO: '94.02', ENDDATE: '20260630'
+  }] } } })
+  assert.deepEqual(target, {
+    targetCode: '588710', targetName: '华泰柏瑞上证科创板半导体材料设备主题ETF',
+    holdingRatio: 94.02, reportDate: '2026-06-30'
+  })
 })
 
 test('uses the Eastmoney full-market snapshot as the official NAV contract', () => {

@@ -22,83 +22,36 @@ interface StockQuote {
 /**
  * 获取股票实时行情（批量）
  * [WHY] 用于根据重仓股计算基金估值
- * [DEPS] 东方财富股票行情接口
- * [FIX] 移除远程后端 /api/stock-quotes 依赖，直接使用 /push2 代理获取
+ * [DEPS] 后端统一股票行情接口
+ * [WHY] 港股收盘值由后端按交易日保留，浏览器不能再用上游的盘后 0 覆盖。
  */
 export async function fetchStockQuotes(holdings: StockHolding[]): Promise<Map<string, StockQuote>> {
   const result = new Map<string, StockQuote>()
   if (holdings.length === 0) return result
 
-  // [WHAT] 分离 A股和港股
-  const aStocks = holdings.filter(h => h.marketPrefix !== '116')
-  const hkStocks = holdings.filter(h => h.marketPrefix === '116')
-
-  // [WHAT] A股批量获取（使用 /push2 代理）
-  const push2BaseUrl = USE_PROXY ? `${API_BASE_URL}/push2` : 'https://push2.eastmoney.com'
-  if (aStocks.length > 0) {
-    const secids = aStocks.map(h => `${h.marketPrefix || '0'}.${h.stockCode}`).join(',')
-    const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), 5000)
-
-    try {
-      const url = `${push2BaseUrl}/api/qt/ulist.np/get?fltt=2&secids=${secids}&fields=f2,f3,f12,f14&ut=fa5fd1943c7b386f172d6893dbfba10b&_=${Date.now()}`
-      const response = await fetch(url, {
-        signal: controller.signal,
-        headers: {
-          'Referer': 'https://quote.eastmoney.com/',
-          'User-Agent': 'Mozilla/5.0'
-        }
+  const secids = holdings.map(item => `${item.marketPrefix || '0'}.${item.stockCode}`).join(',')
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 6000)
+  try {
+    const response = await fetch(`${API_BASE_URL}/api/stock-quotes?secids=${encodeURIComponent(secids)}`, { signal: controller.signal })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const data = (await response.json())?.data || {}
+    for (const holding of holdings) {
+      const quote = data[holding.stockCode]
+      const changePercent = Number(quote?.changePercent)
+      if (!quote || !Number.isFinite(changePercent)) continue
+      result.set(holding.stockCode, {
+        code: holding.stockCode,
+        name: quote.name || '',
+        price: Number(quote.price) || 0,
+        change: Number(quote.change) || 0,
+        changePercent
       })
-      clearTimeout(timer)
-      if (!response.ok) throw new Error(`HTTP ${response.status}`)
-      const data = await response.json()
-      if (data.data && data.data.diff) {
-        for (const holding of aStocks) {
-          const quote = data.data.diff.find((q: any) => q.f12 === holding.stockCode)
-          if (quote) {
-            result.set(holding.stockCode, {
-              code: holding.stockCode,
-              name: quote.f14 || '',
-              price: quote.f2 || 0,
-              change: 0,
-              changePercent: quote.f3 || 0
-            })
-          }
-        }
-      }
-    } catch (err) {
-      clearTimeout(timer)
-      console.warn('[股票行情] A股获取失败:', err)
     }
-  }
-
-  // [WHAT] 港股逐个获取
-  for (const holding of hkStocks) {
-    try {
-      const controller = new AbortController()
-      const timer = setTimeout(() => controller.abort(), 3000)
-      const url = `${push2BaseUrl}/api/qt/stock/get?secid=116.${holding.stockCode}&fields=f2,f3,f12,f14&_=1234567890`
-      const response = await fetch(url, {
-        signal: controller.signal,
-        headers: {
-          'Referer': 'https://quote.eastmoney.com/',
-          'User-Agent': 'Mozilla/5.0'
-        }
-      })
-      clearTimeout(timer)
-      const data = await response.json()
-      if (data.data) {
-        result.set(holding.stockCode, {
-          code: holding.stockCode,
-          name: data.data.f14 || '',
-          price: data.data.f2 || 0,
-          change: 0,
-          changePercent: data.data.f3 || 0
-        })
-      }
-    } catch (e) {
-      console.error(`[股票行情] 港股 ${holding.stockCode} 获取失败:`, e)
-    }
+  } catch (error) {
+    console.warn('[股票行情] 后端获取失败:', error)
+  } finally {
+    clearTimeout(timer)
   }
 
   return result
@@ -226,18 +179,50 @@ function withConcurrencyControl<T>(fn: () => Promise<T>): Promise<T> {
 
 // ========== 后端API接口 ==========
 
-async function fetchBackendEstimateChunk(codes: string[]): Promise<Map<string, FundEstimate>> {
+export interface FundSnapshotEstimate {
+  code: string
+  name?: string
+  nav?: number
+  changePercent?: number | null
+  navDate?: string
+}
+
+export interface FundEstimatesBatchOptions {
+  /** Long-running background hydration may wait for a cold backend cache. */
+  timeoutMs?: number
+  /** A cloud snapshot already covers missing values, so avoid a JSONP fan-out. */
+  fallbackToSingle?: boolean
+}
+
+async function fetchBackendEstimateChunk(codes: string[], timeoutMs = 8_000): Promise<Map<string, FundEstimate>> {
   const results = new Map<string, FundEstimate>()
   const controller = new AbortController()
-  const timer = setTimeout(() => controller.abort(), 3000)
+  // Cold public Redis misses can take longer than three seconds while the
+  // upstream snapshot is refreshed. Do not fall back to a device's older
+  // JSONP value before the authoritative backend has had time to answer.
+  const timer = setTimeout(() => controller.abort(), timeoutMs)
   try {
-    const url = `${API_BASE_URL}/api/fund-estimates?codes=${encodeURIComponent(codes.join(','))}`
-    const response = await fetch(url, { signal: controller.signal })
+    // A per-read token also bypasses intermediary/browser caches left by an
+    // older WebView bundle. `cache: no-store` alone is not sufficient when a
+    // service worker or proxy has retained the previous query response.
+    const url = `${API_BASE_URL}/api/fund-estimates?codes=${encodeURIComponent(codes.join(','))}&t=${Date.now()}`
+    const response = await fetch(url, { signal: controller.signal, cache: 'no-store' })
     if (!response.ok) throw new Error(`HTTP ${response.status}`)
     const payload = await response.json()
     for (const code of codes) {
       const item = payload?.data?.[code]
-      if (item?.fundcode === code && item.name) results.set(code, item as FundEstimate)
+      if (item?.fundcode !== code) continue
+      const estimate = item as FundEstimate
+      results.set(code, estimate)
+      // Batch reads are the holding page's primary path. Persist the same
+      // usable live value as the single-fund path so Android can retain it
+      // through a brief backend/network failure on a later refresh.
+      if (estimate.source !== 'market_snapshot' &&
+          Number.isFinite(Number(estimate.gsz)) && Number(estimate.gsz) > 0 &&
+          Number.isFinite(Number(estimate.gszzl))) {
+        cache.set(`estimate_${code}`, estimate, CACHE_TTL.ESTIMATE)
+        persistCache.set(`estimate_${code}`, estimate)
+      }
     }
     return results
   } finally {
@@ -245,18 +230,54 @@ async function fetchBackendEstimateChunk(codes: string[]): Promise<Map<string, F
   }
 }
 
-async function fetchBackendEstimates(codes: string[]): Promise<Map<string, FundEstimate>> {
+async function fetchBackendEstimates(codes: string[], timeoutMs?: number): Promise<Map<string, FundEstimate>> {
   const uniqueCodes = [...new Set(codes)]
   const chunks: string[][] = []
   for (let index = 0; index < uniqueCodes.length; index += 100) {
     chunks.push(uniqueCodes.slice(index, index + 100))
   }
-  const chunkResults = await Promise.all(chunks.map(fetchBackendEstimateChunk))
+  const safeTimeoutMs = Math.max(1_000, Math.min(timeoutMs || 8_000, 60_000))
+  const chunkResults = await Promise.all(chunks.map(chunk => fetchBackendEstimateChunk(chunk, safeTimeoutMs)))
   return new Map(chunkResults.flatMap(chunk => [...chunk]))
 }
 
 async function fetchBackendEstimate(code: string): Promise<FundEstimate | null> {
   return (await fetchBackendEstimates([code])).get(code) || null
+}
+
+async function fetchFundSnapshotChunk(codes: string[]): Promise<Map<string, FundSnapshotEstimate>> {
+  const results = new Map<string, FundSnapshotEstimate>()
+  const controller = new AbortController()
+  const timer = setTimeout(() => controller.abort(), 8_000)
+  try {
+    const url = `${API_BASE_URL}/api/fund-snapshots?codes=${encodeURIComponent(codes.join(','))}&t=${Date.now()}`
+    const response = await fetch(url, { signal: controller.signal, cache: 'no-store' })
+    if (!response.ok) throw new Error(`HTTP ${response.status}`)
+    const payload = await response.json()
+    for (const code of codes) {
+      const snapshot = payload?.data?.[code]
+      if (!snapshot || snapshot.code !== code) continue
+      results.set(code, snapshot as FundSnapshotEstimate)
+    }
+    return results
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+/**
+ * Return the published market snapshot in compact requests for a full
+ * valuation workspace. This fills a newly installed mobile client while live
+ * estimates warm in the background.
+ */
+export async function fetchFundSnapshotEstimates(codes: string[]): Promise<Map<string, FundSnapshotEstimate>> {
+  const uniqueCodes = [...new Set(codes.filter(code => /^\d{6}$/.test(code)))]
+  const chunks: string[][] = []
+  for (let index = 0; index < uniqueCodes.length; index += 500) {
+    chunks.push(uniqueCodes.slice(index, index + 500))
+  }
+  const settled = await Promise.allSettled(chunks.map(fetchFundSnapshotChunk))
+  return new Map(settled.flatMap(result => result.status === 'fulfilled' ? [...result.value] : []))
 }
 
 // ========== JSONP请求队列 ==========
@@ -338,9 +359,10 @@ export async function fetchFundEstimateFast(code: string): Promise<FundEstimate>
   
     // [FIX] 总是尝试获取最新数据，不再用 isTradingTime() 跳过
   // [WHY] 天天基金接口在收盘后仍返回当天最终估值，应尽量获取
-  // [FIX] 添加总超时限制（5秒），防止主接口+重仓股估值链路过长导致页面一直loading
+  // The backend gets the full cold-cache window before JSONP is allowed to
+  // supply a fallback, otherwise an old local value can win after an upgrade.
   const totalTimeout = new Promise<never>((_, reject) => {
-    setTimeout(() => reject(new Error(`总超时: ${code}`)), 5000)
+    setTimeout(() => reject(new Error(`总超时: ${code}`)), 9000)
   })
   
     const doFetch = async (): Promise<FundEstimate> => {
@@ -919,23 +941,28 @@ function parseStockHoldingsHtml(html: string): StockHolding[] {
 /**
  * 批量获取基金估值（并发优化）
  */
-export async function fetchFundEstimatesBatch(codes: string[]): Promise<Map<string, FundEstimate>> {
+export async function fetchFundEstimatesBatch(
+  codes: string[],
+  options: FundEstimatesBatchOptions = {}
+): Promise<Map<string, FundEstimate>> {
   const uniqueCodes = [...new Set(codes)]
   let results = new Map<string, FundEstimate>()
   try {
-    results = await fetchBackendEstimates(uniqueCodes)
+    results = await fetchBackendEstimates(uniqueCodes, options.timeoutMs)
   } catch {
     // 后端不可用时仅对缺失项启用逐只灾备。
   }
 
-  const promises = uniqueCodes.filter(code => !results.has(code)).map(async code => {
+  const promises = options.fallbackToSingle === false
+    ? []
+    : uniqueCodes.filter(code => !results.has(code)).map(async code => {
     try {
       const data = await fetchFundEstimateFast(code)
       results.set(code, data)
     } catch {
       // 静默失败
     }
-  })
+    })
   
   await Promise.all(promises)
   return results
@@ -1181,6 +1208,8 @@ export interface FundRealDayChange extends FundDailyReturnPoint {
   previous: FundDailyReturnPoint | null
   /** The backend attributed this official return to the current Beijing day. */
   isCurrentPublication: boolean
+  /** False means the history source has fallen behind and must not be shown as yesterday. */
+  isFresh: boolean
 }
 
 function normalizeDailyReturnPoint(item: any): FundDailyReturnPoint | null {
@@ -1192,7 +1221,7 @@ function normalizeDailyReturnPoint(item: any): FundDailyReturnPoint | null {
 }
 
 export async function fetchRealDayChange(code: string): Promise<FundRealDayChange | null> {
-  const cacheKey = `realchange_${code}`
+  const cacheKey = `realchange:v2_${code}`
   const ttl = getMarketAwareTtl()
   const cached = cache.get<FundRealDayChange>(cacheKey)
   if (cached !== null && cached !== undefined) return cached
@@ -1214,7 +1243,8 @@ export async function fetchRealDayChange(code: string): Promise<FundRealDayChang
           const result: FundRealDayChange = {
             ...latest,
             previous: normalizeDailyReturnPoint(payload?.data?.previous),
-            isCurrentPublication: Boolean(current && current.date === latest.date)
+            isCurrentPublication: Boolean(current && current.date === latest.date),
+            isFresh: payload?.data?.latestFresh !== false
           }
           cache.set(cacheKey, result, ttl)
           return result
@@ -1244,7 +1274,8 @@ export async function fetchRealDayChange(code: string): Promise<FundRealDayChang
         const result: FundRealDayChange = {
           ...realNav,
           previous: await getPreviousPoint(),
-          isCurrentPublication: true
+          isCurrentPublication: true,
+          isFresh: true
         }
         cache.set(cacheKey, result, ttl)
         return result
@@ -1267,7 +1298,8 @@ export async function fetchRealDayChange(code: string): Promise<FundRealDayChang
       changeRate: val,
       date: latest.date,
       previous: await getPreviousPoint(),
-      isCurrentPublication: latest.date === today
+      isCurrentPublication: latest.date === today,
+      isFresh: latest.date === today
     }
     cache.set(cacheKey, result, ttl)
     return result

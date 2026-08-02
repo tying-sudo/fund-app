@@ -1,6 +1,6 @@
 import { Capacitor, registerPlugin } from '@capacitor/core'
 import type { PluginListenerHandle } from '@capacitor/core'
-import { addCalendarDays, getBeijingDateString } from './tradingDate.ts'
+import { addCalendarDays } from './tradingDate.ts'
 
 export interface JdHoldingItem {
   code: string
@@ -16,6 +16,14 @@ export interface JdHoldingItem {
   acquiredDate?: string
 }
 
+/** An explicit zero-position detail returned by JD, never inferred from absence. */
+export interface JdClosedHoldingItem {
+  code: string
+  name?: string
+  amount?: string
+  shares?: string
+}
+
 export interface JdAdjustmentItem {
   id: string
   code: string
@@ -29,16 +37,27 @@ export interface JdAdjustmentItem {
   targetName?: string
   targetShares?: string
   status?: string
+  /** Stable order state returned by queryTradeOrderList. */
+  statusCode?: string
+  /** JD's expected or actual share-confirmation time. */
+  confirmTime?: string
+  /** Current-position legs represented by this row; used to split conversions safely. */
+  cycleCodes?: string[]
 }
 
 export interface JdImportResult {
   items: JdHoldingItem[]
+  closedItems: JdClosedHoldingItem[]
   adjustments: JdAdjustmentItem[]
   /** Full current-holding stream used only to certify a grid import. */
   timelineAdjustments: JdAdjustmentItem[]
+  /** Funds whose complete current-position cycle can replace older grid audit rows. */
+  verifiedTimelineCodes: string[]
   summary?: JdAccountSummary
   /** A current-holding snapshot remains usable when JD's optional trade page is unavailable. */
   tradeWarning?: string
+  /** Non-sensitive capture counts used to verify a successful Android import. */
+  tradeDiagnostic?: string
 }
 
 export interface JdAccountSummary {
@@ -54,9 +73,14 @@ export interface JdSyncProgress {
   total?: number
 }
 
+export interface JdSyncProgressState {
+  message: string
+  percentage: number
+}
+
 interface NativeJdHoldingsPlugin {
-  importHoldings(): Promise<{ items?: JdHoldingItem[]; adjustments?: JdAdjustmentItem[] }>
-  importHoldingsWithCookie(options: { cookie: string; background?: boolean }): Promise<{ items?: JdHoldingItem[]; adjustments?: JdAdjustmentItem[] }>
+  importHoldings(): Promise<{ items?: JdHoldingItem[]; closedItems?: JdClosedHoldingItem[]; adjustments?: JdAdjustmentItem[] }>
+  importHoldingsWithCookie(options: { cookie: string; background?: boolean }): Promise<{ items?: JdHoldingItem[]; closedItems?: JdClosedHoldingItem[]; adjustments?: JdAdjustmentItem[] }>
   addListener(eventName: 'syncProgress', listenerFunc: (event: JdSyncProgress) => void): Promise<PluginListenerHandle>
 }
 
@@ -72,6 +96,13 @@ function hasCurrentPosition(candidate: Partial<JdHoldingItem>): boolean {
     .map(parseJdNumber)
     .filter((value): value is number => value !== null)
   return values.length === 0 || values.some((value) => value > 0)
+}
+
+function hasExplicitZeroPosition(candidate: Pick<Partial<JdHoldingItem>, 'amount' | 'shares'>): boolean {
+  const values = [candidate.shares, candidate.amount]
+    .map(parseJdNumber)
+    .filter((value): value is number => value !== null)
+  return values.length > 0 && values.every((value) => Math.abs(value) < 0.000001)
 }
 
 /** Normalize only the non-sensitive rows returned by the Android WebView flow. */
@@ -99,6 +130,24 @@ export function normalizeJdHoldingItems(value: unknown): JdHoldingItem[] {
       ...(costAmount ? { costAmount } : {}),
       profitDate: text(candidate.profitDate),
       ...(acquiredDate ? { acquiredDate } : {})
+    }]
+  })
+}
+
+/** Only use native-reported zero rows; a missing fund row is never a close signal. */
+export function normalizeJdClosedHoldingItems(value: unknown): JdClosedHoldingItem[] {
+  const items = Array.isArray((value as { closedItems?: unknown })?.closedItems)
+    ? (value as { closedItems: unknown[] }).closedItems
+    : []
+  return items.flatMap((item): JdClosedHoldingItem[] => {
+    const candidate = item as Partial<JdClosedHoldingItem>
+    const code = text(candidate.code) || ''
+    if (!/^\d{6}$/.test(code) || !hasExplicitZeroPosition(candidate)) return []
+    return [{
+      code,
+      name: text(candidate.name),
+      amount: text(candidate.amount),
+      shares: text(candidate.shares)
     }]
   })
 }
@@ -131,7 +180,9 @@ function normalizeJdAdjustments(value: unknown): JdAdjustmentItem[] {
       targetCode: targetCode && /^\d{6}$/.test(targetCode) ? targetCode : undefined,
       targetName: text(candidate.targetName),
       targetShares: text(candidate.targetShares),
-      status: text(candidate.status)
+      status: text(candidate.status),
+      statusCode: text(candidate.statusCode)?.toUpperCase(),
+      confirmTime: text(candidate.confirmTime)
     }]
   })
 }
@@ -164,6 +215,7 @@ export interface JdCurrentTimelineSelection {
   adjustments: JdAdjustmentItem[]
   verifiedCodes: Set<string>
   incompleteCodes: Set<string>
+  selectedIdsByCode: Map<string, Set<string>>
 }
 
 function isRelevantToCode(adjustment: JdAdjustmentItem, code: string): boolean {
@@ -179,17 +231,26 @@ function isRelevantToCode(adjustment: JdAdjustmentItem, code: string): boolean {
 export function selectVerifiedJdCurrentTimeline(items: JdHoldingItem[], adjustments: JdAdjustmentItem[]): JdCurrentTimelineSelection {
   const currentCodes = new Set(items.map((item) => item.code).filter((code) => /^\d{6}$/.test(code)))
   const ordered = adjustments
-    .filter((item) => currentCodes.has(item.code) || Boolean(item.targetCode && currentCodes.has(item.targetCode)))
+    .filter((item) => !isInactiveJdAdjustment(item)
+      && (currentCodes.has(item.code) || Boolean(item.targetCode && currentCodes.has(item.targetCode))))
     .sort((left, right) => adjustmentSortKey(left).localeCompare(adjustmentSortKey(right)) || left.id.localeCompare(right.id))
   const requirements = new Map(items.flatMap((item) => {
     const shares = parseJdNumber(item.shares)
     return currentCodes.has(item.code) && shares !== null && shares > 0
-      ? [[item.code, { remaining: shares, complete: false, invalid: false, ids: new Set<string>() }] as const]
+      ? [[item.code, { remaining: shares, complete: false, invalid: false, startIndex: -1 }] as const]
       : []
+  }))
+  const expectedSharesByCode = new Map(items.flatMap((item) => {
+    const shares = parseJdNumber(item.shares)
+    return shares !== null && shares > 0 ? [[item.code, shares] as const] : []
   }))
   const incompleteCodes = new Set([...currentCodes].filter((code) => !requirements.has(code)))
   for (let index = ordered.length - 1; index >= 0; index--) {
     const adjustment = ordered[index]
+    // Pending orders are not reflected in JD's official current-share
+    // snapshot yet. Keep them in the selected audit range, but never use them
+    // to decide whether the confirmed current cycle reconciles.
+    if (isPendingJdAdjustment(adjustment)) continue
     for (const [code, requirement] of requirements) {
       if (requirement.complete) continue
       const delta = adjustmentSharesForCode(adjustment, code)
@@ -197,25 +258,40 @@ export function selectVerifiedJdCurrentTimeline(items: JdHoldingItem[], adjustme
         if (isRelevantToCode(adjustment, code)) requirement.invalid = true
         continue
       }
-      requirement.ids.add(adjustment.id)
       requirement.remaining -= delta
-      if (requirement.remaining <= 0.01 && !requirement.invalid) requirement.complete = true
+      const expectedShares = expectedSharesByCode.get(code) || 0
+      const tolerance = Math.max(0.02, expectedShares * 0.001)
+      if (Math.abs(requirement.remaining) <= tolerance) {
+        requirement.complete = true
+        requirement.startIndex = index
+      } else if (requirement.remaining < -tolerance) {
+        requirement.invalid = true
+      }
     }
   }
   const selected = new Set<string>()
   const verifiedCodes = new Set<string>()
+  const selectedIdsByCode = new Map<string, Set<string>>()
   for (const [code, requirement] of requirements) {
-    if (!requirement.complete || requirement.invalid) {
+    if (!requirement.complete || requirement.invalid || requirement.startIndex < 0) {
       incompleteCodes.add(code)
       continue
     }
     verifiedCodes.add(code)
-    for (const id of requirement.ids) selected.add(id)
+    const codeIds = new Set<string>()
+    for (let index = requirement.startIndex; index < ordered.length; index++) {
+      const adjustment = ordered[index]
+      if (!isRelevantToCode(adjustment, code)) continue
+      codeIds.add(adjustment.id)
+      selected.add(adjustment.id)
+    }
+    selectedIdsByCode.set(code, codeIds)
   }
   return {
     adjustments: ordered.filter((item) => selected.has(item.id)),
     verifiedCodes,
-    incompleteCodes
+    incompleteCodes,
+    selectedIdsByCode
   }
 }
 
@@ -227,18 +303,77 @@ export function selectVerifiedJdCurrentTimeline(items: JdHoldingItem[], adjustme
 export function filterJdCurrentPositionCycle(items: JdHoldingItem[], adjustments: JdAdjustmentItem[]): JdAdjustmentItem[] {
   const currentCodes = new Set(items.map((item) => item.code).filter((code) => /^\d{6}$/.test(code)))
   const ordered = adjustments
-    .filter((item) => currentCodes.has(item.code) || Boolean(item.targetCode && currentCodes.has(item.targetCode)))
+    .filter((item) => !isInactiveJdAdjustment(item)
+      && (currentCodes.has(item.code) || Boolean(item.targetCode && currentCodes.has(item.targetCode))))
     .sort((left, right) => adjustmentSortKey(left).localeCompare(adjustmentSortKey(right)) || left.id.localeCompare(right.id))
   const selection = selectVerifiedJdCurrentTimeline(items, ordered)
-  // This list is audit-only. Keep the source rows visible when JD did not
-  // return enough share fields to certify a grid reconstruction.
-  return selection.verifiedCodes.size > 0 ? selection.adjustments : ordered
+  return ordered.flatMap((item) => {
+    const cycleCodes = [...selection.selectedIdsByCode]
+      .filter(([, ids]) => ids.has(item.id))
+      .map(([code]) => code)
+      .sort()
+    return cycleCodes.length > 0 ? [{ ...item, cycleCodes }] : []
+  })
 }
 
-function hasTerminalJdStatus(status: string): boolean {
-  if (!status) return false
-  if (/(支付成功|受理|确认中|处理中|待确认|申请中|已申请)/.test(status)) return false
-  return /(确认|完成|成交|到账|赎回成功|转换成功|交易成功|申购成功)/.test(status)
+type JdAdjustmentStatusInput = Pick<JdAdjustmentItem, 'status' | 'statusCode'>
+type JdAdjustmentTimingInput = Pick<JdAdjustmentItem, 'tradeDate' | 'tradeTime' | 'status' | 'statusCode' | 'confirmTime'>
+type JdAdjustmentTagInput = JdAdjustmentTimingInput & Pick<JdAdjustmentItem, 'code' | 'type' | 'targetCode'>
+
+function normalizeJdStatusCode(value: string | undefined): string {
+  return (value || '').trim().toUpperCase().replace(/[\s-]+/g, '_')
+}
+
+/** Refunded/cancelled/failed orders stay in the audit trail but never affect positions or tags. */
+export function isInactiveJdAdjustment(adjustment: JdAdjustmentStatusInput): boolean {
+  const code = normalizeJdStatusCode(adjustment.statusCode)
+  const status = (adjustment.status || '').trim()
+  return /(?:^|_)(?:CANCEL(?:ED|LED)?|REFUND(?:_SUCC)?|FAIL(?:ED)?|CLOSED|REJECT(?:ED)?)(?:_|$)/.test(code)
+    || /(取消|已撤销|撤单|退款|失败|关闭|作废|驳回)/.test(status)
+}
+
+/** PAY_SUCC, REDEEM and PROCESS still wait for share confirmation. */
+export function hasTerminalJdStatus(adjustment: JdAdjustmentStatusInput): boolean {
+  if (isInactiveJdAdjustment(adjustment)) return false
+  const code = normalizeJdStatusCode(adjustment.statusCode)
+  const status = (adjustment.status || '').trim()
+  if (/^(?:PAY_SUCC|REDEEM|PROCESS|PROCESSING|PENDING|WAIT_CONFIRM|CONFIRMING)$/.test(code)) return false
+  if (/^(?:COMPLETE|COMPLETED|REDEEM_SUCC|CONFIRM_SUCC|TRANSFORM_SUCC|TRANSFER_SUCC|TRADE_SUCC)$/.test(code)) return true
+  if (/(支付成功|受理|确认中|处理中|待确认|申请中|已申请|转出中)/.test(status)) return false
+  return /(订单完成|转出完成|确认成功|份额确认|成交|到账|赎回成功|转换成功|交易成功|申购成功)/.test(status)
+}
+
+/** Explicit JD states that have not entered the official holding shares yet. */
+export function isPendingJdAdjustment(adjustment: JdAdjustmentStatusInput): boolean {
+  if (isInactiveJdAdjustment(adjustment) || hasTerminalJdStatus(adjustment)) return false
+  // Match the backend contract: only an explicit successful terminal state is
+  // allowed into visible batch reconstruction. Unknown/legacy states remain
+  // audit-only instead of being guessed as confirmed.
+  return true
+}
+
+/** Inbound orders have not reached JD's current-position snapshot and protect local rows from deletion. */
+export function getPendingJdInboundCodes(adjustments: JdAdjustmentItem[]): Set<string> {
+  return new Set(adjustments.flatMap((adjustment) => {
+    if (!isPendingJdAdjustment(adjustment)) return []
+    if (adjustment.type === 'add') return [adjustment.code]
+    if (adjustment.type === 'convert' && adjustment.targetCode) return [adjustment.targetCode]
+    return []
+  }))
+}
+
+/** Decide which explicit zero snapshots may safely remove an existing local holding. */
+export function getSafeJdClosedHoldingCodes(
+  closedItems: JdClosedHoldingItem[],
+  currentItems: JdHoldingItem[],
+  adjustments: JdAdjustmentItem[],
+  localCodes: Iterable<string>
+): string[] {
+  const currentCodes = new Set(currentItems.map((item) => item.code))
+  const pendingInboundCodes = getPendingJdInboundCodes(adjustments)
+  const localCodeSet = new Set(localCodes)
+  return [...new Set(closedItems.map((item) => item.code))]
+    .filter((code) => localCodeSet.has(code) && !currentCodes.has(code) && !pendingInboundCodes.has(code))
 }
 
 /** A regex alone accepts impossible dates such as 2026-02-31. */
@@ -252,47 +387,33 @@ export function isValidJdTradeDate(value: string): boolean {
   return date.getUTCFullYear() === year && date.getUTCMonth() === month - 1 && date.getUTCDate() === day
 }
 
-/** Browser transaction capture is bounded so imports never walk the full account history. */
-export const JD_TRANSACTION_HISTORY_DAYS = 30
-
-/** Only the current five Beijing calendar days are written to the holding adjustment audit. */
-export const JD_RECENT_ADJUSTMENT_DAYS = 5
-
-/** Include today and the preceding four Beijing calendar days. */
-export function isJdAdjustmentRecent(
-  adjustment: Pick<JdAdjustmentItem, 'tradeDate'>,
-  now = new Date(),
-  days = JD_RECENT_ADJUSTMENT_DAYS
-): boolean {
-  if (!isValidJdTradeDate(adjustment.tradeDate)) return false
-  const windowDays = Math.max(1, Math.floor(days))
-  const today = getBeijingDateString(now)
-  const earliest = addCalendarDays(today, -(windowDays - 1))
-  return adjustment.tradeDate >= earliest && adjustment.tradeDate <= today
+function parseJdConfirmationTime(value: string | undefined): number | null {
+  const raw = (value || '').trim()
+  if (!raw) return null
+  if (/^\d{10,13}$/.test(raw)) {
+    const numeric = Number(raw)
+    const timestamp = raw.length === 10 ? numeric * 1000 : numeric
+    return Number.isFinite(timestamp) ? timestamp : null
+  }
+  // JD may return a human-readable value such as "预计2026-08-05到账".
+  // Keep the embedded calendar date instead of falling back to the next-day
+  // legacy window, which would hide a redemption tag too early.
+  const beijing = /(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?/.exec(raw)
+  if (beijing) {
+    const [, year, month, day, hour = '15', minute = '00', second = '00'] = beijing
+    const normalized = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T${hour.padStart(2, '0')}:${minute}:${second}+08:00`
+    const parsed = Date.parse(normalized)
+    return Number.isFinite(parsed) ? parsed : null
+  }
+  const parsed = Date.parse(raw)
+  return Number.isFinite(parsed) ? parsed : null
 }
 
-export function filterRecentJdAdjustments(
-  adjustments: JdAdjustmentItem[],
-  now = new Date(),
-  days = JD_RECENT_ADJUSTMENT_DAYS
-): JdAdjustmentItem[] {
-  return adjustments.filter((adjustment) => isJdAdjustmentRecent(adjustment, now, days))
-}
-
-/**
- * Keep the 30-day browser capture available to consumers such as the grid
- * importer, while the holding page applies its stricter five-day audit limit.
- */
-export function filterRecentJdTransactions(
-  adjustments: JdAdjustmentItem[],
-  now = new Date()
-): JdAdjustmentItem[] {
-  return filterRecentJdAdjustments(adjustments, now, JD_TRANSACTION_HISTORY_DAYS)
-}
-
-/** JD normally confirms pre-close orders at about noon and post-close orders at 15:00 the next day. */
-export function getJdAdjustmentConfirmationAt(adjustment: JdAdjustmentItem): number {
+/** Prefer JD's real confirmation time; use the legacy cut-off rule for older saved records. */
+export function getJdAdjustmentConfirmationAt(adjustment: JdAdjustmentTimingInput): number {
   if (!isValidJdTradeDate(adjustment.tradeDate)) return Number.POSITIVE_INFINITY
+  const explicitConfirmation = parseJdConfirmationTime(adjustment.confirmTime)
+  if (explicitConfirmation !== null) return explicitConfirmation
   const time = adjustment.tradeTime?.slice(11, 16) || ''
   const timeSlot = time >= '15:00' ? 'after' : 'before'
   const date = addCalendarDays(adjustment.tradeDate, 1)
@@ -300,9 +421,25 @@ export function getJdAdjustmentConfirmationAt(adjustment: JdAdjustmentItem): num
 }
 
 /** A completed JD status wins; old rows without a status become eligible after their confirmation window. */
-export function hasReachedJdConfirmationWindow(adjustment: JdAdjustmentItem, now = Date.now()): boolean {
+export function hasReachedJdConfirmationWindow(adjustment: JdAdjustmentTimingInput, now = Date.now()): boolean {
   if (!isValidJdTradeDate(adjustment.tradeDate)) return false
-  return hasTerminalJdStatus((adjustment.status || '').trim()) || now >= getJdAdjustmentConfirmationAt(adjustment)
+  if (isInactiveJdAdjustment(adjustment)) return false
+  return hasTerminalJdStatus(adjustment) || now >= getJdAdjustmentConfirmationAt(adjustment)
+}
+
+/** A holding-row tag represents a real order that is still waiting for share confirmation. */
+export function shouldShowJdAdjustmentTag(adjustment: JdAdjustmentTimingInput, now = Date.now()): boolean {
+  if (!isValidJdTradeDate(adjustment.tradeDate) || isInactiveJdAdjustment(adjustment) || hasTerminalJdStatus(adjustment)) return false
+  return now < getJdAdjustmentConfirmationAt(adjustment)
+}
+
+export function getJdAdjustmentTagLabel(adjustment: JdAdjustmentTagInput, fundCode: string): string | null {
+  const belongsToSource = adjustment.code === fundCode
+  const belongsToTarget = adjustment.type === 'convert' && adjustment.targetCode === fundCode
+  if (!belongsToSource && !belongsToTarget) return null
+  if (adjustment.type === 'add') return '调仓·买入'
+  if (adjustment.type === 'reduce') return '调仓·卖出'
+  return '调仓·转换'
 }
 
 export function summarizeJdAccount(items: JdHoldingItem[]): JdAccountSummary | undefined {
@@ -328,14 +465,25 @@ export function summarizeJdAccount(items: JdHoldingItem[]): JdAccountSummary | u
 
 export function normalizeJdImportResult(value: unknown): JdImportResult {
   const items = normalizeJdHoldingItems(value)
-  const timelineAdjustments = filterRecentJdTransactions(normalizeJdAdjustments(value))
+  const closedItems = normalizeJdClosedHoldingItems(value)
+  const normalizedAdjustments = normalizeJdAdjustments(value)
+  const selection = selectVerifiedJdCurrentTimeline(items, normalizedAdjustments)
+  const currentCycle = filterJdCurrentPositionCycle(items, normalizedAdjustments)
+  // Preserve the decoded account timeline for audit and let each consumer
+  // apply its own current-cycle boundary. This does not mutate holdings.
+  const timelineAdjustments = [...new Map(normalizedAdjustments.map((item) => [item.id, item])).values()]
+    .sort((left, right) => adjustmentSortKey(left).localeCompare(adjustmentSortKey(right)) || left.id.localeCompare(right.id))
   const tradeWarning = text((value as { tradeWarning?: unknown })?.tradeWarning)
+  const tradeDiagnostic = text((value as { tradeDiagnostic?: unknown })?.tradeDiagnostic)
   return {
     items,
-    adjustments: filterJdCurrentPositionCycle(items, timelineAdjustments),
+    closedItems,
+    adjustments: currentCycle,
     timelineAdjustments,
+    verifiedTimelineCodes: [...selection.verifiedCodes].sort(),
     summary: summarizeJdAccount(items),
-    ...(tradeWarning ? { tradeWarning } : {})
+    ...(tradeWarning ? { tradeWarning } : {}),
+    ...(tradeDiagnostic ? { tradeDiagnostic } : {})
   }
 }
 
@@ -343,6 +491,32 @@ export function normalizeJdCookie(value: unknown): string | null {
   const cookie = String(value ?? '').trim().replace(/^cookie\s*:\s*/i, '')
   if (cookie.length < 3 || cookie.length > 16_384 || !cookie.includes('=') || /[\r\n]/.test(cookie)) return null
   return cookie
+}
+
+export function toJdSyncProgressState(progress: JdSyncProgress): JdSyncProgressState {
+  const ratio = progress.total && progress.total > 0
+    ? Math.min(1, Math.max(0, (progress.current || 0) / progress.total))
+    : 0
+  const percentage = progress.stage === 'reading_holdings'
+    ? 12 + Math.round(ratio * 43)
+    : progress.stage === 'reading_trades'
+      ? 55 + Math.round(ratio * 25)
+      : ({ login: 8, normalizing: 82, saving: 88, refreshing: 95, completed: 100 } as Record<string, number>)[progress.stage] || 8
+  return { message: progress.message, percentage }
+}
+
+export function jdImportErrorMessage(error: unknown): string {
+  const message = String((error as { message?: unknown })?.message || '').trim()
+  if (!message) return '京东持仓读取失败，请检查网络后重试'
+  const chineseReason = message.match(/[\u3400-\u9fff][\s\S]*/)?.[0]?.trim()
+  if (chineseReason) return chineseReason
+  if (/[A-Za-z]/.test(message)) {
+    if (/(cookie|login|sign.?in|unauthorized|forbidden|expired)/i.test(message)) {
+      return '京东 Cookie 已过期或无效，请更新后重试'
+    }
+    return '京东持仓读取失败，请检查 Cookie 和网络后重试'
+  }
+  return message
 }
 
 /** Opens the isolated native JD sign-in flow and returns only normalized fund data. */

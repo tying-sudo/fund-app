@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
 
-import { calculateIntradayProgress, parseFundPerformancePayload } from './fund-chart-service.mjs'
+import { calculateIntradayProgress, compactIntradayPoints, parseFundPerformancePayload, parseSinaPerformancePayload } from './fund-chart-service.mjs'
 
 test('rebases cached fund performance and preserves peer/index gaps as null', () => {
   const day = 24 * 60 * 60 * 1000
@@ -25,6 +25,25 @@ test('rejects unsupported ranges and malformed performance payloads', () => {
   assert.deepEqual(parseFundPerformancePayload('var Data_grandTotal = invalid;', 'y'), [])
 })
 
+test('normalizes Sina cumulative return points and preserves missing peer data', () => {
+  const points = parseSinaPerformancePayload({ result: { data: {
+    thefund: [
+      { tradedate: '20260727', growthrate: '0.0000' },
+      { tradedate: '20260728', growthrate: '1.2500' }
+    ],
+    similaravg: [],
+    index: [{ name: '沪深300', rate: [
+      { tradedate: '20260727', growthrate: '0.0000' },
+      { tradedate: '20260728', growthrate: '-0.5000' }
+    ] }]
+  } } }, 'y')
+
+  assert.deepEqual(points, [
+    { date: '2026-07-27', fundReturn: 0, avgReturn: null, indexReturn: 0 },
+    { date: '2026-07-28', fundReturn: 1.25, avgReturn: null, indexReturn: -0.5 }
+  ])
+})
+
 test('normalizes US QDII anchors to the market clock and fills bounded per-second progress', () => {
   const points = calculateIntradayProgress([
     { time: '2026-07-21 09:30:00', value: 5, change: 0, source: 'previous_nav' },
@@ -37,4 +56,13 @@ test('normalizes US QDII anchors to the market clock and fills bounded per-secon
   assert.equal(points.length, 4)
   assert.equal(points[1].source, 'estimated_progress')
   assert.ok(points[1].value > 5.45 && points[1].value < 5.46)
+})
+
+test('compacts an intraday response while preserving its first and last points', () => {
+  const points = Array.from({ length: 1_000 }, (_, index) => ({ time: String(index), value: index }))
+  const compacted = compactIntradayPoints(points, 480)
+
+  assert.equal(compacted.length, 480)
+  assert.equal(compacted[0], points[0])
+  assert.equal(compacted.at(-1), points.at(-1))
 })

@@ -4,6 +4,7 @@ app.py - API入口：/state + /valuation + /fund/name + /position + /strategy
 import os
 import re
 import math
+import hashlib
 import threading
 import time
 from contextlib import asynccontextmanager
@@ -35,7 +36,7 @@ from positions import (
     add_watch_fund,
     confirm_buy_nav,
     auto_fill_nav,
-    import_jd_grid_transactions,
+    import_jd_grid_transactions, sync_jd_grid_account,
     PositionDataError,
 )
 from skills.export_image import export_all_sector_images
@@ -48,6 +49,20 @@ from grid import (
     set_market_regime, get_market_regime_info,
     get_fitness_scores, get_fund_fitness
 )
+from realtime_store import MemoryReadDatabase
+
+
+realtime_read_model = MemoryReadDatabase()
+
+
+def _valuation_codes(codes: List[str]) -> list[str]:
+    return [str(code).strip() for code in codes if str(code).strip()]
+
+
+def _valuation_cache_key(prefix: str, codes: List[str]) -> str:
+    canonical = ",".join(sorted(set(codes)))
+    digest = hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+    return f"{prefix}:{digest}"
 
 # ============================================================
 # 启动时刷新持仓缓存（后台线程，不阻塞服务就绪）
@@ -100,6 +115,16 @@ async def position_data_error_handler(_request, exc: PositionDataError):
     )
 
 # CORS
+@app.middleware("http")
+async def invalidate_realtime_read_model_after_write(request, call_next):
+    """Keep the millisecond read model accurate after every grid write."""
+    response = await call_next(request)
+    is_realtime_read = request.url.path == "/v1/valuation/batch"
+    if request.method in {"POST", "PUT", "PATCH", "DELETE"} and not is_realtime_read and response.status_code < 400:
+        realtime_read_model.invalidate()
+    return response
+
+
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -224,21 +249,37 @@ def delete_etf_link(link_code: str):
 @app.get("/v1/valuation/{fund_code}")
 def get_valuation(fund_code: str):
     """单基金估值"""
-    return calculate_valuation(fund_code)
+    code = fund_code.strip()
+    return realtime_read_model.get_or_compute(
+        f"valuation:single:{code}", 750, lambda: calculate_valuation(code)
+    )
 
 @app.post("/v1/valuation/batch")
 def post_valuation_batch(req: BatchRequest):
     """批量估值"""
-    if not req.fund_codes:
+    requested_codes = _valuation_codes(req.fund_codes)
+    if not requested_codes:
         return {"items": []}
-    if len(req.fund_codes) > 2000:
+    if len(requested_codes) > 2000:
         raise HTTPException(status_code=400, detail="单次最多2000只基金")
-    return {"items": calculate_valuation_batch(req.fund_codes)}
+    canonical_codes = sorted(set(requested_codes))
+    snapshot = realtime_read_model.get_or_compute(
+        _valuation_cache_key("valuation:batch", canonical_codes),
+        900,
+        lambda: {
+            item["fund_code"]: item
+            for item in calculate_valuation_batch(canonical_codes)
+            if isinstance(item, dict) and item.get("fund_code")
+        },
+    )
+    return {"items": [snapshot[code] for code in requested_codes if code in snapshot]}
 
 @app.get("/v1/valuation/state")
 def get_valuation_state():
     """按当前state返回所有基金估值（板块分组）"""
-    return calculate_valuation_by_state()
+    return realtime_read_model.get_or_compute(
+        "valuation:state", 900, calculate_valuation_by_state
+    )
 
 # ============================================================
 # 持仓缓存刷新 API
@@ -276,7 +317,7 @@ def export_images(mode: str = "valuation"):
 @app.get("/health")
 @app.get("/v1/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "realtime_read_model": realtime_read_model.stats()}
 
 
 # ============================================================
@@ -454,6 +495,10 @@ class JdGridAdjustment(BaseModel):
     targetCode: Optional[str] = None
     targetName: Optional[str] = None
     targetShares: Optional[str] = None
+    status: Optional[str] = None
+    statusCode: Optional[str] = None
+    confirmTime: Optional[str] = None
+    cycleCodes: List[str] = []
 
 
 class JdGridHolding(BaseModel):
@@ -470,6 +515,7 @@ class JdGridHolding(BaseModel):
 
 class JdGridImportRequest(BaseModel):
     current_holding_codes: List[str]
+    replace_transaction_codes: List[str] = []
     current_holdings: List[JdGridHolding] = []
     adjustments: List[JdGridAdjustment]
 
@@ -523,13 +569,18 @@ def _jd_import_leg(ledger_id: str, code: str, action: str, trade_date: str,
                    nav_cache: dict, note: str, name: str = "") -> Optional[dict]:
     shares = _jd_positive_number(shares_value)
     amount = _jd_positive_number(amount_value)
-    nav = _jd_nav_on_date(code, trade_date, trade_time, nav_cache)
+    # Fund-detail rows normally carry both confirmed shares and amount.  Their
+    # ratio is the exact order NAV and avoids one historical-NAV request per
+    # transaction.  Fall back to published NAV only for account-list rows that
+    # omit one side of the confirmation.
+    nav = amount / shares if amount and shares else _jd_nav_on_date(code, trade_date, trade_time, nav_cache)
     if action == "buy":
         if not amount and shares and nav:
             amount = shares * nav
-        if not amount or not nav:
+        if not shares and amount and nav:
+            shares = amount / nav
+        if not amount or not nav or not shares:
             return None
-        shares = amount / nav
     elif not shares:
         if amount and nav:
             shares = amount / nav
@@ -546,6 +597,50 @@ def _jd_import_leg(ledger_id: str, code: str, action: str, trade_date: str,
         "nav": round(nav, 6) if nav else None,
         "note": note,
         "name": name.strip(),
+    }
+
+
+def _jd_snapshot_leg(holding: JdGridHolding) -> Optional[dict]:
+    """Create one auditable baseline from JD's official current-position snapshot."""
+    code = holding.code.strip()
+    shares = _jd_positive_number(holding.shares)
+    if not code.isdigit() or len(code) != 6 or not shares:
+        return None
+
+    cost_amount = _jd_positive_number(holding.costAmount)
+    cost_nav = _jd_positive_number(holding.costPrice)
+    market_amount = _jd_positive_number(holding.amount)
+    if cost_amount:
+        amount = cost_amount
+        nav = cost_nav or cost_amount / shares
+    elif cost_nav:
+        nav = cost_nav
+        amount = shares * cost_nav
+    elif market_amount:
+        amount = market_amount
+        nav = market_amount / shares
+    else:
+        return None
+    if amount <= 0 or nav <= 0:
+        return None
+
+    acquired_date = (holding.acquiredDate or "").strip()
+    try:
+        datetime.strptime(acquired_date, "%Y-%m-%d")
+        baseline_date = acquired_date
+    except ValueError:
+        baseline_date = beijing_now().strftime("%Y-%m-%d")
+    return {
+        "ledger_id": f"jd:snapshot:{code}",
+        "code": code,
+        "action": "seed",
+        "trade_date": baseline_date,
+        "trade_time": "",
+        "shares": round(shares, 4),
+        "amount": round(amount, 4),
+        "nav": round(nav, 6),
+        "note": "京东导入·当前持仓基线",
+        "name": holding.name.strip(),
     }
 
 
@@ -568,8 +663,151 @@ def _jd_timeline_matches_current_holding(legs: list, expected_shares: Optional[f
     return has_buy and balance > 0 and abs(balance - expected_shares) <= tolerance
 
 
+def _jd_trade_state(adjustment: JdGridAdjustment) -> str:
+    code = (adjustment.statusCode or "").strip().upper().replace("-", "_")
+    status = (adjustment.status or "").strip()
+    if re.search(r"(?:^|_)(?:CANCEL(?:ED|LED)?|REFUND(?:_SUCC)?|FAIL(?:ED)?|CLOSED|REJECT(?:ED)?)(?:_|$)", code):
+        return "inactive"
+    if code in {"COMPLETE", "COMPLETED", "REDEEM_SUCC", "CONFIRM_SUCC", "TRANSFORM_SUCC", "TRANSFER_SUCC", "TRADE_SUCC"}:
+        return "confirmed"
+    if re.search(r"取消|撤销|撤单|退款|失败|关闭|作废|驳回", status):
+        return "inactive"
+    if re.search(r"订单完成|转出完成|确认成功|份额确认|成交|到账|赎回成功|转换成功|交易成功|申购成功", status):
+        return "confirmed"
+    return "pending"
+
+
+def _jd_trade_record(adjustment: JdGridAdjustment, code: str, leg_type: str,
+                     shares_value, amount_value, fund_name: str = "",
+                     counterparty_code: str = "", counterparty_name: str = "") -> dict:
+    shares = _jd_positive_number(shares_value)
+    amount = _jd_positive_number(amount_value)
+    digest = hashlib.sha256(f"{adjustment.id}:{leg_type}".encode("utf-8")).hexdigest()[:20]
+    return {
+        "id": f"jdtx:{digest}",
+        "code": code,
+        "fund_name": fund_name.strip(),
+        "type": leg_type,
+        "trade_date": adjustment.tradeDate.strip(),
+        "trade_time": (adjustment.tradeTime or "").strip(),
+        "amount": round(amount, 2) if amount else None,
+        "shares": round(shares, 4) if shares else None,
+        "nav": round(amount / shares, 6) if amount and shares else None,
+        "state": _jd_trade_state(adjustment),
+        "order_status": (adjustment.status or "").strip(),
+        "status_code": (adjustment.statusCode or "").strip().upper(),
+        "confirm_time": (adjustment.confirmTime or "").strip(),
+        "counterparty_code": counterparty_code.strip(),
+        "counterparty_name": counterparty_name.strip(),
+        "source": "jd",
+    }
+
+
 @app.post("/v1/positions/jd-import")
 def import_jd_positions(req: JdGridImportRequest):
+    """Sync official JD holdings, detailed grid batches, and audit rows."""
+    current_codes = {
+        code.strip() for code in req.current_holding_codes
+        if isinstance(code, str) and code.strip().isdigit() and len(code.strip()) == 6
+    }
+    if not current_codes:
+        raise HTTPException(status_code=400, detail="当前京东持仓和当日转入基金不能为空")
+
+    holding_names = {
+        holding.code.strip(): holding.name.strip()
+        for holding in req.current_holdings if holding.code
+    }
+    snapshots = []
+    rejected = []
+    for holding in req.current_holdings:
+        code = holding.code.strip()
+        if code not in current_codes:
+            continue
+        snapshot = _jd_snapshot_leg(holding)
+        if snapshot:
+            snapshots.append(snapshot)
+        else:
+            rejected.append({"id": f"jd:snapshot:{code}", "code": code, "status": "skipped", "reason": "missing_snapshot_value"})
+
+    transactions = []
+    for adjustment in req.adjustments:
+        code = adjustment.code.strip()
+        target_code = (adjustment.targetCode or "").strip()
+        trade_date = adjustment.tradeDate.strip()
+        if not code.isdigit() or len(code) != 6 or adjustment.type not in {"add", "reduce", "convert"}:
+            rejected.append({"id": adjustment.id, "status": "skipped", "reason": "invalid_adjustment"})
+            continue
+        try:
+            datetime.strptime(trade_date, "%Y-%m-%d")
+        except ValueError:
+            rejected.append({"id": adjustment.id, "status": "skipped", "reason": "invalid_trade_date"})
+            continue
+        if _jd_trade_state(adjustment) == "inactive":
+            rejected.append({"id": adjustment.id, "code": code, "status": "skipped", "reason": "inactive_transaction"})
+            continue
+
+        cycle_codes = {
+            item.strip() for item in adjustment.cycleCodes
+            if isinstance(item, str) and item.strip().isdigit() and len(item.strip()) == 6
+        }
+        legacy_cycle = not adjustment.cycleCodes
+        includes_source = legacy_cycle or code in cycle_codes
+        includes_target = legacy_cycle or target_code in cycle_codes
+
+        if adjustment.type == "add" and code in current_codes and includes_source:
+            transactions.append(_jd_trade_record(
+                adjustment, code, "buy", adjustment.shares, adjustment.amount,
+                adjustment.name or holding_names.get(code, "")
+            ))
+        elif adjustment.type == "reduce" and code in current_codes and includes_source:
+            transactions.append(_jd_trade_record(
+                adjustment, code, "sell", adjustment.shares, adjustment.amount,
+                adjustment.name or holding_names.get(code, "")
+            ))
+        elif adjustment.type == "convert":
+            if code in current_codes and includes_source:
+                transactions.append(_jd_trade_record(
+                    adjustment, code, "convert_out", adjustment.shares, adjustment.amount,
+                    adjustment.name or holding_names.get(code, ""), target_code,
+                    adjustment.targetName or holding_names.get(target_code, "")
+                ))
+            if target_code in current_codes and includes_target:
+                transactions.append(_jd_trade_record(
+                    adjustment, target_code, "convert_in", adjustment.targetShares, adjustment.amount,
+                    adjustment.targetName or holding_names.get(target_code, ""), code,
+                    adjustment.name or holding_names.get(code, "")
+                ))
+        else:
+            rejected.append({"id": adjustment.id, "code": code, "status": "skipped", "reason": "not_current_holding"})
+
+    requested_replace_transaction_codes = {
+        code.strip() for code in req.replace_transaction_codes
+        if isinstance(code, str) and code.strip() in current_codes
+    }
+    # Materialize the verified current holding cycle first.  The account sync
+    # below then records the official snapshot and audit rows without replacing
+    # the detailed JD-owned batches with one aggregate snapshot.
+    batch_result = _legacy_import_jd_positions(req)
+    server_verified_codes = set(batch_result.pop("_verified_codes", []))
+    replace_transaction_codes = requested_replace_transaction_codes & server_verified_codes
+    audit_result = sync_jd_grid_account(
+        sorted(current_codes), snapshots, transactions, sorted(replace_transaction_codes)
+    )
+    return {
+        "success": True,
+        "imported": batch_result.get("imported", 0),
+        "updated": batch_result.get("updated", 0),
+        "skipped": batch_result.get("skipped", 0),
+        "partial": batch_result.get("partial", 0),
+        "audit_imported": audit_result.get("imported", 0),
+        "audit_updated": audit_result.get("updated", 0),
+        "audit_skipped": audit_result.get("skipped", 0) + len(rejected),
+        "results": batch_result.get("results", []),
+        "audit_results": rejected + audit_result.get("results", []),
+    }
+
+
+def _legacy_import_jd_positions(req: JdGridImportRequest):
     """Import the JD audit stream as idempotent grid batches for current holdings only."""
     current_codes = {code.strip() for code in req.current_holding_codes if isinstance(code, str) and code.strip().isdigit() and len(code.strip()) == 6}
     if not current_codes:
@@ -590,6 +828,11 @@ def import_jd_positions(req: JdGridImportRequest):
             datetime.strptime(trade_date, "%Y-%m-%d")
         except ValueError:
             rejected.append({"id": adjustment.id, "status": "skipped", "reason": "invalid_trade_date"})
+            continue
+        # Pending orders remain visible in jd_transactions, but the official
+        # holding snapshot may not include them yet.  Replaying them here would
+        # create fake shares or prematurely sell an existing batch.
+        if _jd_trade_state(adjustment) != "confirmed":
             continue
 
         if adjustment.type == "add":
@@ -653,6 +896,7 @@ def import_jd_positions(req: JdGridImportRequest):
         if holding.code and holding.code.strip() in current_codes
     }
     verified_legs = []
+    verified_codes = set()
     for code in sorted(current_codes):
         fund_legs = [leg for leg in legs if leg["code"] == code]
         # A snapshot-only fund has no actual timeline to validate. Preserve the
@@ -667,24 +911,37 @@ def import_jd_positions(req: JdGridImportRequest):
         for leg in fund_legs:
             leg["timeline_verified"] = True
             verified_legs.append(leg)
+        verified_codes.add(code)
     legs = verified_legs
     holding_names = {holding.code.strip(): holding.name.strip() for holding in req.current_holdings}
     for leg in legs:
         if not leg.get("name"):
             leg["name"] = holding_names.get(leg["code"], "")
 
-    # The grid is an auditable reconstruction of the current holding cycle.
-    # Never synthesize a batch from a cost snapshot when JD did not return the
-    # actual opening transaction and its date.
+    # A 30-day trade window cannot reconstruct long-held positions. Seed only
+    # still-current JD holdings that were not covered by a verified timeline;
+    # the stable ledger id makes the baseline one-time and replaceable if a
+    # complete real timeline becomes available later.
     covered_codes = {leg["code"] for leg in legs if leg["action"] == "buy"}
+    holdings_by_code = {
+        holding.code.strip(): holding
+        for holding in req.current_holdings
+        if holding.code and holding.code.strip() in current_codes
+    }
     for code in sorted(current_codes - covered_codes):
-        if code in candidate_codes:
-            continue
-        rejected.append({"id": f"jd:cycle:{code}", "code": code, "status": "skipped", "reason": "missing_current_cycle_transaction"})
+        seed = _jd_snapshot_leg(holdings_by_code.get(code)) if code in holdings_by_code else None
+        if seed:
+            legs.append(seed)
+        else:
+            rejected.append({"id": f"jd:snapshot:{code}", "code": code, "status": "skipped", "reason": "missing_snapshot_value"})
 
     result = import_jd_grid_transactions(legs)
     result["results"] = rejected + result["results"]
     result["skipped"] += len(rejected)
+    # Never trust the client replacement list by itself. Only codes whose
+    # reconstructed legs reconcile to the official snapshot may prune audit
+    # rows already stored on the server.
+    result["_verified_codes"] = sorted(verified_codes)
     return result
 
 
@@ -745,13 +1002,18 @@ def delete_sell_record_api(fund_code: str, sell_record_id: str):
 @app.get("/v1/strategy/signals")
 def get_all_strategy_signals():
     """获取全部基金策略信号"""
-    return generate_all_signals()
+    return realtime_read_model.get_or_compute(
+        "strategy:signals", 1_000, generate_all_signals
+    )
 
 
 @app.get("/v1/strategy/signal/{fund_code}")
 def get_strategy_signal(fund_code: str):
     """获取单基金策略信号"""
-    return generate_signal(fund_code)
+    code = fund_code.strip()
+    return realtime_read_model.get_or_compute(
+        f"strategy:signal:{code}", 1_000, lambda: generate_signal(code)
+    )
 
 
 @app.get("/v1/strategy/history")

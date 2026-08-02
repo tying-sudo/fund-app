@@ -97,17 +97,27 @@ export interface GridMutationResult {
 
 export interface GridJdImportResult {
   success: boolean
+  /** Visible buy/sell batches rebuilt from the verified current cycle. */
   imported: number
+  updated?: number
   skipped: number
   partial: number
-  results: Array<{
-    ledger_id?: string
-    id?: string
-    code?: string
-    action?: 'buy' | 'sell' | 'seed'
-    status: 'imported' | 'partial' | 'skipped'
-    reason?: string
-  }>
+  results: GridJdImportResultItem[]
+  /** Audit-table counters are separate from visible position batches. */
+  audit_imported?: number
+  audit_updated?: number
+  audit_skipped?: number
+  audit_results?: GridJdImportResultItem[]
+}
+
+export interface GridJdImportResultItem {
+  ledger_id?: string
+  id?: string
+  code?: string
+  action?: 'buy' | 'sell' | 'seed' | 'convert_in' | 'convert_out' | 'replace_audit' | string
+  status: 'imported' | 'updated' | 'partial' | 'skipped'
+  reason?: string
+  removed?: number
 }
 
 export interface GridStrategyParams {
@@ -150,6 +160,8 @@ export interface GridPosition {
   fee_schedule?: GridFeeScheduleItem[]
   batches?: GridBatch[]
   sell_records?: GridSellRecord[]
+  jd_transactions?: GridJdTransaction[]
+  jd_pending_position?: boolean
   supplement_count?: number
 }
 
@@ -313,25 +325,54 @@ export function fetchGridPositions() {
   return request<{ funds?: Record<string, GridPosition> }>('/v1/positions')
 }
 
+export interface GridJdTransaction {
+  id: string
+  code: string
+  fund_name?: string
+  type: 'buy' | 'sell' | 'convert_in' | 'convert_out'
+  trade_date: string
+  trade_time?: string
+  amount?: number | null
+  shares?: number | null
+  nav?: number | null
+  state?: 'pending' | 'confirmed' | string
+  order_status?: string
+  status_code?: string
+  confirm_time?: string
+  counterparty_code?: string
+  counterparty_name?: string
+}
+
 export function importGridJdTransactions(input: {
   current_holding_codes: string[]
+  replace_transaction_codes: string[]
   current_holdings: Array<{
     code: string
     name: string
     amount?: string
     shares?: string
     costPrice?: string
+    costAmount?: string
+    profit?: string
+    profitDate?: string
+    acquiredDate?: string
   }>
   adjustments: Array<{
     id: string
     code: string
+    name?: string
     type: 'add' | 'reduce' | 'convert'
     tradeDate: string
     tradeTime?: string
     shares?: string
     amount?: string
     targetCode?: string
+    targetName?: string
     targetShares?: string
+    status?: string
+    statusCode?: string
+    confirmTime?: string
+    cycleCodes?: string[]
   }>
 }) {
   return request<GridJdImportResult>('/v1/positions/jd-import', {
