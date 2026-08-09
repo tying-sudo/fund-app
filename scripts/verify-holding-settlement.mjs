@@ -1,10 +1,14 @@
 import assert from 'node:assert/strict'
 import {
   calculateSubscriptionShares,
+  findAdjustmentSettlementNav,
   findSettlementNav,
+  getAdjustmentConfirmationAt,
+  getAdjustmentConfirmationDate,
   getBeijingDateString,
   getCalendarDayDifference,
-  getSettlementNavStartDate
+  getSettlementNavStartDate,
+  shouldAttemptAdjustmentSettlement
 } from '../src/utils/tradingDate.ts'
 import { calculateHoldingProfit, calculateOfficialHoldingProfit, getValuationComparisonState, hasUsableCurrentEstimate, hasUsableEstimateChange, isDelayedSettlementQdiiFund, isFundPreOpen, isFundTradingHours, isJdYesterdaySummaryCurrent, isLunchBreak, isRetainedMarketEstimate, selectLatestRealChange, shouldRetainCompletedEstimate, shouldRetainCurrentDayEstimate, shouldRetainCurrentIntradayEstimate, shouldUseDelayedQdiiPublishedChange, shouldUseGridEstimateFallback } from '../src/utils/holdingCalculator.ts'
 import { deriveHoldingImportBasis } from '../src/utils/holdingImport.ts'
@@ -16,13 +20,49 @@ const history = [
   { date: '2026-07-17', netValue: 1.01, totalValue: 0, changeRate: 0.1 }
 ]
 
-assert.equal(getSettlementNavStartDate('2026-07-17', 'before'), '2026-07-18')
-assert.equal(getSettlementNavStartDate('2026-07-17', 'after'), '2026-07-19')
-assert.equal(findSettlementNav(history, getSettlementNavStartDate('2026-07-17', 'before'), '2026-07-17'), null)
-assert.equal(findSettlementNav(history, getSettlementNavStartDate('2026-07-17', 'before'), '2026-07-20')?.date, '2026-07-20')
+assert.equal(getSettlementNavStartDate('2026-07-17', 'before'), '2026-07-17')
+assert.equal(getSettlementNavStartDate('2026-07-17', 'after'), '2026-07-18')
+assert.equal(getAdjustmentConfirmationDate('2026-07-17', 'before'), '2026-07-20')
+assert.equal(getAdjustmentConfirmationDate('2026-07-17', 'after'), '2026-07-21')
+assert.equal(getAdjustmentConfirmationAt('2026-07-17', 'before'), Date.parse('2026-07-20T13:00:00+08:00'))
+assert.equal(getAdjustmentConfirmationAt('2026-07-17', 'after'), Date.parse('2026-07-21T13:00:00+08:00'))
+assert.equal(shouldAttemptAdjustmentSettlement('2026-02-13', '2026-02-24'), true)
+assert.equal(shouldAttemptAdjustmentSettlement(null, '2026-02-24'), true)
+assert.equal(shouldAttemptAdjustmentSettlement(null, null), false)
+assert.equal(findSettlementNav(history, getSettlementNavStartDate('2026-07-17', 'before'), '2026-07-17')?.date, '2026-07-17')
+assert.equal(findSettlementNav(history, getSettlementNavStartDate('2026-07-17', 'before'), '2026-07-20')?.date, '2026-07-17')
 assert.equal(findSettlementNav(history, '2026-07-18', '2026-07-17'), null)
 assert.equal(findSettlementNav(history, '2026-07-18', '2026-07-20')?.date, '2026-07-20')
 assert.equal(findSettlementNav(history, '2026-07-17', '2026-07-21')?.date, '2026-07-17')
+assert.equal(findAdjustmentSettlementNav(history, '2026-07-17', 'before', '2026-07-17'), null)
+assert.equal(findAdjustmentSettlementNav(history, '2026-07-17', 'before', '2026-07-20')?.date, '2026-07-17')
+assert.equal(findAdjustmentSettlementNav(history, '2026-07-17', 'after', '2026-07-20'), null)
+assert.equal(findAdjustmentSettlementNav(history, '2026-07-17', 'after', '2026-07-21')?.date, '2026-07-20')
+assert.equal(findAdjustmentSettlementNav(history, '2026-07-18', 'before', '2026-07-20'), null)
+assert.equal(findAdjustmentSettlementNav(history, '2026-07-18', 'before', '2026-07-21')?.date, '2026-07-20')
+const tuesdayPricingOnly = [
+  { date: '2026-07-28', netValue: 1.03, totalValue: 0, changeRate: 0.2 }
+]
+assert.equal(findAdjustmentSettlementNav(tuesdayPricingOnly, '2026-07-28', 'before', '2026-07-28', {
+  sessionDate: '2026-07-29',
+  now: new Date('2026-07-29T12:59:59+08:00')
+}), null)
+assert.equal(findAdjustmentSettlementNav(tuesdayPricingOnly, '2026-07-28', 'before', '2026-07-28', {
+  sessionDate: '2026-07-29',
+  now: new Date('2026-07-29T13:00:00+08:00')
+})?.date, '2026-07-28')
+const afterClosePricingOnly = [
+  { date: '2026-07-29', netValue: 1.04, totalValue: 0, changeRate: 0.2 },
+  ...tuesdayPricingOnly
+]
+assert.equal(findAdjustmentSettlementNav(afterClosePricingOnly, '2026-07-28', 'after', '2026-07-29', {
+  sessionDate: '2026-07-30',
+  now: new Date('2026-07-30T13:00:00+08:00')
+})?.date, '2026-07-29')
+assert.equal(findAdjustmentSettlementNav(tuesdayPricingOnly, '2026-07-28', 'before', '2026-07-28', {
+  sessionDate: null,
+  now: new Date('2026-07-29T13:00:00+08:00')
+}), null)
 assert.equal(calculateSubscriptionShares(10_000, 15, 1.2), 8_320.833333333334)
 assert.equal(calculateSubscriptionShares(10_000, 10_000, 1.2), 0)
 assert.equal(getCalendarDayDifference('2026-07-10', '2026-07-20'), 10)

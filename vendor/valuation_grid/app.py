@@ -514,10 +514,22 @@ class JdGridHolding(BaseModel):
 
 
 class JdGridImportRequest(BaseModel):
+    # None keeps legacy clients distinguishable from an explicit empty account
+    # snapshot, which is needed to remove stale JD-managed positions safely.
+    full_current_holding_codes: Optional[List[str]] = None
     current_holding_codes: List[str]
     replace_transaction_codes: List[str] = []
+    resolve_current_cycles_on_server: bool = False
     current_holdings: List[JdGridHolding] = []
     adjustments: List[JdGridAdjustment]
+
+
+_JD_SHARE_MATCH_TOLERANCE = 0.005
+
+
+def _jd_trade_date_is_importable(trade_date: str) -> bool:
+    """Keep historical JD orders; only a future-dated row is impossible to import."""
+    return trade_date <= beijing_now().date().isoformat()
 
 
 def _jd_positive_number(value) -> Optional[float]:
@@ -539,18 +551,21 @@ def _jd_nav_on_date(code: str, trade_date: str, trade_time: Optional[str], cache
     if cache_key in cache:
         return cache[cache_key]
     try:
-        from valuation.providers import get_fund_nav_history
-        trade_day = datetime.strptime(trade_date, "%Y-%m-%d").date()
-        calendar_days = max(0, (date.today() - trade_day).days)
-        # Estimate trading days, add a margin for holidays, and cap the request
-        # at a decade of published history used by the JD transaction reader.
-        history_days = min(3000, max(90, calendar_days * 5 // 7 + 90))
-        history = get_fund_nav_history(code, history_days)
-        nav_by_date = {
-            item.get("date"): _jd_positive_number(item.get("nav"))
-            for item in history
-            if isinstance(item, dict) and item.get("date") and _jd_positive_number(item.get("nav"))
-        }
+        history_key = ("history", code)
+        nav_by_date = cache.get(history_key)
+        if nav_by_date is None:
+            from valuation.providers import get_fund_nav_history
+            trade_day = datetime.strptime(trade_date, "%Y-%m-%d").date()
+            calendar_days = max(0, (date.today() - trade_day).days)
+            # One history response covers every amount-only row for this fund.
+            history_days = min(3000, max(90, calendar_days * 5 // 7 + 90))
+            history = get_fund_nav_history(code, history_days)
+            nav_by_date = {
+                item.get("date"): _jd_positive_number(item.get("nav"))
+                for item in history
+                if isinstance(item, dict) and item.get("date") and _jd_positive_number(item.get("nav"))
+            }
+            cache[history_key] = nav_by_date
         order_time = str(trade_time or "").rsplit(" ", 1)[-1]
         before_cutoff = not re.match(r"^(?:1[5-9]|2[0-3]):", order_time)
         available_dates = sorted(nav_by_date)
@@ -602,6 +617,14 @@ def _jd_import_leg(ledger_id: str, code: str, action: str, trade_date: str,
 
 def _jd_snapshot_leg(holding: JdGridHolding) -> Optional[dict]:
     """Create one auditable baseline from JD's official current-position snapshot."""
+    snapshot = _jd_snapshot_data(holding)
+    if not snapshot or not snapshot.get("trade_date"):
+        return None
+    return {**snapshot, "action": "seed", "trade_time": ""}
+
+
+def _jd_snapshot_data(holding: JdGridHolding) -> Optional[dict]:
+    """Return official JD snapshot values even when its holding-start date is unknown."""
     code = holding.code.strip()
     shares = _jd_positive_number(holding.shares)
     if not code.isdigit() or len(code) != 6 or not shares:
@@ -624,24 +647,33 @@ def _jd_snapshot_leg(holding: JdGridHolding) -> Optional[dict]:
     if amount <= 0 or nav <= 0:
         return None
 
-    acquired_date = (holding.acquiredDate or "").strip()
-    try:
-        datetime.strptime(acquired_date, "%Y-%m-%d")
-        baseline_date = acquired_date
-    except ValueError:
-        baseline_date = beijing_now().strftime("%Y-%m-%d")
     return {
         "ledger_id": f"jd:snapshot:{code}",
         "code": code,
-        "action": "seed",
-        "trade_date": baseline_date,
-        "trade_time": "",
+        "trade_date": _jd_holding_start_date(holding.acquiredDate) or "",
         "shares": round(shares, 4),
         "amount": round(amount, 4),
         "nav": round(nav, 6),
         "note": "京东导入·当前持仓基线",
         "name": holding.name.strip(),
     }
+
+
+def _jd_holding_start_date(value: Optional[str]) -> Optional[str]:
+    """Normalize JD's holding-start date without fabricating a fallback date."""
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    direct = re.search(r"(\d{4})\D(\d{1,2})\D(\d{1,2})", raw)
+    if direct:
+        try:
+            return date(int(direct.group(1)), int(direct.group(2)), int(direct.group(3))).isoformat()
+        except ValueError:
+            return None
+    try:
+        return datetime.fromisoformat(raw.replace("Z", "+00:00")).date().isoformat()
+    except ValueError:
+        return None
 
 
 def _jd_timeline_matches_current_holding(legs: list, expected_shares: Optional[float]) -> bool:
@@ -659,8 +691,49 @@ def _jd_timeline_matches_current_holding(legs: list, expected_shares: Optional[f
             has_buy = True
         elif leg.get("action") == "sell":
             balance -= shares
-    tolerance = max(0.02, expected_shares * 0.001)
-    return has_buy and balance > 0 and abs(balance - expected_shares) <= tolerance
+    # JD displays shares to 0.01. Differences that would change the displayed
+    # value must never certify a destructive current-cycle replacement.
+    return has_buy and balance > 0 and abs(balance - expected_shares) < _JD_SHARE_MATCH_TOLERANCE
+
+
+def _jd_leg_sort_key(leg: dict) -> tuple:
+    return (
+        str(leg.get("trade_date", "")),
+        str(leg.get("trade_time", "")),
+        str(leg.get("ledger_id", "")),
+    )
+
+
+def _jd_select_current_holding_cycle(legs: list, expected_shares: Optional[float]) -> list:
+    """Return only the post-clear cycle that reconciles to JD's current shares.
+
+    Amount-only JD transaction rows have already been converted to shares by
+    ``_jd_import_leg``. Walking backwards lets an older fully closed cycle be
+    ignored without guessing from the current cost snapshot.
+    """
+    if not expected_shares or expected_shares <= 0:
+        return []
+    ordered = sorted(legs, key=_jd_leg_sort_key)
+    remaining = float(expected_shares)
+    # See _jd_timeline_matches_current_holding. This must stay strict or the
+    # backwards scan can stop before the opening order of the live cycle.
+    tolerance = _JD_SHARE_MATCH_TOLERANCE
+    for index in range(len(ordered) - 1, -1, -1):
+        leg = ordered[index]
+        shares = _jd_positive_number(leg.get("shares"))
+        if not shares:
+            return []
+        if leg.get("action") == "buy":
+            remaining -= shares
+        elif leg.get("action") == "sell":
+            remaining += shares
+        else:
+            return []
+        if abs(remaining) < tolerance:
+            return ordered[index:]
+        if remaining < -tolerance:
+            return []
+    return []
 
 
 def _jd_trade_state(adjustment: JdGridAdjustment) -> str:
@@ -710,8 +783,16 @@ def import_jd_positions(req: JdGridImportRequest):
         code.strip() for code in req.current_holding_codes
         if isinstance(code, str) and code.strip().isdigit() and len(code.strip()) == 6
     }
-    if not current_codes:
+    if not current_codes and req.full_current_holding_codes is None:
         raise HTTPException(status_code=400, detail="当前京东持仓和当日转入基金不能为空")
+    full_current_codes = {
+        code.strip() for code in (req.full_current_holding_codes or [])
+        if isinstance(code, str) and code.strip().isdigit() and len(code.strip()) == 6
+    }
+    # Backward-compatible full imports use current_holding_codes for both
+    # scopes. New clients preserve this full set when narrowing a popup choice.
+    if req.full_current_holding_codes is None or (not full_current_codes and current_codes):
+        full_current_codes = set(current_codes)
 
     holding_names = {
         holding.code.strip(): holding.name.strip()
@@ -723,9 +804,11 @@ def import_jd_positions(req: JdGridImportRequest):
         code = holding.code.strip()
         if code not in current_codes:
             continue
-        snapshot = _jd_snapshot_leg(holding)
+        snapshot = _jd_snapshot_data(holding)
         if snapshot:
             snapshots.append(snapshot)
+            if not snapshot.get("trade_date"):
+                rejected.append({"id": f"jd:snapshot:{code}", "code": code, "status": "skipped", "reason": "missing_acquired_date"})
         else:
             rejected.append({"id": f"jd:snapshot:{code}", "code": code, "status": "skipped", "reason": "missing_snapshot_value"})
 
@@ -741,6 +824,9 @@ def import_jd_positions(req: JdGridImportRequest):
             datetime.strptime(trade_date, "%Y-%m-%d")
         except ValueError:
             rejected.append({"id": adjustment.id, "status": "skipped", "reason": "invalid_trade_date"})
+            continue
+        if not _jd_trade_date_is_importable(trade_date):
+            rejected.append({"id": adjustment.id, "code": code, "status": "skipped", "reason": "future_trade_date"})
             continue
         if _jd_trade_state(adjustment) == "inactive":
             rejected.append({"id": adjustment.id, "code": code, "status": "skipped", "reason": "inactive_transaction"})
@@ -784,14 +870,39 @@ def import_jd_positions(req: JdGridImportRequest):
         code.strip() for code in req.replace_transaction_codes
         if isinstance(code, str) and code.strip() in current_codes
     }
+    # An explicit empty account snapshot is a valid full-sync instruction. It
+    # only removes JD-managed positions; manual grid positions remain intact.
+    if not current_codes:
+        audit_result = sync_jd_grid_account(
+            sorted(full_current_codes), [], [], [], mutation_codes=[], allow_empty_jd_account=True
+        )
+        return {
+            "success": True,
+            "imported": 0,
+            "updated": 0,
+            "skipped": 0,
+            "partial": 0,
+            "audit_imported": audit_result.get("imported", 0),
+            "audit_updated": audit_result.get("updated", 0),
+            "audit_skipped": audit_result.get("skipped", 0),
+            "results": [],
+            "audit_results": audit_result.get("results", []),
+            "verified_cycle_codes": [],
+        }
+
     # Materialize the verified current holding cycle first.  The account sync
     # below then records the official snapshot and audit rows without replacing
     # the detailed JD-owned batches with one aggregate snapshot.
     batch_result = _legacy_import_jd_positions(req)
     server_verified_codes = set(batch_result.pop("_verified_codes", []))
-    replace_transaction_codes = requested_replace_transaction_codes & server_verified_codes
+    replace_transaction_codes = (
+        server_verified_codes
+        if req.resolve_current_cycles_on_server
+        else requested_replace_transaction_codes & server_verified_codes
+    )
     audit_result = sync_jd_grid_account(
-        sorted(current_codes), snapshots, transactions, sorted(replace_transaction_codes)
+        sorted(full_current_codes), snapshots, transactions, sorted(replace_transaction_codes),
+        mutation_codes=sorted(current_codes),
     )
     return {
         "success": True,
@@ -804,6 +915,7 @@ def import_jd_positions(req: JdGridImportRequest):
         "audit_skipped": audit_result.get("skipped", 0) + len(rejected),
         "results": batch_result.get("results", []),
         "audit_results": rejected + audit_result.get("results", []),
+        "verified_cycle_codes": sorted(server_verified_codes),
     }
 
 
@@ -828,6 +940,9 @@ def _legacy_import_jd_positions(req: JdGridImportRequest):
             datetime.strptime(trade_date, "%Y-%m-%d")
         except ValueError:
             rejected.append({"id": adjustment.id, "status": "skipped", "reason": "invalid_trade_date"})
+            continue
+        if not _jd_trade_date_is_importable(trade_date):
+            rejected.append({"id": adjustment.id, "code": code, "status": "skipped", "reason": "future_trade_date"})
             continue
         # Pending orders remain visible in jd_transactions, but the official
         # holding snapshot may not include them yet.  Replaying them here would
@@ -905,10 +1020,15 @@ def _legacy_import_jd_positions(req: JdGridImportRequest):
         # leave its otherwise-valid legs in the grid.
         if not fund_legs and code not in candidate_codes:
             continue
-        if code in invalid_candidate_codes or not _jd_timeline_matches_current_holding(fund_legs, expected_shares.get(code)):
+        timeline_legs = (
+            _jd_select_current_holding_cycle(fund_legs, expected_shares.get(code))
+            if req.resolve_current_cycles_on_server
+            else fund_legs
+        )
+        if code in invalid_candidate_codes or not _jd_timeline_matches_current_holding(timeline_legs, expected_shares.get(code)):
             rejected.append({"id": f"jd:timeline:{code}", "code": code, "status": "skipped", "reason": "unverified_current_timeline"})
             continue
-        for leg in fund_legs:
+        for leg in timeline_legs:
             leg["timeline_verified"] = True
             verified_legs.append(leg)
         verified_codes.add(code)
@@ -918,10 +1038,9 @@ def _legacy_import_jd_positions(req: JdGridImportRequest):
         if not leg.get("name"):
             leg["name"] = holding_names.get(leg["code"], "")
 
-    # A 30-day trade window cannot reconstruct long-held positions. Seed only
-    # still-current JD holdings that were not covered by a verified timeline;
-    # the stable ledger id makes the baseline one-time and replaceable if a
-    # complete real timeline becomes available later.
+    # Seed only still-current JD holdings that were not covered by a verified
+    # real timeline; the stable ledger id is replaceable if JD history becomes
+    # available later.
     covered_codes = {leg["code"] for leg in legs if leg["action"] == "buy"}
     holdings_by_code = {
         holding.code.strip(): holding
@@ -929,9 +1048,14 @@ def _legacy_import_jd_positions(req: JdGridImportRequest):
         if holding.code and holding.code.strip() in current_codes
     }
     for code in sorted(current_codes - covered_codes):
-        seed = _jd_snapshot_leg(holdings_by_code.get(code)) if code in holdings_by_code else None
+        holding = holdings_by_code.get(code)
+        seed = _jd_snapshot_leg(holding) if holding else None
         if seed:
             legs.append(seed)
+        elif holding and _jd_snapshot_data(holding):
+            # The account sync retains this as a visible read-only baseline.
+            # It cannot become a batch until JD supplies a real opening date.
+            continue
         else:
             rejected.append({"id": f"jd:snapshot:{code}", "code": code, "status": "skipped", "reason": "missing_snapshot_value"})
 

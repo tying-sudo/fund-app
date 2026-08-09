@@ -108,6 +108,8 @@ export interface GridJdImportResult {
   audit_updated?: number
   audit_skipped?: number
   audit_results?: GridJdImportResultItem[]
+  /** Codes whose reconstructed server-side timeline exactly matches JD shares. */
+  verified_cycle_codes?: string[]
 }
 
 export interface GridJdImportResultItem {
@@ -162,6 +164,8 @@ export interface GridPosition {
   sell_records?: GridSellRecord[]
   jd_transactions?: GridJdTransaction[]
   jd_pending_position?: boolean
+  jd_baseline_missing_date?: boolean
+  jd_snapshot?: { amount?: number; nav?: number; shares?: number; acquired_date_known?: boolean; synced_at?: string }
   supplement_count?: number
 }
 
@@ -344,8 +348,10 @@ export interface GridJdTransaction {
 }
 
 export function importGridJdTransactions(input: {
+  full_current_holding_codes: string[]
   current_holding_codes: string[]
   replace_transaction_codes: string[]
+  resolve_current_cycles_on_server?: boolean
   current_holdings: Array<{
     code: string
     name: string

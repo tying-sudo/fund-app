@@ -1088,7 +1088,9 @@ def _is_jd_managed_batch(batch: dict) -> bool:
 
 @position_write
 def sync_jd_grid_account(current_codes: list, snapshots: list, transactions: list,
-                         replace_transaction_codes: list | None = None) -> dict:
+                         replace_transaction_codes: list | None = None,
+                         mutation_codes: list | None = None,
+                         allow_empty_jd_account: bool = False) -> dict:
     """Sync official holdings and audit-only trade rows without double-counting shares."""
     data = load_positions()
     funds = data.setdefault("funds", {})
@@ -1096,13 +1098,17 @@ def sync_jd_grid_account(current_codes: list, snapshots: list, transactions: lis
         str(code).strip() for code in current_codes
         if str(code).strip().isdigit() and len(str(code).strip()) == 6
     }
+    scoped_codes = {
+        str(code).strip() for code in (mutation_codes if mutation_codes is not None else current_codes)
+        if str(code).strip() in allowed_codes
+    }
     snapshots_by_code = {
         str(item.get("code", "")).strip(): item for item in snapshots
-        if str(item.get("code", "")).strip() in allowed_codes
+        if str(item.get("code", "")).strip() in scoped_codes
     }
     replace_codes = {
         str(code).strip() for code in (replace_transaction_codes or [])
-        if str(code).strip() in allowed_codes
+        if str(code).strip() in scoped_codes
     }
     results = []
     imported = skipped = updated = 0
@@ -1118,13 +1124,30 @@ def sync_jd_grid_account(current_codes: list, snapshots: list, transactions: lis
             continue
         del funds[code]
 
-    for code in sorted(allowed_codes):
+    for code in sorted(scoped_codes):
         snapshot = snapshots_by_code.get(code)
         fund = funds.get(code)
         existing_batches = fund.get("batches", []) if fund else []
         manual_position = bool(existing_batches) and not all(_is_jd_managed_batch(batch) for batch in existing_batches)
         detailed_position = bool(existing_batches) and all(_is_jd_timeline_batch(batch) for batch in existing_batches)
-        if snapshot and detailed_position:
+        if snapshot and not snapshot.get("trade_date") and not manual_position and not existing_batches:
+            if fund is None:
+                fund = _ensure_fund(data, code)
+            fund["jd_snapshot"] = {
+                "amount": round(float(snapshot["amount"]), 2),
+                "nav": round(float(snapshot["nav"]), 6),
+                "shares": round(float(snapshot["shares"]), 2),
+                "acquired_date_known": False,
+                "synced_at": beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
+            }
+            fund["jd_managed"] = True
+            fund["jd_pending_position"] = False
+            fund["jd_baseline_missing_date"] = True
+            if snapshot.get("name"):
+                fund["fund_name"] = str(snapshot["name"]).strip()
+            results.append({"ledger_id": snapshot["ledger_id"], "code": code, "action": "seed", "status": "skipped", "reason": "missing_acquired_date"})
+            skipped += 1
+        elif snapshot and detailed_position:
             # A complete JD timeline is more useful to the grid than one
             # aggregate snapshot.  Retain it and store the official totals only
             # as reconciliation metadata.  An incomplete later capture must not
@@ -1138,6 +1161,7 @@ def sync_jd_grid_account(current_codes: list, snapshots: list, transactions: lis
             }
             fund["jd_managed"] = True
             fund["jd_pending_position"] = False
+            fund.pop("jd_baseline_missing_date", None)
             if snapshot.get("name"):
                 fund["fund_name"] = str(snapshot["name"]).strip()
         elif snapshot and not manual_position:
@@ -1167,6 +1191,7 @@ def sync_jd_grid_account(current_codes: list, snapshots: list, transactions: lis
             fund["jd_transactions"] = old_transactions
             fund["jd_managed"] = True
             fund["jd_pending_position"] = False
+            fund.pop("jd_baseline_missing_date", None)
             if snapshot.get("name"):
                 fund["fund_name"] = str(snapshot["name"]).strip()
             status = "skipped" if unchanged else "updated" if old_batch else "imported"
@@ -1217,7 +1242,7 @@ def sync_jd_grid_account(current_codes: list, snapshots: list, transactions: lis
     for transaction in transactions:
         code = str(transaction.get("code", "")).strip()
         transaction_id = str(transaction.get("id", "")).strip()
-        if code not in allowed_codes or not transaction_id:
+        if code not in scoped_codes or not transaction_id:
             results.append({"id": transaction_id, "code": code, "status": "skipped", "reason": "not_current_holding"})
             skipped += 1
             continue
@@ -1245,7 +1270,7 @@ def sync_jd_grid_account(current_codes: list, snapshots: list, transactions: lis
         records.sort(key=lambda item: (item.get("trade_time") or item.get("trade_date", ""), item.get("id", "")), reverse=True)
         results.append({"id": transaction_id, "code": code, "action": transaction.get("type"), "status": status})
 
-    save_positions(data)
+    save_positions(data, allow_empty=allow_empty_jd_account)
     return {
         "success": True,
         "imported": imported,
@@ -1299,7 +1324,14 @@ def import_jd_grid_transactions(transactions: list) -> dict:
             results.append({"ledger_id": ledger_id, "code": code, "status": "skipped", "reason": "existing_manual_grid_position"})
             skipped += 1
             continue
-        if ledger_id in ledger and not item.get("timeline_verified"):
+        fund_state = data.get("funds", {}).get(code, {})
+        retry_missing_date_snapshot = (
+            action == "seed"
+            and not fund_state.get("batches")
+            and fund_state.get("jd_baseline_missing_date") is True
+            and ledger.get(ledger_id, {}).get("outcome") == "skipped"
+        )
+        if ledger_id in ledger and not item.get("timeline_verified") and not retry_missing_date_snapshot:
             results.append({"ledger_id": ledger_id, "code": code, "status": "skipped", "reason": "duplicate"})
             skipped += 1
             continue
@@ -1334,6 +1366,7 @@ def import_jd_grid_transactions(transactions: list) -> dict:
                     batch["original_amount"] = round(amount, 2)
                 batch["source"] = "jd_snapshot"
                 batch["source_ledger_id"] = ledger_id
+                _ensure_fund(data, code).pop("jd_baseline_missing_date", None)
             elif item.get("timeline_verified"):
                 batch["source"] = "jd_timeline"
                 batch["source_ledger_id"] = ledger_id

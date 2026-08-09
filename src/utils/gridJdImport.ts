@@ -10,8 +10,13 @@ import {
 import { getBeijingDateString } from './tradingDate.ts'
 
 export interface GridJdImportPayload {
+  /** Complete JD current-account scope; never narrowed by the review selection. */
+  full_current_holding_codes: string[]
+  /** Funds selected for this mutation. */
   current_holding_codes: string[]
   replace_transaction_codes: string[]
+  /** Let the grid backend derive amount-only trade shares and current-cycle bounds. */
+  resolve_current_cycles_on_server: boolean
   current_holdings: Array<{
     code: string
     name: string
@@ -24,6 +29,31 @@ export interface GridJdImportPayload {
     acquiredDate?: string
   }>
   adjustments: JdAdjustmentItem[]
+}
+
+/** One selectable current-fund cycle in the grid Cookie-import review. */
+export interface GridJdImportCandidate {
+  code: string
+  name: string
+  /** Confirmed buy or transfer-in records that can become grid batches. */
+  candidateBatchCount: number
+  transactionCount: number
+  pendingTransactionCount: number
+  hasHoldingSnapshot: boolean
+  batches: GridJdImportCandidateBatch[]
+}
+
+/** One JD purchase leg shown before it is written as a low-frequency-grid batch. */
+export interface GridJdImportCandidateBatch {
+  id: string
+  tradeDate: string
+  tradeTime?: string
+  type: 'buy' | 'convert_in' | 'snapshot'
+  amount?: string
+  shares?: string
+  status?: string
+  statusCode?: string
+  pending: boolean
 }
 
 function adjustmentSortKey(adjustment: JdAdjustmentItem): string {
@@ -55,15 +85,19 @@ function hasRecentExplicitPendingStatus(adjustment: JdAdjustmentItem, now: Date)
 export function buildGridJdImportPayload(
   items: JdHoldingItem[],
   adjustments: JdAdjustmentItem[],
-  now = new Date()
+  now = new Date(),
+  options: { resolveCurrentCyclesOnServer?: boolean } = {}
 ): GridJdImportPayload {
   const snapshotCodes = [...new Set(items
     .map((item) => item.code.trim())
     .filter((code) => /^\d{6}$/.test(code)))]
   const today = getBeijingDateString(now)
+  // A current holding's real acquisition date is its first effective buy, so
+  // retain the complete JD timeline and only exclude impossible future rows.
   const normalizedAdjustments = adjustments.filter((item) =>
     /^\d{6}$/.test(item.code)
     && isValidJdTradeDate(item.tradeDate)
+    && item.tradeDate <= today
     && ['add', 'reduce', 'convert'].includes(item.type)
     && !isInactiveJdAdjustment(item)
   )
@@ -92,10 +126,22 @@ export function buildGridJdImportPayload(
   }
   const validAdjustments = [...adjustmentMap.values()]
     .sort((left, right) => adjustmentSortKey(left).localeCompare(adjustmentSortKey(right)) || left.id.localeCompare(right.id))
+  // JD's account timeline often discloses completed transfer-ins as an amount
+  // only. The backend resolves their confirmation NAV, derives shares, and
+  // cuts the current cycle from the reconstructed ledger. Send the complete
+  // decoded timeline only for that explicit server-verified mode.
+  const serverTimeline = normalizedAdjustments
+    .flatMap((item) => {
+      const cycleCodes = cycleCodesForAdjustment(item, currentCodes)
+      return cycleCodes.length > 0 ? [{ ...item, cycleCodes }] : []
+    })
+    .sort((left, right) => adjustmentSortKey(left).localeCompare(adjustmentSortKey(right)) || left.id.localeCompare(right.id))
   const replace_transaction_codes = [...selectVerifiedJdCurrentTimeline(items, normalizedAdjustments).verifiedCodes].sort()
   return {
+    full_current_holding_codes: current_holding_codes,
     current_holding_codes,
     replace_transaction_codes,
+    resolve_current_cycles_on_server: options.resolveCurrentCyclesOnServer === true,
     current_holdings: items.flatMap((item) => {
       const code = item.code.trim()
       if (!currentCodes.has(code)) return []
@@ -113,9 +159,95 @@ export function buildGridJdImportPayload(
     }),
     // Pending rows are intentionally retained. The backend persists them as
     // audit-only trade batches and never adds them to calculated shares.
-    adjustments: validAdjustments.filter((item) => {
+    adjustments: (options.resolveCurrentCyclesOnServer ? serverTimeline : validAdjustments).filter((item) => {
       return currentCodes.has(item.code) || Boolean(item.targetCode && currentCodes.has(item.targetCode))
     })
+  }
+}
+
+function adjustmentIncludesGridCode(adjustment: JdAdjustmentItem, code: string): boolean {
+  return adjustment.cycleCodes?.includes(code) === true
+    || adjustment.code === code
+    || adjustment.targetCode === code
+}
+
+/**
+ * Summarize each fund before any grid write. A fund remains the selection
+ * unit because server reconciliation needs its full current holding cycle.
+ */
+export function getGridJdImportCandidates(payload: GridJdImportPayload): GridJdImportCandidate[] {
+  return payload.current_holding_codes.map((code) => {
+    const holding = payload.current_holdings.find((item) => item.code === code)
+    const records = payload.adjustments.filter((item) => adjustmentIncludesGridCode(item, code))
+    const fallback = records.find((item) => item.code === code || item.targetCode === code)
+    const batches = records.flatMap((item): GridJdImportCandidateBatch[] => {
+      const isBuy = item.type === 'add' && item.code === code
+      const isConversionIn = item.type === 'convert' && item.targetCode === code
+      if (!isBuy && !isConversionIn) return []
+      return [{
+        id: `${item.id}:${isConversionIn ? 'target' : 'source'}`,
+        tradeDate: item.tradeDate,
+        ...(item.tradeTime ? { tradeTime: item.tradeTime } : {}),
+        type: isConversionIn ? 'convert_in' : 'buy',
+        ...(item.amount ? { amount: item.amount } : {}),
+        ...((isConversionIn ? item.targetShares : item.shares)
+          ? { shares: isConversionIn ? item.targetShares : item.shares }
+          : {}),
+        ...(item.status ? { status: item.status } : {}),
+        ...(item.statusCode ? { statusCode: item.statusCode } : {}),
+        pending: isPendingJdAdjustment(item)
+      }]
+    })
+    if (!batches.length && holding) {
+      batches.push({
+        id: `jd:snapshot:${code}`,
+        // Profit-date is a valuation timestamp, never a holding-start date.
+        // Keep an unknown baseline visibly unknown instead of inventing a buy date.
+        tradeDate: holding.acquiredDate || '',
+        type: 'snapshot',
+        amount: holding.costAmount || holding.amount,
+        shares: holding.shares,
+        status: '交易批次不完整，将保留当前持仓基线',
+        pending: false
+      })
+    }
+    // A snapshot without JD's real holding-start date is useful for review,
+    // but cannot become a tradable grid batch without fabricating a buy date.
+    const candidateBatchCount = batches.filter((item) => !item.pending && (item.type !== 'snapshot' || Boolean(item.tradeDate))).length
+    return {
+      code,
+      name: holding?.name || (fallback?.targetCode === code ? fallback.targetName : fallback?.name) || `基金 ${code}`,
+      candidateBatchCount,
+      transactionCount: records.length,
+      pendingTransactionCount: records.filter(isPendingJdAdjustment).length,
+      hasHoldingSnapshot: Boolean(holding),
+      batches
+    }
+  })
+}
+
+/** Return an independent payload containing only the user-selected fund cycles. */
+export function selectGridJdImportPayload(payload: GridJdImportPayload, codes: Iterable<string>): GridJdImportPayload {
+  const selectedCodes = new Set([...codes].filter((code) => payload.current_holding_codes.includes(code)))
+  const adjustments = payload.adjustments.flatMap((item) => {
+    const cycleCodes = item.cycleCodes?.filter((code) => selectedCodes.has(code))
+    const included = cycleCodes?.length
+      || (!item.cycleCodes?.length && (selectedCodes.has(item.code) || Boolean(item.targetCode && selectedCodes.has(item.targetCode))))
+    if (!included) return []
+    return [{
+      ...item,
+      ...(item.cycleCodes ? { cycleCodes } : {})
+    }]
+  })
+  return {
+    ...payload,
+    // Preserve the complete account scope so a partial import cannot make the
+    // backend delete an unselected but still-current JD-managed fund.
+    full_current_holding_codes: payload.full_current_holding_codes,
+    current_holding_codes: payload.current_holding_codes.filter((code) => selectedCodes.has(code)),
+    replace_transaction_codes: payload.replace_transaction_codes.filter((code) => selectedCodes.has(code)),
+    current_holdings: payload.current_holdings.filter((item) => selectedCodes.has(item.code)),
+    adjustments
   }
 }
 
@@ -196,6 +328,7 @@ const gridJdSkipReasonLabels: Record<string, string> = {
   existing_manual_grid_position: '已有手工网格持仓',
   invalid_adjustment: '无效交易记录',
   invalid_trade_date: '交易日期无效',
+  future_trade_date: '交易日期晚于今天',
   inactive_transaction: '已取消/退款/失败',
   missing_conversion_source: '缺少转换转出数据',
   missing_conversion_target: '缺少转换转入数据',

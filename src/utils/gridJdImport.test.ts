@@ -1,6 +1,23 @@
 import assert from 'node:assert/strict'
 import test from 'node:test'
-import { buildGridJdImportPayload, formatGridJdImportFeedback, summarizeGridJdImportResult } from './gridJdImport.ts'
+import { buildGridJdImportPayload, formatGridJdImportFeedback, getGridJdImportCandidates, selectGridJdImportPayload, summarizeGridJdImportResult } from './gridJdImport.ts'
+
+test('keeps the complete JD history needed to find the true first buy', () => {
+  const now = new Date('2026-08-04T12:00:00+08:00')
+  const payload = buildGridJdImportPayload(
+    [{ code: '000001', name: 'Current', shares: '30' }],
+    [
+      { id: 'first-buy', code: '000001', type: 'add', tradeDate: '2021-05-03', shares: '10', statusCode: 'COMPLETE' },
+      { id: 'recent', code: '000001', type: 'add', tradeDate: '2026-08-03', shares: '20', statusCode: 'COMPLETE' },
+      { id: 'future', code: '000001', type: 'add', tradeDate: '2026-08-05', shares: '10', statusCode: 'COMPLETE' }
+    ],
+    now,
+    { resolveCurrentCyclesOnServer: true }
+  )
+
+  assert.deepEqual(payload.adjustments.map((item) => item.id), ['first-buy', 'recent'])
+  assert.equal(payload.adjustments[0]?.tradeDate, '2021-05-03')
+})
 
 test('keeps only current JD holdings and their relevant transaction stream', () => {
   const payload = buildGridJdImportPayload(
@@ -164,13 +181,14 @@ test('uses the first real purchase in the current cycle as the grid opening chec
   const payload = buildGridJdImportPayload(
     [{ code: '000001', name: 'Current', shares: '60' }],
     [
-      { id: 'first-buy', code: '000001', type: 'add', tradeDate: '2024-01-02', shares: '10', amount: '10', statusCode: 'COMPLETE' },
-      { id: 'second-buy', code: '000001', type: 'add', tradeDate: '2025-07-03', shares: '50', amount: '50', statusCode: 'COMPLETE' }
-    ]
+      { id: 'first-buy', code: '000001', type: 'add', tradeDate: '2026-05-04', shares: '10', amount: '10', statusCode: 'COMPLETE' },
+      { id: 'second-buy', code: '000001', type: 'add', tradeDate: '2026-07-03', shares: '50', amount: '50', statusCode: 'COMPLETE' }
+    ],
+    new Date('2026-08-04T11:00:00+08:00')
   )
 
   assert.deepEqual(payload.adjustments.map((item) => item.id), ['first-buy', 'second-buy'])
-  assert.equal(payload.adjustments[0].tradeDate, '2024-01-02')
+  assert.equal(payload.adjustments[0].tradeDate, '2026-05-04')
   assert.deepEqual(payload.replace_transaction_codes, ['000001'])
   assert.deepEqual(payload.adjustments[0].cycleCodes, ['000001'])
 })
@@ -179,11 +197,12 @@ test('removes the fully closed cycle before a later rebuild', () => {
   const payload = buildGridJdImportPayload(
     [{ code: '000001', name: 'Rebuilt', shares: '40' }],
     [
-      { id: 'old-buy', code: '000001', type: 'add', tradeDate: '2021-01-01', shares: '100', statusCode: 'COMPLETE' },
-      { id: 'old-exit', code: '000001', type: 'reduce', tradeDate: '2022-01-01', shares: '100', statusCode: 'REDEEM_SUCC' },
-      { id: 'rebuild-buy', code: '000001', type: 'add', tradeDate: '2025-01-01', shares: '60', statusCode: 'COMPLETE' },
-      { id: 'rebuild-sell', code: '000001', type: 'reduce', tradeDate: '2026-01-01', shares: '20', statusCode: 'REDEEM_SUCC' }
-    ]
+      { id: 'old-buy', code: '000001', type: 'add', tradeDate: '2026-05-05', shares: '100', statusCode: 'COMPLETE' },
+      { id: 'old-exit', code: '000001', type: 'reduce', tradeDate: '2026-05-06', shares: '100', statusCode: 'REDEEM_SUCC' },
+      { id: 'rebuild-buy', code: '000001', type: 'add', tradeDate: '2026-06-01', shares: '60', statusCode: 'COMPLETE' },
+      { id: 'rebuild-sell', code: '000001', type: 'reduce', tradeDate: '2026-07-01', shares: '20', statusCode: 'REDEEM_SUCC' }
+    ],
+    new Date('2026-08-04T11:00:00+08:00')
   )
 
   assert.deepEqual(payload.adjustments.map((item) => item.id), ['rebuild-buy', 'rebuild-sell'])
@@ -242,6 +261,130 @@ test('does not send an unverified old history as the current cycle', () => {
 
   assert.deepEqual(payload.replace_transaction_codes, [])
   assert.deepEqual(payload.adjustments, [])
+})
+
+test('sends every amount-only current-fund row to the server cycle resolver', () => {
+  const payload = buildGridJdImportPayload(
+    [{ code: '006616', name: 'Target', shares: '3834.69' }],
+    [
+      { id: 'in-1', code: '006616', type: 'add', tradeDate: '2026-06-26', amount: '1.00', statusCode: 'COMPLETE' },
+      { id: 'in-2', code: '006616', type: 'add', tradeDate: '2026-06-29', amount: '809.38', statusCode: 'COMPLETE' },
+      { id: 'in-3', code: '006616', type: 'add', tradeDate: '2026-07-02', amount: '10000.00', statusCode: 'COMPLETE' },
+      { id: 'in-4', code: '006616', type: 'add', tradeDate: '2026-07-06', amount: '1500.00', statusCode: 'COMPLETE' },
+      { id: 'in-5', code: '006616', type: 'add', tradeDate: '2026-07-29', amount: '5000.00', statusCode: 'COMPLETE' }
+    ],
+    new Date('2026-08-02T16:49:44+08:00'),
+    { resolveCurrentCyclesOnServer: true }
+  )
+
+  assert.equal(payload.resolve_current_cycles_on_server, true)
+  assert.deepEqual(payload.adjustments.map((item) => item.id), ['in-1', 'in-2', 'in-3', 'in-4', 'in-5'])
+})
+
+test('selects whole fund cycles from the Cookie-import review without leaking another fund', () => {
+  const payload = buildGridJdImportPayload(
+    [
+      { code: '000001', name: 'Source', shares: '100' },
+      { code: '000002', name: 'Target', shares: '50' }
+    ],
+    [
+      { id: 'source-buy', code: '000001', type: 'add', tradeDate: '2026-07-01', shares: '100', statusCode: 'COMPLETE' },
+      { id: 'target-buy', code: '000002', type: 'add', tradeDate: '2026-07-02', shares: '40', statusCode: 'COMPLETE' },
+      { id: 'convert', code: '000001', type: 'convert', targetCode: '000002', targetShares: '10', tradeDate: '2026-07-03', statusCode: 'COMPLETE' }
+    ],
+    new Date('2026-08-02T16:49:44+08:00'),
+    { resolveCurrentCyclesOnServer: true }
+  )
+
+  assert.deepEqual(getGridJdImportCandidates(payload), [
+    {
+      code: '000001',
+      name: 'Source',
+      candidateBatchCount: 1,
+      transactionCount: 2,
+      pendingTransactionCount: 0,
+      hasHoldingSnapshot: true,
+      batches: [{
+        id: 'source-buy:source',
+        tradeDate: '2026-07-01',
+        type: 'buy',
+        shares: '100',
+        statusCode: 'COMPLETE',
+        pending: false
+      }]
+    },
+    {
+      code: '000002',
+      name: 'Target',
+      candidateBatchCount: 2,
+      transactionCount: 2,
+      pendingTransactionCount: 0,
+      hasHoldingSnapshot: true,
+      batches: [
+        {
+          id: 'target-buy:source',
+          tradeDate: '2026-07-02',
+          type: 'buy',
+          shares: '40',
+          statusCode: 'COMPLETE',
+          pending: false
+        },
+        {
+          id: 'convert:target',
+          tradeDate: '2026-07-03',
+          type: 'convert_in',
+          shares: '10',
+          statusCode: 'COMPLETE',
+          pending: false
+        }
+      ]
+    }
+  ])
+
+  const selected = selectGridJdImportPayload(payload, ['000002'])
+  assert.deepEqual(selected.current_holding_codes, ['000002'])
+  assert.deepEqual(selected.full_current_holding_codes, ['000001', '000002'])
+  assert.deepEqual(selected.current_holdings.map((item) => item.code), ['000002'])
+  assert.deepEqual(selected.adjustments.map((item) => item.id), ['target-buy', 'convert'])
+  assert.deepEqual(selected.adjustments.find((item) => item.id === 'convert')?.cycleCodes, ['000002'])
+})
+
+test('shows a snapshot fallback as one review row when JD returned no purchase batches', () => {
+  const payload = buildGridJdImportPayload(
+    [{ code: '000001', name: 'Current', amount: '1200', shares: '1000', acquiredDate: '2026-01-02' }],
+    []
+  )
+
+  assert.deepEqual(getGridJdImportCandidates(payload)[0]?.batches, [{
+    id: 'jd:snapshot:000001',
+    tradeDate: '2026-01-02',
+    type: 'snapshot',
+    amount: '1200',
+    shares: '1000',
+    status: '交易批次不完整，将保留当前持仓基线',
+    pending: false
+  }])
+})
+
+test('does not count an undated JD snapshot as an importable batch', () => {
+  const payload = buildGridJdImportPayload(
+    [{ code: '000001', name: 'Current', amount: '1200', shares: '1000' }],
+    []
+  )
+
+  const candidate = getGridJdImportCandidates(payload)[0]
+  assert.equal(candidate?.candidateBatchCount, 0)
+  assert.equal(candidate?.batches[0]?.type, 'snapshot')
+  assert.equal(candidate?.batches[0]?.tradeDate, '')
+})
+
+test('does not treat a profit-date as the holding start for a snapshot fallback', () => {
+  const payload = buildGridJdImportPayload(
+    [{ code: '000001', name: 'Current', amount: '1200', shares: '1000', profitDate: '2026-07-23' }],
+    []
+  )
+
+  assert.equal(getGridJdImportCandidates(payload)[0]?.batches[0]?.tradeDate, '')
 })
 
 test('reports duplicate snapshot baselines separately from skipped real trades', () => {

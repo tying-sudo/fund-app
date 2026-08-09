@@ -55,11 +55,11 @@ import {
 import { getRiskController } from '@/utils/riskControl'
 import { getHoldingLogger } from '@/utils/holdingLogger'
 import {
-  findSettlementNav,
+  findAdjustmentSettlementNav,
   calculateSubscriptionShares,
   getBeijingDateString,
   getCalendarDayDifference,
-  getSettlementNavStartDate
+  shouldAttemptAdjustmentSettlement
 } from '@/utils/tradingDate'
 
 /** 持仓项（包含实时估值和收益计算） */
@@ -517,8 +517,10 @@ export const useHoldingStore = defineStore('holding', () => {
             usableRealData?.previous,
             usableRealData?.isCurrentPublication
           )
-          if (realData?.isFresh !== false && realData) {
-            await confirmPendingAdjustments(code, realData.date)
+          const today = getTodayStr()
+          const confirmationSessionDate = hasUsableCurrentEstimate(data, today) ? today : null
+          if (shouldAttemptAdjustmentSettlement(realData?.date, confirmationSessionDate)) {
+            await confirmPendingAdjustments(code, realData?.date, confirmationSessionDate)
           }
           await hydrateHoldingSettlementIfMissing(code)
           successCount++
@@ -1200,10 +1202,14 @@ export const useHoldingStore = defineStore('holding', () => {
   }
 
   /**
-   * 检查并确认已到确认日的待确认调仓记录
-   * [WHEN] 每次官方净值更新后调用（realNav 有值且日期有效）
+   * 检查并确认已到确认时点的待确认调仓记录。
+   * [WHEN] 当前交易日盘中估值或更晚的官方净值提供真实会话证据时调用。
    */
-  async function confirmPendingAdjustments(code?: string, realNavDate?: string | null): Promise<void> {
+  async function confirmPendingAdjustments(
+    code?: string,
+    realNavDate?: string | null,
+    confirmationSessionDate?: string | null
+  ): Promise<void> {
     if (pendingAdjustments.value.length === 0) return
 
     const effectiveDate = realNavDate || getTodayStr(new Date())
@@ -1218,8 +1224,9 @@ export const useHoldingStore = defineStore('holding', () => {
       pendingSettlementLocks.add(pending.id)
       try {
         const history = await fetchNetValueHistoryFast(pending.code, 1500)
-        const settlementStartDate = getSettlementNavStartDate(pending.tradeDate, pending.timeSlot)
-        const settlement = findSettlementNav(history, settlementStartDate, effectiveDate)
+        const settlement = findAdjustmentSettlementNav(history, pending.tradeDate, pending.timeSlot, effectiveDate, {
+          sessionDate: confirmationSessionDate
+        })
         if (!settlement) continue
 
         await applyAdjustment(pending, settlement.netValue)

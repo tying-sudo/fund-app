@@ -21,13 +21,50 @@ import {
   clearCache,
   fetchStockQuotes
 } from './server/cache.mjs'
+import { importJdBrowserCapture, importJdCookie } from './server/jd-cookie-proxy.mjs'
+import { consumeJdBrowserCaptureSession, createJdBrowserCaptureSession, getJdBrowserCaptureHoldings, hasJdBrowserCaptureSession, storeJdBrowserCaptureHoldings } from './server/jd-browser-capture.mjs'
 
 const app = express()
 const PORT = 3001 // 使用不同端口避免冲突
 
 // CORS 中间件
 app.use(cors())
-app.use(express.json())
+app.use(express.json({ limit: '12mb' }))
+
+app.post('/api/jd/holdings/import', async (req, res) => {
+  res.set('Cache-Control', 'no-store, max-age=0')
+  try {
+    res.json(await importJdCookie(req.body?.cookie))
+  } catch (error) {
+    const status = error?.code === 'JD_AUTH' ? 401 : error?.status === 429 ? 429 : 502
+    res.status(status).json({ error: error?.code || 'JD_IMPORT_FAILED' })
+  }
+})
+
+app.post('/api/jd/holdings/browser-session', (req, res) => {
+  res.set('Cache-Control', 'no-store, max-age=0')
+  res.json(createJdBrowserCaptureSession())
+})
+
+app.post('/api/jd/holdings/browser-holdings', (req, res) => {
+  res.set('Cache-Control', 'no-store, max-age=0')
+  const token = req.get('X-JD-Capture-Token')
+  if (!hasJdBrowserCaptureSession(token) || !storeJdBrowserCaptureHoldings(token, req.body?.items)) return res.status(401).json({ error: 'JD_CAPTURE_AUTH' })
+  res.sendStatus(204)
+})
+
+app.post('/api/jd/holdings/browser-capture', async (req, res) => {
+  res.set('Cache-Control', 'no-store, max-age=0')
+  const token = req.get('X-JD-Capture-Token')
+  if (!hasJdBrowserCaptureSession(token)) return res.status(401).json({ error: 'JD_CAPTURE_AUTH' })
+  try {
+    const result = importJdBrowserCapture({ ...req.body, items: getJdBrowserCaptureHoldings(token) || req.body?.items })
+    consumeJdBrowserCaptureSession(token)
+    res.json(result)
+  } catch (error) {
+    res.status(422).json({ error: 'JD_CAPTURE_INVALID' })
+  }
+})
 
 // ========== 自有 API 路由 ==========
 

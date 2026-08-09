@@ -1,6 +1,6 @@
 import { Capacitor, registerPlugin } from '@capacitor/core'
 import type { PluginListenerHandle } from '@capacitor/core'
-import { addCalendarDays } from './tradingDate.ts'
+import { getAdjustmentConfirmationAt, getTradeTimeSlot } from './tradingDate.ts'
 
 export interface JdHoldingItem {
   code: string
@@ -80,7 +80,7 @@ export interface JdSyncProgressState {
 
 interface NativeJdHoldingsPlugin {
   importHoldings(): Promise<{ items?: JdHoldingItem[]; closedItems?: JdClosedHoldingItem[]; adjustments?: JdAdjustmentItem[] }>
-  importHoldingsWithCookie(options: { cookie: string; background?: boolean }): Promise<{ items?: JdHoldingItem[]; closedItems?: JdClosedHoldingItem[]; adjustments?: JdAdjustmentItem[] }>
+  importHoldingsWithCookie(options: { cookie: string; background?: boolean; grid?: boolean }): Promise<{ items?: JdHoldingItem[]; closedItems?: JdClosedHoldingItem[]; adjustments?: JdAdjustmentItem[] }>
   addListener(eventName: 'syncProgress', listenerFunc: (event: JdSyncProgress) => void): Promise<PluginListenerHandle>
 }
 
@@ -260,8 +260,8 @@ export function selectVerifiedJdCurrentTimeline(items: JdHoldingItem[], adjustme
       }
       requirement.remaining -= delta
       const expectedShares = expectedSharesByCode.get(code) || 0
-      const tolerance = Math.max(0.02, expectedShares * 0.001)
-      if (Math.abs(requirement.remaining) <= tolerance) {
+      const tolerance = 0.005
+      if (Math.abs(requirement.remaining) < tolerance) {
         requirement.complete = true
         requirement.startIndex = index
       } else if (requirement.remaining < -tolerance) {
@@ -400,7 +400,7 @@ function parseJdConfirmationTime(value: string | undefined): number | null {
   // legacy window, which would hide a redemption tag too early.
   const beijing = /(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})(?:[ T](\d{1,2}):(\d{2})(?::(\d{2}))?)?/.exec(raw)
   if (beijing) {
-    const [, year, month, day, hour = '15', minute = '00', second = '00'] = beijing
+    const [, year, month, day, hour = '13', minute = '00', second = '00'] = beijing
     const normalized = `${year}-${month.padStart(2, '0')}-${day.padStart(2, '0')}T${hour.padStart(2, '0')}:${minute}:${second}+08:00`
     const parsed = Date.parse(normalized)
     return Number.isFinite(parsed) ? parsed : null
@@ -409,15 +409,12 @@ function parseJdConfirmationTime(value: string | undefined): number | null {
   return Number.isFinite(parsed) ? parsed : null
 }
 
-/** Prefer JD's real confirmation time; use the legacy cut-off rule for older saved records. */
+/** Prefer JD's real confirmation time; otherwise use JD's 15:00 trading-session rule. */
 export function getJdAdjustmentConfirmationAt(adjustment: JdAdjustmentTimingInput): number {
   if (!isValidJdTradeDate(adjustment.tradeDate)) return Number.POSITIVE_INFINITY
   const explicitConfirmation = parseJdConfirmationTime(adjustment.confirmTime)
   if (explicitConfirmation !== null) return explicitConfirmation
-  const time = adjustment.tradeTime?.slice(11, 16) || ''
-  const timeSlot = time >= '15:00' ? 'after' : 'before'
-  const date = addCalendarDays(adjustment.tradeDate, 1)
-  return Date.parse(`${date}T${timeSlot === 'before' ? '12:00:00' : '15:00:00'}+08:00`)
+  return getAdjustmentConfirmationAt(adjustment.tradeDate, getTradeTimeSlot(adjustment.tradeTime))
 }
 
 /** A completed JD status wins; old rows without a status become eligible after their confirmation window. */
@@ -430,6 +427,9 @@ export function hasReachedJdConfirmationWindow(adjustment: JdAdjustmentTimingInp
 /** A holding-row tag represents a real order that is still waiting for share confirmation. */
 export function shouldShowJdAdjustmentTag(adjustment: JdAdjustmentTimingInput, now = Date.now()): boolean {
   if (!isValidJdTradeDate(adjustment.tradeDate) || isInactiveJdAdjustment(adjustment) || hasTerminalJdStatus(adjustment)) return false
+  // A real JD pending state remains pending until a later sync returns a
+  // terminal state. Only legacy rows without any state use the time fallback.
+  if ((adjustment.statusCode || '').trim() || (adjustment.status || '').trim()) return true
   return now < getJdAdjustmentConfirmationAt(adjustment)
 }
 
@@ -463,10 +463,26 @@ export function summarizeJdAccount(items: JdHoldingItem[]): JdAccountSummary | u
   }
 }
 
+/** Use JD's first effective inbound record when the holding card omits its start date. */
+export function applyJdFirstInboundDates(items: JdHoldingItem[], adjustments: JdAdjustmentItem[]): JdHoldingItem[] {
+  return items.map((item) => {
+    if (item.acquiredDate) return item
+    const firstInbound = adjustments
+      .filter((adjustment) => !isInactiveJdAdjustment(adjustment)
+        && ((adjustment.type === 'add' && adjustment.code === item.code)
+          || (adjustment.type === 'convert' && adjustment.targetCode === item.code)))
+      .sort((left, right) => adjustmentSortKey(left).localeCompare(adjustmentSortKey(right)))[0]
+    return firstInbound ? { ...item, acquiredDate: firstInbound.tradeDate } : item
+  })
+}
+
 export function normalizeJdImportResult(value: unknown): JdImportResult {
-  const items = normalizeJdHoldingItems(value)
+  const rawItems = normalizeJdHoldingItems(value)
   const closedItems = normalizeJdClosedHoldingItems(value)
   const normalizedAdjustments = normalizeJdAdjustments(value)
+  const items = (value as { firstInboundDatesComplete?: unknown })?.firstInboundDatesComplete === true
+    ? applyJdFirstInboundDates(rawItems, normalizedAdjustments)
+    : rawItems
   const selection = selectVerifiedJdCurrentTimeline(items, normalizedAdjustments)
   const currentCycle = filterJdCurrentPositionCycle(items, normalizedAdjustments)
   // Preserve the decoded account timeline for audit and let each consumer
@@ -505,18 +521,80 @@ export function toJdSyncProgressState(progress: JdSyncProgress): JdSyncProgressS
   return { message: progress.message, percentage }
 }
 
-export function jdImportErrorMessage(error: unknown): string {
-  const message = String((error as { message?: unknown })?.message || '').trim()
-  if (!message) return '京东持仓读取失败，请检查网络后重试'
-  const chineseReason = message.match(/[\u3400-\u9fff][\s\S]*/)?.[0]?.trim()
-  if (chineseReason) return chineseReason
-  if (/[A-Za-z]/.test(message)) {
-    if (/(cookie|login|sign.?in|unauthorized|forbidden|expired)/i.test(message)) {
-      return '京东 Cookie 已过期或无效，请更新后重试'
-    }
-    return '京东持仓读取失败，请检查 Cookie 和网络后重试'
+type JdErrorKind = 'auth' | 'timeout' | 'network' | 'rate_limit' | 'server' | 'json' | 'unknown'
+
+function errorText(error: unknown): string {
+  if (typeof error === 'string') return error.trim()
+  return String((error as { message?: unknown } | null)?.message || '').trim()
+}
+
+function chineseErrorReason(message: string): string {
+  return message.match(/[\u3400-\u9fff][\s\S]*/)?.[0]?.trim() || ''
+}
+
+function errorStatus(error: unknown, message: string): number | null {
+  const value = error as {
+    status?: unknown
+    statusCode?: unknown
+    response?: { status?: unknown }
+  } | null
+  for (const candidate of [value?.status, value?.statusCode, value?.response?.status]) {
+    const status = Number(candidate)
+    if (Number.isInteger(status) && status >= 100 && status <= 599) return status
   }
-  return message
+  const match = /(?:http(?:\s+status)?\s*[:=]?\s*)?\b(401|403|429|5\d\d)\b/i.exec(message)
+  return match ? Number(match[1]) : null
+}
+
+function classifyJdError(error: unknown, message: string): JdErrorKind {
+  const code = String((error as { code?: unknown } | null)?.code || '').trim()
+  const signal = `${code} ${message}`.toLowerCase()
+  const status = errorStatus(error, message)
+
+  if (status === 401 || status === 403
+    || /(?:^|[_\s.-])(?:jd_)?(?:auth(?:entication)?|unauthorized|forbidden|login_required|cookie_(?:expired|invalid))(?:$|[_\s.-])/i.test(code)
+    || /\b(?:unauthorized|forbidden|login required|sign[- ]?in required|authentication required|not authenticated)\b|loginrequiredexception|(?:cookie[^\n]*(?:expired|invalid)|(?:expired|invalid)[^\n]*cookie)/i.test(signal)) {
+    return 'auth'
+  }
+  if (status === 429 || /\b(?:too many requests|rate[ _-]?limit(?:ed|ing)?)\b/i.test(signal)) return 'rate_limit'
+  if ((status !== null && status >= 500) || /\b(?:bad gateway|service unavailable|internal server error)\b/i.test(signal)) return 'server'
+  if (/(?:jsonexception|jsonobject|jsonarray|json[ _-]?parse|unexpected token|not valid json|malformed json|response[ _-]?format)/i.test(signal)) return 'json'
+  if (/(?:sockettimeoutexception|timed?\s*out|timeout|etimedout)/i.test(signal)) return 'timeout'
+  if (/(?:unknownhostexception|unknown host|failed to fetch|network(?: error| request)?|connectexception|connection (?:reset|refused|aborted)|econn\w*|ssl(?:exception|handshake)|certificate|\bdns\b|no route to host|socketexception|ioexception|host (?:is )?unreachable)/i.test(signal)) return 'network'
+  return 'unknown'
+}
+
+export function jdImportErrorMessage(error: unknown): string {
+  const message = errorText(error)
+  const chineseReason = chineseErrorReason(message)
+  if (chineseReason) return chineseReason
+
+  switch (classifyJdError(error, message)) {
+    case 'auth': return '京东认证已失效，请更新 Cookie 后重试'
+    case 'timeout': return '京东持仓读取超时，请检查网络后重试'
+    case 'network': return '京东持仓读取失败，请检查网络后重试'
+    case 'rate_limit': return '京东接口请求过于频繁，请稍后重试'
+    case 'server': return '京东服务暂时不可用，请稍后重试'
+    case 'json': return '京东返回数据格式异常，请稍后重试'
+    default: return '京东持仓读取失败，请稍后重试'
+  }
+}
+
+/** Formats failures after the JD read has completed without blaming its Cookie. */
+export function jdDataSaveErrorMessage(error: unknown, operation = '京东数据保存'): string {
+  const message = errorText(error)
+  const chineseReason = chineseErrorReason(message)
+  if (chineseReason) return chineseReason
+
+  switch (classifyJdError(error, message)) {
+    case 'timeout': return `${operation}超时，请检查网络后重试`
+    case 'network': return `${operation}失败，请检查网络后重试`
+    case 'rate_limit': return `${operation}请求过于频繁，请稍后重试`
+    case 'server': return `${operation}失败，服务暂时不可用，请稍后重试`
+    case 'json': return `${operation}失败，服务返回数据格式异常，请稍后重试`
+    case 'auth': return `${operation}失败，服务认证异常，请稍后重试`
+    default: return `${operation}失败，请稍后重试`
+  }
 }
 
 /** Opens the isolated native JD sign-in flow and returns only normalized fund data. */
@@ -535,9 +613,24 @@ export async function importJdHoldings(options: { onProgress?: (progress: JdSync
 }
 
 /** Sends a user-approved Cookie only to JD's fixed holdings endpoints. */
-export async function importJdHoldingsWithCookie(cookie: string, options: { onProgress?: (progress: JdSyncProgress) => void; background?: boolean } = {}): Promise<JdImportResult> {
+export async function importJdHoldingsWithCookie(cookie: string, options: { onProgress?: (progress: JdSyncProgress) => void; background?: boolean; grid?: boolean } = {}): Promise<JdImportResult> {
   if (Capacitor.getPlatform() !== 'android') {
-    throw new Error('京东 Cookie 读取仅支持 Android App')
+    const normalizedCookie = normalizeJdCookie(cookie)
+    if (!normalizedCookie) throw new Error('Invalid JD Cookie')
+    options.onProgress?.({ stage: 'login', message: 'Connecting to JD' })
+    const response = await fetch('/api/jd/holdings/import', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cookie: normalizedCookie, background: Boolean(options.background), grid: Boolean(options.grid) }),
+      cache: 'no-store'
+    })
+    let payload: unknown = null
+    try { payload = await response.json() } catch { /* handled below */ }
+    if (!response.ok) {
+      const error = new Error(String((payload as { error?: unknown } | null)?.error || `JD import failed (${response.status})`))
+      ;(error as Error & { status?: number }).status = response.status
+      throw error
+    }
+    return normalizeJdImportResult(payload)
   }
   const normalizedCookie = normalizeJdCookie(cookie)
   if (!normalizedCookie) throw new Error('请输入有效的京东 Cookie')
@@ -547,7 +640,8 @@ export async function importJdHoldingsWithCookie(cookie: string, options: { onPr
   try {
     return normalizeJdImportResult(await JdHoldings.importHoldingsWithCookie({
       cookie: normalizedCookie,
-      ...(options.background ? { background: true } : {})
+      ...(options.background ? { background: true } : {}),
+      ...(options.grid ? { grid: true } : {})
     }))
   } finally {
     await listener?.remove()

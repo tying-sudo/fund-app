@@ -21,11 +21,12 @@ import JdImportProgress from '@/components/JdImportProgress.vue'
 import { type FundInfo, type HoldingRecord, type FundShareClass, type FundFeeInfo, type JdHoldingSnapshot, type PendingAdjustment, type SyncedAdjustment } from '@/types/fund'
 
 import { getTodayStr, getValuationComparisonState, isEstimateDateToday, isTradingHours as isBeijingTradingHours, PRECISION, round } from '@/utils/holdingCalculator'
-import { addCalendarDays, getAdjustmentConfirmationAt, getSettlementNavStartDate } from '@/utils/tradingDate'
+import { addCalendarDays, getAdjustmentConfirmationDate, getBeijingDayAndMinutes } from '@/utils/tradingDate'
 import { buildJdHoldingSnapshot, deriveHoldingImportBasis, parseHoldingImportNumber } from '@/utils/holdingImport'
 import { openAlipayFundDetail } from '@/utils/alipayFund'
 import { buildJdFundTradeScheme, openJdFundDetail, openJdFundTrade, type JdFundTradeAction } from '@/utils/jdFund'
-import { getJdAdjustmentTagLabel, getSafeJdClosedHoldingCodes, importJdHoldingsWithCookie, jdImportErrorMessage, shouldShowJdAdjustmentTag, toJdSyncProgressState, type JdClosedHoldingItem, type JdHoldingItem, type JdSyncProgress } from '@/utils/jdHoldings'
+import { getJdAdjustmentTagLabel, getSafeJdClosedHoldingCodes, importJdHoldingsWithCookie, jdDataSaveErrorMessage, jdImportErrorMessage, shouldShowJdAdjustmentTag, toJdSyncProgressState, type JdClosedHoldingItem, type JdHoldingItem, type JdSyncProgress } from '@/utils/jdHoldings'
+import { mergeJdSyncProgress } from '@/utils/jdSyncProgress'
 
 // 集成风控系统和日志模块
 import { getRiskController } from '@/utils/riskControl'
@@ -307,19 +308,23 @@ async function cancelPendingItem(id: string) {
 function openTradeDialog(code: string, name: string) {
   tradeFundCode.value = code
   tradeFundName.value = name
+  const { day, minutes } = getBeijingDayAndMinutes()
+  const defaultTradeTimeSlot: 'before' | 'after' = day >= 1 && day <= 5 && minutes < 15 * 60
+    ? 'before'
+    : 'after'
   
   // 重置表单
   addTradeForm.value = {
     amount: '',
     feeRate: '0.00',
     tradeDate: getTodayStr(),
-    // 默认根据当前时间判断交易时段
-    tradeTimeSlot: isTradingHours.value ? 'before' : 'after'
+    // 京东以 15:00 为唯一切点；开盘前仍属于“15:00前”。
+    tradeTimeSlot: defaultTradeTimeSlot
   }
   reduceTradeForm.value = {
     shares: '',
     tradeDate: getTodayStr(),
-    tradeTimeSlot: isTradingHours.value ? 'before' : 'after'
+    tradeTimeSlot: defaultTradeTimeSlot
   }
   convertTradeForm.value = {
     shares: '',
@@ -327,7 +332,7 @@ function openTradeDialog(code: string, name: string) {
     targetCode: '',
     targetName: '',
     tradeDate: getTodayStr(),
-    tradeTimeSlot: isTradingHours.value ? 'before' : 'after'
+    tradeTimeSlot: defaultTradeTimeSlot
   }
   convertSearchResults.value = []
   
@@ -339,13 +344,13 @@ function openTradeDialog(code: string, name: string) {
 /**
  * 计算交易确认日和收益起始日的核心逻辑
  * 
- * 加减仓统一保留为待确认记录，直到交易日之后的首个官方净值公布。
- * 周末和节假日由净值历史中的下一条真实交易日记录自然顺延。
+ * 加减仓统一保留为待确认记录；13:00 前不结算。
+ * 当日盘中估值证明实际开市后可按京东时点结算，休市日则继续等待。
  * 
  * @returns { confirmDate: 官方净值结算的最早日期 }
  */
 function calcTradeDates(tradeDateStr: string, timeSlot: 'before' | 'after'): { confirmDate: string } {
-  return { confirmDate: getSettlementNavStartDate(tradeDateStr, timeSlot) }
+  return { confirmDate: getAdjustmentConfirmationDate(tradeDateStr, timeSlot) }
 }
 
 /** 生成唯一ID */
@@ -411,7 +416,7 @@ async function confirmAddTrade() {
     await holdingStore.addPendingAdjustment(pending)
 
     closeToast()
-    showToast(`已记录加仓，将按 ${confirmDate} 起的官方净值自动结算`)
+    showToast(`已记录加仓，预计 ${confirmDate} 13:00 起复核结算`)
 
     // 刷新估值
     await holdingStore.refreshEstimates()
@@ -502,7 +507,7 @@ async function confirmReduceTrade() {
     closeToast()
     showToast(isFullSell
       ? `已提交清仓，将按官方净值自动结算`
-      : `已记录减仓，将按 ${confirmDate} 起的官方净值自动结算`)
+      : `已记录减仓，预计 ${confirmDate} 13:00 起复核结算`)
 
     // 刷新估值
     await holdingStore.refreshEstimates()
@@ -592,7 +597,7 @@ async function confirmConvertTrade() {
       createdAt: Date.now()
     })
     closeToast()
-    showToast(`已记录转换，将按 ${confirmDate} 起的官方净值自动结算`)
+    showToast(`已记录转换，预计 ${confirmDate} 13:00 起复核结算`)
     await holdingStore.refreshEstimates()
   } catch (error) {
     closeToast()
@@ -669,11 +674,9 @@ const getComparisonState = (holding: any) => getValuationComparisonState({
 
 /** 获取某基金的待确认调仓标签列表 */
 function getPendingTags(holding: any): { label: string; type: 'add' | 'reduce' | 'convert' }[] {
-  const now = confirmationClock.value
   const list = holdingStore.pendingAdjustments.filter(
     (p: PendingAdjustment) => (p.code === holding.code || (p.type === 'convert' && p.targetCode === holding.code))
       && p.status === 'pending'
-      && now < getAdjustmentConfirmationAt(p.tradeDate, p.timeSlot)
   )
   return list.map((p: PendingAdjustment) => ({
     label: p.type === 'add' ? '调仓·买入' : p.type === 'reduce' ? '调仓·卖出' : '调仓·转换',
@@ -1358,8 +1361,12 @@ const extractedFunds = ref<Array<{
 const jdImportedAdjustments = ref<SyncedAdjustment[]>([])
 const jdSyncProgress = ref({ message: '正在打开京东金融...', percentage: 5 })
 
-function updateJdSyncProgress(progress: JdSyncProgress | { stage: string; message: string; current?: number; total?: number }) {
-  jdSyncProgress.value = toJdSyncProgressState(progress)
+function updateJdSyncProgress(
+  progress: JdSyncProgress | { stage: string; message: string; current?: number; total?: number },
+  reset = false
+) {
+  const next = toJdSyncProgressState(progress)
+  jdSyncProgress.value = mergeJdSyncProgress(jdSyncProgress.value, next, reset)
 }
 
 // [NEW] 手动补全相关状态
@@ -1590,12 +1597,14 @@ function extractFundDataFromAI(result: any): any[] {
 async function importJdHoldings(cookie: string) {
   if (isJdImporting.value) return
   isJdImporting.value = true
-  updateJdSyncProgress({ stage: 'reading_holdings', message: '正在读取京东当前持仓...' })
+  let importPhase: 'reading' | 'saving' = 'reading'
+  updateJdSyncProgress({ stage: 'reading_holdings', message: '正在读取京东当前持仓...' }, true)
   try {
     const result = await importJdHoldingsWithCookie(cookie, {
       background: true,
       onProgress: updateJdSyncProgress
     })
+    importPhase = 'saving'
     const syncedAt = Date.now()
     updateJdSyncProgress({ stage: 'saving', message: '正在写入京东当前持仓...' })
     const importedHoldings = await saveJdCurrentHoldings(result.items, syncedAt)
@@ -1635,7 +1644,7 @@ async function importJdHoldings(cookie: string) {
       importedHoldings.added > 0 ? `新增 ${importedHoldings.added} 只持仓` : '',
       importedHoldings.updated > 0 ? `校准 ${importedHoldings.updated} 只已有持仓` : '',
       closedHoldings.removed > 0 ? `清仓删除 ${closedHoldings.removed} 只基金` : '',
-      `${synced.adjustments} 条近30天交易审计记录`,
+      `${synced.adjustments} 条近3个月交易审计记录`,
       synced.summary && result.summary ? `昨日收益 ${formatMoney(result.summary.yesterdayProfit)}` : '',
       result.tradeWarning || '',
       importedHoldings.failed > 0 ? `${importedHoldings.failed} 只持仓写入失败` : '',
@@ -1648,7 +1657,9 @@ async function importJdHoldings(cookie: string) {
     }
     showToast(`同步完成：${details}`)
   } catch (error: any) {
-    showToast(jdImportErrorMessage(error))
+    showToast(importPhase === 'reading'
+      ? jdImportErrorMessage(error)
+      : jdDataSaveErrorMessage(error, '京东持仓保存'))
   } finally {
     isJdImporting.value = false
   }
@@ -1681,9 +1692,7 @@ async function removeJdClosedHoldings(
 }
 
 function createJdHoldingRecord(item: JdHoldingItem, snapshot: JdHoldingSnapshot): HoldingRecord | null {
-  const buyDate = /^\d{4}-\d{2}-\d{2}$/.test(item.acquiredDate || '')
-    ? item.acquiredDate as string
-    : getTodayStr()
+  const buyDate = /^(\d{4}-\d{2}-\d{2})/.exec(item.acquiredDate || '')?.[1] || ''
   return {
     code: item.code,
     name: item.name,
@@ -2503,10 +2512,10 @@ function closeImportDialog() {
             <div class="trade-time-tip" v-if="addTradeForm.tradeDate && addTradeForm.amount">
               <van-icon name="info-o" size="14" />
               <span v-if="addTradeForm.tradeTimeSlot === 'before'">
-                15:00前提交 → 下一交易日官方净值公布后自动结算
+                15:00前提交 → 当日净值计价，下一交易日13:00复核结算
               </span>
               <span v-else>
-                15:00后提交 → 下一交易日官方净值公布后自动结算
+                15:00后提交 → 下一交易日净值计价，第二交易日13:00复核结算
               </span>
             </div>
           </template>
@@ -2577,10 +2586,10 @@ function closeImportDialog() {
             <div class="trade-time-tip" v-if="reduceTradeForm.tradeDate && reduceTradeForm.shares">
               <van-icon name="info-o" size="14" />
               <span v-if="reduceTradeForm.tradeTimeSlot === 'before'">
-                15:00前提交 → 下一交易日官方净值公布后自动结算
+                15:00前提交 → 当日净值计价，下一交易日13:00复核结算
               </span>
               <span v-else>
-                15:00后提交 → 下一交易日官方净值公布后自动结算
+                15:00后提交 → 下一交易日净值计价，第二交易日13:00复核结算
               </span>
             </div>
           </template>
@@ -2628,7 +2637,7 @@ function closeImportDialog() {
                   <span class="pending-type" :class="item.type">
                     {{ item.type === 'add' ? '加仓' : item.type === 'reduce' ? '减仓' : '转换' }}
                   </span>
-                  <span class="pending-date">净值结算起始日 {{ item.confirmDate }}</span>
+                  <span class="pending-date">最早确认日 {{ calcTradeDates(item.tradeDate, item.timeSlot).confirmDate }} 13:00，休市则顺延</span>
                 </div>
                 <div class="pending-detail">
                   {{ item.timeSlot === 'before' ? '15:00前' : '15:00后' }} |
@@ -2653,7 +2662,7 @@ function closeImportDialog() {
         <div class="synced-adjustments" v-if="currentSyncedAdjustments.length > 0">
           <div class="pending-title synced-title">
             <van-icon name="records-o" />
-            <span>京东已同步调仓（近30天审计 · {{ currentSyncedAdjustments.length }}）</span>
+            <span>京东已同步调仓（近3个月审计 · {{ currentSyncedAdjustments.length }}）</span>
             <span class="pending-tip">仅记录，不修改持仓</span>
           </div>
           <div class="pending-list">

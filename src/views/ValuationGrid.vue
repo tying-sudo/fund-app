@@ -5,8 +5,21 @@ import { useRouter } from 'vue-router'
 import Sortable from 'sortablejs'
 import { useHoldingStore } from '@/stores/holding'
 import { getJdFundLink } from '@/utils/format'
-import { importJdHoldingsWithCookie, jdImportErrorMessage, toJdSyncProgressState, type JdSyncProgress } from '@/utils/jdHoldings'
-import { buildGridJdImportPayload, formatGridJdImportFeedback } from '@/utils/gridJdImport'
+import { importJdHoldingsWithCookie, jdDataSaveErrorMessage, jdImportErrorMessage, toJdSyncProgressState, type JdSyncProgress } from '@/utils/jdHoldings'
+import { mergeJdSyncProgress } from '@/utils/jdSyncProgress'
+import {
+  buildGridJdImportPayload,
+  formatGridJdImportFeedback,
+  getGridJdImportCandidates,
+  selectGridJdImportPayload,
+  type GridJdImportPayload
+} from '@/utils/gridJdImport'
+import {
+  getGridJdPendingRefreshEntries,
+  mergeGridJdPendingRefreshEntries,
+  reconcileGridJdPendingRefreshEntries,
+  type GridJdPendingRefreshEntry
+} from '@/utils/gridJdPendingRefresh'
 import { fetchFundEstimatesBatch, fetchFundSnapshotEstimates } from '@/api/fundFast'
 import JdCookieImportDialog from '@/components/JdCookieImportDialog.vue'
 import JdImportProgress from '@/components/JdImportProgress.vue'
@@ -110,6 +123,13 @@ const jdImporting = ref(false)
 const showJdCookieDialog = ref(false)
 const jdSyncProgress = ref({ message: '正在读取京东当前持仓...', percentage: 8 })
 const jdImportFeedback = ref<{ message: string; hasWarning: boolean } | null>(null)
+const jdGridImportSelectionOpen = ref(false)
+const selectedJdGridImportCodes = ref<string[]>([])
+const pendingJdGridImport = ref<{
+  payload: GridJdImportPayload
+  tradeWarning?: string
+  tradeDiagnostic?: string
+} | null>(null)
 const tradeImageInput = ref<HTMLInputElement | null>(null)
 const tradeImportOpen = ref(false)
 const tradeImportRecognizing = ref(false)
@@ -185,6 +205,13 @@ const cloudSnapshotIntervalMs = 60_000
 let cloudEstimateTimer: ReturnType<typeof window.setInterval> | undefined
 let cloudEstimateInFlight: Promise<void> | undefined
 const cloudEstimateIntervalMs = 15_000
+let jdPendingRefreshTimer: ReturnType<typeof window.setInterval> | undefined
+let jdPendingRefreshInFlight: Promise<void> | undefined
+const jdPendingRefreshStorageKey = 'fund-app:grid-jd-pending-refresh:v1'
+const jdPendingRefreshRetryMs = 30 * 60 * 1000
+// Keep the approved Cookie only for this mounted page. Pending entries may
+// survive a restart, but a new Cookie must then be provided explicitly.
+let jdPendingRefreshCookie = ''
 
 const valuationCacheKey = 'fund-app:native-valuation:v2'
 const legacyValuationCacheKey = 'fund-app:native-valuation:v1'
@@ -240,9 +267,17 @@ watch(() => state.value.sectors.length, (length) => {
   }
 })
 const strategyRows = computed(() => {
-  const rows = signals.value.map((signal) => {
-    const code = signal.fund_code.split('__')[0]
-    return { signal, code, position: positions.value[signal.fund_code] || positions.value[code] }
+  const signalsByKey = new Map(signals.value.map((signal) => [signal.fund_code, signal]))
+  const keys = [...new Set([...Object.keys(positions.value), ...signalsByKey.keys()])]
+  const rows = keys.map((fundKey) => {
+    const code = fundKey.split('__')[0]
+    const signal = signalsByKey.get(fundKey) || {
+      fund_code: fundKey,
+      action: 'hold',
+      signal_name: '持仓已同步',
+      reason: '策略信号将在下一次刷新时生成'
+    }
+    return { signal, code, position: positions.value[fundKey] || positions.value[code] }
   })
   const order = mergeStrategyOrder(strategyOrder.value, rows.map(row => row.signal.fund_code))
   return sortByStrategyOrder(rows, order, row => row.signal.fund_code)
@@ -252,7 +287,11 @@ const budgetPercent = computed(() => {
   const invested = Number(portfolioBudget.value.invested) || 0
   return max > 0 ? Math.min(100, Math.round(invested / max * 100)) : 0
 })
-const budgetAvailable = computed(() => Math.max(0, (Number(portfolioBudget.value.max_invest) || 0) - (Number(portfolioBudget.value.invested) || 0)))
+const budgetAvailable = computed(() => {
+  const serverBudget = Number(portfolioBudget.value.daily_budget)
+  if (Number.isFinite(serverBudget)) return Math.max(0, serverBudget)
+  return Math.max(0, (Number(portfolioBudget.value.max_invest) || 0) - (Number(portfolioBudget.value.invested) || 0))
+})
 
 function valueFor(code: string): GridValuation {
   return valuations.value[code] || { fund_code: code }
@@ -1089,32 +1128,6 @@ function sectorCloudTone(change: number | null) {
   return change > 0 ? 'gain' : 'loss'
 }
 
-function jdTransactions(position?: GridPosition) {
-  return [...(position?.jd_transactions || [])].sort((left, right) =>
-    (right.trade_time || right.trade_date || '').localeCompare(left.trade_time || left.trade_date || '')
-  )
-}
-
-function jdTradeTypeLabel(type: string) {
-  return {
-    buy: '买入',
-    sell: '卖出',
-    convert_in: '转换入',
-    convert_out: '转换出'
-  }[type] || type
-}
-
-function jdTradeStateLabel(state?: string, orderStatus?: string) {
-  if (state === 'confirmed') return orderStatus || '已确认'
-  if (state === 'pending') return orderStatus || '待确认'
-  return orderStatus || state || '--'
-}
-
-function jdTradeCounterparty(item: NonNullable<GridPosition['jd_transactions']>[number]) {
-  if (!item.counterparty_code && !item.counterparty_name) return '--'
-  return [item.counterparty_name, item.counterparty_code].filter(Boolean).join(' ')
-}
-
 function strategyParams(signal?: GridSignal | null) {
   return signal?.market_analysis?.strategy_params || {}
 }
@@ -1200,36 +1213,195 @@ function openJdGridCookieImport() {
   if (!jdImporting.value) showJdCookieDialog.value = true
 }
 
-function updateJdGridSyncProgress(progress: JdSyncProgress) {
-  jdSyncProgress.value = toJdSyncProgressState(progress)
+function updateJdGridSyncProgress(progress: JdSyncProgress, reset = false) {
+  const next = toJdSyncProgressState(progress)
+  jdSyncProgress.value = mergeJdSyncProgress(jdSyncProgress.value, next, reset)
+}
+
+const jdGridImportCandidates = computed(() => pendingJdGridImport.value
+  ? getGridJdImportCandidates(pendingJdGridImport.value.payload)
+  : [])
+const selectedJdGridBatchCount = computed(() => jdGridImportCandidates.value
+  .filter((item) => selectedJdGridImportCodes.value.includes(item.code))
+  .reduce((total, item) => total + item.candidateBatchCount, 0))
+const totalJdGridBatchCount = computed(() => jdGridImportCandidates.value
+  .reduce((total, item) => total + item.batches.length, 0))
+const isAllJdGridImportCandidatesSelected = computed(() => jdGridImportCandidates.value.length > 0
+  && jdGridImportCandidates.value.every((item) => selectedJdGridImportCodes.value.includes(item.code)))
+
+function toggleAllJdGridImportCandidates() {
+  selectedJdGridImportCodes.value = isAllJdGridImportCandidatesSelected.value
+    ? []
+    : jdGridImportCandidates.value.map((item) => item.code)
+}
+
+function cancelJdGridImportSelection() {
+  jdGridImportSelectionOpen.value = false
+  pendingJdGridImport.value = null
+  selectedJdGridImportCodes.value = []
+}
+
+function readJdPendingRefreshEntries(): GridJdPendingRefreshEntry[] {
+  try {
+    const value = JSON.parse(localStorage.getItem(jdPendingRefreshStorageKey) || '[]')
+    if (!Array.isArray(value)) return []
+    return value.filter((item): item is GridJdPendingRefreshEntry =>
+      typeof item?.id === 'string'
+      && /^\d{6}$/.test(item?.code || '')
+      && /^\d{4}-\d{2}-\d{2}$/.test(item?.tradeDate || '')
+      && Number.isFinite(item?.eligibleAt)
+    )
+  } catch {
+    return []
+  }
+}
+
+function writeJdPendingRefreshEntries(entries: GridJdPendingRefreshEntry[]) {
+  try { localStorage.setItem(jdPendingRefreshStorageKey, JSON.stringify(entries)) } catch { /* Manual refresh remains available. */ }
+}
+
+function rememberJdPendingGridRefresh(payload: GridJdImportPayload, selectedCodes: Iterable<string>) {
+  const incoming = getGridJdPendingRefreshEntries(payload, selectedCodes)
+  if (!incoming.length) return
+  writeJdPendingRefreshEntries(mergeGridJdPendingRefreshEntries(readJdPendingRefreshEntries(), incoming))
+}
+
+async function refreshDueJdPendingGridBatches() {
+  if (isValuation.value || jdImporting.value || document.hidden || jdPendingRefreshInFlight) return jdPendingRefreshInFlight
+  const now = Date.now()
+  const stored = readJdPendingRefreshEntries()
+  const due = stored.filter((item) => now >= item.eligibleAt && (!item.lastAttemptAt || now - item.lastAttemptAt >= jdPendingRefreshRetryMs))
+  if (!due.length) return
+  const cookie = jdPendingRefreshCookie
+  if (!cookie.includes('=')) return
+
+  const dueKeys = new Set(due.map((item) => `${item.id}:${item.code}`))
+  const dueCodes = [...new Set(due.map((item) => item.code))]
+  const attempted = stored.map((item) => dueKeys.has(`${item.id}:${item.code}`) ? { ...item, lastAttemptAt: now } : item)
+  writeJdPendingRefreshEntries(attempted)
+  jdImporting.value = true
+  jdImportFeedback.value = null
+  updateJdGridSyncProgress({ stage: 'reading_holdings', message: '正在复核次交易日待确认买入...' }, true)
+  const task = (async () => {
+    try {
+      const jdResult = await importJdHoldingsWithCookie(cookie, {
+        background: true,
+        grid: true,
+        onProgress: updateJdGridSyncProgress
+      })
+      const fullPayload = buildGridJdImportPayload(jdResult.items, jdResult.timelineAdjustments, new Date(), {
+        resolveCurrentCyclesOnServer: true
+      })
+      const payload = selectGridJdImportPayload(fullPayload, dueCodes)
+      if (!payload.current_holding_codes.length) {
+        writeJdPendingRefreshEntries(reconcileGridJdPendingRefreshEntries(
+          attempted, due, jdResult.timelineAdjustments, []
+        ))
+        return
+      }
+      updateJdGridSyncProgress({ stage: 'saving', message: '正在更新已确认金额与份额...' })
+      const imported = await importGridJdTransactions(payload)
+      const verified = new Set(imported.verified_cycle_codes || [])
+      const remaining = reconcileGridJdPendingRefreshEntries(
+        attempted, due, jdResult.timelineAdjustments, verified
+      )
+      rememberJdPendingGridRefresh(fullPayload, dueCodes)
+      const rediscovered = readJdPendingRefreshEntries()
+      const remainingKeys = new Set(remaining.map((item) => `${item.id}:${item.code}`))
+      writeJdPendingRefreshEntries(rediscovered.filter((item) => !dueKeys.has(`${item.id}:${item.code}`) || remainingKeys.has(`${item.id}:${item.code}`)))
+      await refreshStrategy(true)
+      if (verified.size) showToast(`已更新 ${verified.size} 只基金的确认金额与份额`)
+    } catch (error) {
+      console.error('[京东网格] 待确认买入自动复核失败:', error)
+    } finally {
+      jdImporting.value = false
+      jdPendingRefreshInFlight = undefined
+    }
+  })()
+  jdPendingRefreshInFlight = task
+  return task
+}
+
+function startJdPendingRefreshTimer() {
+  if (isValuation.value || jdPendingRefreshTimer) return
+  void refreshDueJdPendingGridBatches()
+  jdPendingRefreshTimer = window.setInterval(() => void refreshDueJdPendingGridBatches(), 60_000)
+}
+
+function stopJdPendingRefreshTimer() {
+  if (jdPendingRefreshTimer) window.clearInterval(jdPendingRefreshTimer)
+  jdPendingRefreshTimer = undefined
 }
 
 async function importJdGridTransactions(cookie: string) {
   if (jdImporting.value) return
+  jdPendingRefreshCookie = cookie
   jdImporting.value = true
   jdImportFeedback.value = null
-  updateJdGridSyncProgress({ stage: 'reading_holdings', message: '正在读取京东当前持仓...' })
+  updateJdGridSyncProgress({ stage: 'reading_holdings', message: '正在读取京东当前持仓...' }, true)
   try {
     const jdResult = await importJdHoldingsWithCookie(cookie, {
       background: true,
+      grid: true,
       onProgress: updateJdGridSyncProgress
     })
     // The audit list may intentionally retain incomplete JD rows for the
     // holding page. The grid must certify against the full Cookie timeline.
-    const payload = buildGridJdImportPayload(jdResult.items, jdResult.timelineAdjustments)
+    const payload = buildGridJdImportPayload(jdResult.items, jdResult.timelineAdjustments, new Date(), {
+      resolveCurrentCyclesOnServer: true
+    })
     if (!payload.current_holding_codes.length) {
-      showToast('京东账户暂无当前持仓基金')
+      await showConfirmDialog({
+        title: '同步京东空仓',
+        message: '京东账户当前没有基金持仓。确认后将移除仅由京东同步创建的网格持仓，手工创建的网格持仓不会受影响。'
+      })
+      updateJdGridSyncProgress({ stage: 'saving', message: '正在同步京东空仓...' })
+      await importGridJdTransactions(payload)
+      await refreshStrategy(true)
+      updateJdGridSyncProgress({ stage: 'completed', message: '京东空仓已同步' })
+      showToast('京东空仓已同步')
       return
     }
-    updateJdGridSyncProgress({ stage: 'saving', message: '正在写入京东网格持仓与交易记录...' })
+    pendingJdGridImport.value = {
+      payload,
+      tradeWarning: jdResult.tradeWarning,
+      tradeDiagnostic: jdResult.tradeDiagnostic
+    }
+    selectedJdGridImportCodes.value = getGridJdImportCandidates(payload).map((item) => item.code)
+    jdGridImportSelectionOpen.value = true
+    updateJdGridSyncProgress({ stage: 'normalizing', message: '已读取交易批次，请选择后导入' })
+  } catch (error) {
+    if (error === 'cancel' || (error instanceof Error && error.message === 'cancel')) return
+    showToast(jdImportErrorMessage(error))
+  } finally {
+    jdImporting.value = false
+  }
+}
+
+async function confirmJdGridImportSelection() {
+  const pending = pendingJdGridImport.value
+  if (!pending || jdImporting.value) return
+  const payload = selectGridJdImportPayload(pending.payload, selectedJdGridImportCodes.value)
+  if (!payload.current_holding_codes.length) {
+    showToast('请至少选择一只基金')
+    return
+  }
+  jdImporting.value = true
+  jdGridImportSelectionOpen.value = false
+  jdImportFeedback.value = null
+  updateJdGridSyncProgress({ stage: 'saving', message: '正在写入所选京东网格批次...' }, true)
+  let operation = '京东网格批次写入'
+  try {
     const imported = await importGridJdTransactions(payload)
+    rememberJdPendingGridRefresh(payload, selectedJdGridImportCodes.value)
+    operation = '低频网格刷新'
     updateJdGridSyncProgress({ stage: 'refreshing', message: '正在刷新低频网格策略...' })
     await refreshStrategy(true)
     const feedback = formatGridJdImportFeedback(imported, {
-      verifiedCycles: payload.replace_transaction_codes.length,
+      verifiedCycles: imported.verified_cycle_codes?.length ?? payload.replace_transaction_codes.length,
       snapshotFunds: payload.current_holdings.length,
-      tradeWarning: jdResult.tradeWarning,
-      tradeDiagnostic: jdResult.tradeDiagnostic
+      tradeWarning: pending.tradeWarning,
+      tradeDiagnostic: pending.tradeDiagnostic
     })
     jdImportFeedback.value = feedback
     updateJdGridSyncProgress({ stage: 'completed', message: '网格同步完成' })
@@ -1237,9 +1409,11 @@ async function importJdGridTransactions(cookie: string) {
     showToast({ message: feedback.message, duration: feedback.hasWarning ? 6000 : 3000 })
     if (feedback.hasChanges) positionEditorOpen.value = false
   } catch (error) {
-    showToast(jdImportErrorMessage(error))
+    showToast(jdDataSaveErrorMessage(error, operation))
   } finally {
     jdImporting.value = false
+    pendingJdGridImport.value = null
+    selectedJdGridImportCodes.value = []
   }
 }
 
@@ -1944,11 +2118,13 @@ watch(() => props.mode, async (mode) => {
   activePane.value = mode
   hasLoaded.value = false
   stopRefreshStreams()
+  stopJdPendingRefreshTimer()
   destroyStrategySortable()
   startLiveEstimateStream()
   await loadPage()
   await setupStrategySortable()
   startRefreshStream()
+  startJdPendingRefreshTimer()
 })
 watch(activeSectorIndex, () => {
   if (!isValuation.value || !hasLoaded.value) return
@@ -1960,19 +2136,23 @@ onMounted(async () => {
   await Promise.all([holdingStore.initHoldings(), loadPage()])
   await setupStrategySortable()
   startRefreshStream()
+  startJdPendingRefreshTimer()
 })
 onActivated(() => {
   startLiveEstimateStream()
   if (!hasLoaded.value) void loadPage()
   void setupStrategySortable()
   startRefreshStream()
+  startJdPendingRefreshTimer()
 })
 onDeactivated(() => {
   stopRefreshStreams()
+  stopJdPendingRefreshTimer()
   destroyStrategySortable()
 })
 onBeforeUnmount(() => {
   stopRefreshStreams()
+  stopJdPendingRefreshTimer()
   destroyStrategySortable()
 })
 </script>
@@ -1981,6 +2161,51 @@ onBeforeUnmount(() => {
   <main class="grid-native-page workspace-page" :class="{ 'strategy-source-page': !isValuation }">
     <JdCookieImportDialog v-model:show="showJdCookieDialog" title="京东 Cookie 读取" confirm-text="读取并导入网格" @confirm="importJdGridTransactions" />
     <JdImportProgress :show="jdImporting" title="京东网格导入" :message="jdSyncProgress.message" :percentage="jdSyncProgress.percentage" />
+    <van-popup v-model:show="jdGridImportSelectionOpen" position="bottom" round :style="{ maxHeight: '82vh' }">
+      <section class="native-dialog jd-grid-import-selection" aria-label="选择京东网格导入批次">
+        <div class="dialog-title">
+          <span>确认导入批次</span>
+          <van-icon name="cross" @click="cancelJdGridImportSelection" />
+        </div>
+        <div class="jd-grid-import-selection-summary">
+          <span>已提取 {{ jdGridImportCandidates.length }} 只基金 · {{ totalJdGridBatchCount }} 个批次</span>
+          <button type="button" @click="toggleAllJdGridImportCandidates">{{ isAllJdGridImportCandidatesSelected ? '取消全选' : '全选' }}</button>
+        </div>
+        <div class="jd-grid-import-selection-list">
+          <section v-for="item in jdGridImportCandidates" :key="item.code" class="jd-grid-import-selection-group" :class="{ 'is-unselected': !selectedJdGridImportCodes.includes(item.code) }">
+            <label class="jd-grid-import-selection-row">
+              <input v-model="selectedJdGridImportCodes" type="checkbox" :value="item.code">
+              <span class="jd-grid-import-selection-main">
+                <b>{{ item.name }}</b><small>{{ item.code }}</small>
+              </span>
+              <span class="jd-grid-import-selection-count">
+                <b>{{ item.candidateBatchCount }}</b><small>可导入批次</small>
+                <em v-if="item.pendingTransactionCount">待确认 {{ item.pendingTransactionCount }} 笔</em>
+                <em v-else>{{ item.transactionCount }} 笔交易</em>
+              </span>
+            </label>
+            <div class="jd-grid-import-batches">
+              <article v-for="(batch, batchIndex) in item.batches" :key="batch.id" class="jd-grid-import-batch" :class="{ 'is-pending': batch.pending, 'is-snapshot': batch.type === 'snapshot' }">
+                <span class="jd-grid-import-batch-index">{{ batchIndex + 1 }}</span>
+                <span class="jd-grid-import-batch-main">
+                  <b>{{ batch.type === 'convert_in' ? '转换转入' : batch.type === 'snapshot' ? '当前持仓基线' : '买入' }}</b>
+                  <small>{{ batch.tradeDate || (batch.type === 'snapshot' ? '京东未返回真实首购日期' : '日期待补充') }}{{ batch.tradeTime ? ` ${batch.tradeTime.split(' ').at(-1)}` : '' }}</small>
+                </span>
+                <span class="jd-grid-import-batch-value">
+                  <b>{{ batch.amount ? `¥${batch.amount}` : '金额待解析' }}</b>
+                  <small>{{ batch.shares ? `${batch.shares} 份` : '份额由服务端确认' }}</small>
+                </span>
+                <em>{{ batch.pending ? '待确认' : batch.type === 'snapshot' ? '基线' : '已确认' }}</em>
+              </article>
+            </div>
+          </section>
+        </div>
+        <p class="form-hint">读取京东完整交易历史并逐批次展示；勾选以基金为单位，服务端只导入与当前持仓份额吻合的完整周期。未返回真实首购日期的快照仅供对账，不会伪造批次。待确认买入先保留记录，15:00前第1个交易日、15:00后第2个交易日13:00后自动复核金额与份额。</p>
+        <button class="command-button full" type="button" :disabled="jdImporting || !selectedJdGridImportCodes.length" @click="confirmJdGridImportSelection">
+          {{ jdImporting ? '导入中...' : `导入所选 ${selectedJdGridImportCodes.length} 只基金 · ${selectedJdGridBatchCount} 个候选批次` }}
+        </button>
+      </section>
+    </van-popup>
     <input ref="tradeImageInput" class="visually-hidden" type="file" accept="image/png,image/jpeg,image/webp" multiple @change="handleTradeImages">
     <van-pull-refresh v-model="pullRefreshing" class="grid-pull-refresh" @refresh="onPullRefresh">
       <header class="grid-header workspace-header">
@@ -2008,7 +2233,7 @@ onBeforeUnmount(() => {
 
       <section class="workspace-overview" aria-label="估值与策略概览">
         <div><span>当前视图</span><strong>{{ isValuation ? '实时估值' : '低频网格' }}</strong></div>
-        <div><span>跟踪基金</span><strong>{{ isValuation ? visibleValuationCodes.length : strategyRows.length }}</strong></div>
+        <div><span>跟踪基金</span><strong>{{ isValuation ? cloudValuationCodes.length : Object.keys(positions).length }}</strong></div>
         <div><span>数据节奏</span><strong>{{ isValuation ? '1 秒' : '20 秒' }}</strong></div>
         <div v-if="!isValuation && portfolioBudget.max_invest"><span>可用预算</span><strong>{{ formatMoney(budgetAvailable, 0) }}</strong></div>
       </section>
@@ -2223,6 +2448,7 @@ onBeforeUnmount(() => {
             <button class="summary-parameter" type="button" @click="openMaxPositionEditor(row.signal.fund_code, row.position)">上限 <b>¥{{ row.position?.max_position || 5000 }}</b></button>
             <button class="summary-parameter" type="button" @click="openFeeScheduleEditor(row.signal.fund_code, row.position)">费率 <b>{{ formatFeeSchedule(row.position.fee_schedule).replaceAll(',', ' / ') }}</b></button>
           </div>
+          <div v-else-if="row.position?.jd_baseline_missing_date" class="watch-summary">京东当前持仓基线已保存，但京东未提供真实建仓日期；不会伪造批次或开放卖出。金额 {{ formatMoney(row.position.jd_snapshot?.amount) }}，份额 {{ Number(row.position.jd_snapshot?.shares || 0).toFixed(2) }}</div>
           <div v-else-if="row.position" class="watch-summary">空仓观察：{{ row.position.watch_note || row.position.note || '策略引擎正在监控建仓时机' }}，<button class="watch-parameter" type="button" @click="openMaxPositionEditor(row.signal.fund_code, row.position)">上限 {{ formatMoney(row.position.max_position || 5000, 0) }}</button></div>
 
           <div class="signal-actions position-actions">
@@ -2230,7 +2456,7 @@ onBeforeUnmount(() => {
             <button v-if="holdingBatchCount(row.position)" class="action-button sell" type="button" @click="openSellEditor(row.signal.fund_code, row.position, row.signal.sell_shares)"><van-icon name="cash-back-record" /> 买入卖出</button>
             <button class="action-button danger" type="button" @click="deletePosition(row.signal.fund_code)"><van-icon name="delete-o" /> 移除</button>
           </div>
-          <div v-if="positionBatches(row.position).length || sellRecords(row.position).length" class="position-table-scroll">
+          <div v-if="positionBatches(row.position).length || sellRecords(row.position).length || row.position?.jd_baseline_missing_date" class="position-table-scroll">
             <table class="position-table">
               <thead><tr><th>批次</th><th>日期</th><th>金额</th><th>净值</th><th>份额</th><th>备注</th><th>操作</th></tr></thead>
               <tbody v-if="positionBatches(row.position).length">
@@ -2241,6 +2467,10 @@ onBeforeUnmount(() => {
                   <td><button class="table-action sell" type="button" @click="openBatchSell(row.signal.fund_code, batch)">卖</button><button class="table-action danger" type="button" @click="deleteBatch(row.signal.fund_code, batch.id)">×</button></td>
                 </tr>
               </tbody>
+              <tbody v-else-if="row.position?.jd_baseline_missing_date">
+                <tr class="sold-label"><td colspan="7">京东当前持仓基线</td></tr>
+                <tr><td>JD 快照</td><td>建仓日期未知</td><td>{{ formatMoney(row.position.jd_snapshot?.amount) }}</td><td>{{ Number(row.position.jd_snapshot?.nav || 0).toFixed(4) }}</td><td>{{ Number(row.position.jd_snapshot?.shares || 0).toFixed(2) }}</td><td>仅作持仓对账，待京东提供真实建仓日期</td><td>不可卖出</td></tr>
+              </tbody>
               <tbody v-if="sellRecords(row.position).length">
                 <tr class="sold-label"><td colspan="8">卖出记录</td></tr>
                 <tr class="sold-table-heading"><th>来源批次</th><th>卖出日</th><th>买入净值</th><th>卖出净值</th><th>份额</th><th>持有天数</th><th>盈亏金额</th><th>收益率</th></tr>
@@ -2250,22 +2480,6 @@ onBeforeUnmount(() => {
                   <td>{{ Number(record.sell_shares || 0).toFixed(2) }}</td><td>{{ record.hold_days }} 天</td>
                   <td><b v-if="Number.isFinite(record.profit)" :class="changeClass(record.profit)">{{ formatMoney(record.profit) }}</b><span v-else>待确认</span></td>
                   <td><b :class="changeClass(record.profit_pct)">{{ formatPercent(record.profit_pct) }}</b><button class="table-action danger" type="button" @click="deleteSellRecord(row.signal.fund_code, record.id)">×</button></td>
-                </tr>
-              </tbody>
-            </table>
-          </div>
-          <div v-if="jdTransactions(row.position).length" class="position-table-scroll jd-transaction-scroll">
-            <table class="position-table jd-transaction-table">
-              <thead><tr><th>京东交易批次</th><th>交易时间</th><th>金额</th><th>份额</th><th>净值</th><th>状态</th><th>关联基金</th></tr></thead>
-              <tbody>
-                <tr v-for="item in jdTransactions(row.position)" :key="item.id" :class="['jd-transaction-row', `state-${item.state || 'unknown'}`]">
-                  <td><b>{{ jdTradeTypeLabel(item.type) }}</b></td>
-                  <td>{{ item.trade_time || item.trade_date }}</td>
-                  <td>{{ Number.isFinite(item.amount) ? formatMoney(item.amount) : '--' }}</td>
-                  <td>{{ Number.isFinite(item.shares) ? Number(item.shares).toFixed(2) : '--' }}</td>
-                  <td>{{ Number.isFinite(item.nav) ? Number(item.nav).toFixed(4) : '--' }}</td>
-                  <td><span class="jd-trade-state">{{ jdTradeStateLabel(item.state, item.order_status) }}</span></td>
-                  <td>{{ jdTradeCounterparty(item) }}</td>
                 </tr>
               </tbody>
             </table>
@@ -2828,5 +3042,42 @@ onBeforeUnmount(() => {
   .workspace-tabs button { height: 30px; font-size: 11px; }
   .workspace-overview { margin: 8px 10px 0; }
   .workspace-overview > div { min-height: 52px; padding: 7px 9px; }
+}
+
+.jd-grid-import-selection { display: flex; flex-direction: column; width: min(100%, 680px); max-height: 82vh; padding-bottom: calc(14px + env(safe-area-inset-bottom, 0px)); }
+.jd-grid-import-selection-summary { display: flex; align-items: center; justify-content: space-between; gap: 10px; padding: 0 0 9px; color: var(--text-secondary); font-size: 12px; }
+.jd-grid-import-selection-summary button { min-height: 28px; padding: 0 9px; border: 1px solid var(--border-color); border-radius: 4px; color: var(--color-primary); background: var(--bg-secondary); font: inherit; font-size: 11px; cursor: pointer; }
+.jd-grid-import-selection-list { display: grid; min-height: 0; max-height: min(54vh, 520px); overflow-y: auto; border-top: 1px solid var(--border-color); border-bottom: 1px solid var(--border-color); }
+.jd-grid-import-selection-group { display: grid; border-bottom: 1px solid var(--border-color); transition: opacity .15s ease; }
+.jd-grid-import-selection-group:last-child { border-bottom: 0; }
+.jd-grid-import-selection-group.is-unselected { opacity: .48; }
+.jd-grid-import-selection-row { display: grid; grid-template-columns: 20px minmax(0, 1fr) auto; align-items: center; gap: 8px; min-height: 58px; padding: 7px 2px; border-bottom: 1px solid var(--border-color); cursor: pointer; }
+.jd-grid-import-selection-row input { width: 16px; height: 16px; margin: 0; accent-color: var(--color-primary); }
+.jd-grid-import-selection-main { display: grid; min-width: 0; gap: 2px; }
+.jd-grid-import-selection-main b, .jd-grid-import-selection-main small { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.jd-grid-import-selection-main b { color: var(--text-primary); font-size: 13px; line-height: 17px; }
+.jd-grid-import-selection-main small { color: var(--text-secondary); font-size: 10px; font-variant-numeric: tabular-nums; }
+.jd-grid-import-selection-count { display: grid; justify-items: end; gap: 1px; color: var(--text-secondary); font-size: 10px; line-height: 14px; text-align: right; }
+.jd-grid-import-selection-count b { color: var(--color-primary); font-size: 15px; font-variant-numeric: tabular-nums; }
+.jd-grid-import-selection-count small { color: var(--text-secondary); font-size: 10px; }
+.jd-grid-import-selection-count em { color: #b45309; font-size: 10px; font-style: normal; }
+.jd-grid-import-batches { display: grid; gap: 5px; padding: 7px 2px 9px 28px; background: color-mix(in srgb, var(--bg-secondary) 62%, transparent); }
+.jd-grid-import-batch { display: grid; grid-template-columns: 20px minmax(92px, 1fr) minmax(100px, auto) 42px; align-items: center; gap: 6px; min-height: 42px; padding: 5px 7px; border: 1px solid var(--border-color); border-radius: 5px; background: var(--bg-primary); }
+.jd-grid-import-batch-index { display: grid; place-items: center; width: 18px; height: 18px; border-radius: 50%; color: var(--color-primary); background: color-mix(in srgb, var(--color-primary) 12%, transparent); font-size: 10px; font-variant-numeric: tabular-nums; }
+.jd-grid-import-batch-main, .jd-grid-import-batch-value { display: grid; min-width: 0; gap: 1px; }
+.jd-grid-import-batch-main b, .jd-grid-import-batch-value b { overflow: hidden; color: var(--text-primary); font-size: 11px; text-overflow: ellipsis; white-space: nowrap; }
+.jd-grid-import-batch-main small, .jd-grid-import-batch-value small { overflow: hidden; color: var(--text-secondary); font-size: 9px; text-overflow: ellipsis; white-space: nowrap; }
+.jd-grid-import-batch-value { justify-items: end; text-align: right; }
+.jd-grid-import-batch > em { justify-self: end; padding: 2px 4px; border-radius: 3px; color: #047857; background: rgba(16, 185, 129, .1); font-size: 9px; font-style: normal; white-space: nowrap; }
+.jd-grid-import-batch.is-pending > em { color: #b45309; background: rgba(245, 158, 11, .12); }
+.jd-grid-import-batch.is-snapshot > em { color: var(--text-secondary); background: var(--bg-secondary); }
+.jd-grid-import-selection .form-hint { margin: 9px 0 0; }
+
+@media (max-width: 360px) {
+  .jd-grid-import-selection-row { grid-template-columns: 18px minmax(0, 1fr) 74px; gap: 6px; }
+  .jd-grid-import-selection-main b { font-size: 12px; }
+  .jd-grid-import-batches { padding-left: 24px; }
+  .jd-grid-import-batch { grid-template-columns: 18px minmax(72px, 1fr) minmax(82px, auto); }
+  .jd-grid-import-batch > em { display: none; }
 }
 </style>

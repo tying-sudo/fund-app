@@ -1,7 +1,7 @@
 {
   "name": "fund-app",
   "private": true,
-  "version": "1.0.136",
+  "version": "1.0.144",
   "type": "module",
   "scripts": {
     "dev": "vite",
@@ -11,7 +11,9 @@
     "test:holding": "node --experimental-strip-types scripts/verify-holding-settlement.mjs",
     "test:grid-trade-import": "node --experimental-strip-types --test src/utils/gridTradeImport.test.ts",
     "test:grid-jd-import": "node --experimental-strip-types --test src/utils/gridJdImport.test.ts",
+    "test:grid-jd-pending-refresh": "node --experimental-strip-types --test src/utils/gridJdPendingRefresh.test.ts",
     "test:jd-holdings": "node --experimental-strip-types --test src/utils/jdHoldings.test.ts",
+    "test:jd-sync-progress": "node --experimental-strip-types --test src/utils/jdSyncProgress.test.ts",
     "test:grid-strategy-order": "node --experimental-strip-types --test src/utils/gridStrategyOrder.test.ts",
     "preview": "vite preview",
     "update-funds": "node scripts/fetch-fund-list.mjs",

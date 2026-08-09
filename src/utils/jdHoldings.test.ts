@@ -11,6 +11,7 @@ import {
   hasReachedJdConfirmationWindow,
   isInactiveJdAdjustment,
   isValidJdTradeDate,
+  jdDataSaveErrorMessage,
   jdImportErrorMessage,
   normalizeJdCookie,
   normalizeJdClosedHoldingItems,
@@ -21,15 +22,22 @@ import {
   toJdSyncProgressState
 } from './jdHoldings.ts'
 import { buildJdHoldingSnapshot, deriveJdHoldingImportBasis } from './holdingImport.ts'
-import { getSettlementNavStartDate } from './tradingDate.ts'
+import { findAdjustmentSettlementNav, getAdjustmentConfirmationDate, getSettlementNavStartDate } from './tradingDate.ts'
 
-test('Android capture follows JD ten-year pagination instead of a 30-day window', () => {
+test('Android grid capture uses the captured newna endpoint and retains historical buys', () => {
   const source = readFileSync(new URL('../../android/app/src/main/java/com/fundapp/realtime/JdHoldingsPlugin.java', import.meta.url), 'utf8')
-  assert.match(source, /TRADE_HISTORY_YEARS\s*=\s*10/)
   assert.match(source, /ACCOUNT_TRADE_TIMEOUT_SECONDS\s*=\s*120/)
   assert.match(source, /ACCOUNT_TRADE_FIRST_PAGE_TIMEOUT_MILLIS\s*=\s*20_000/)
   assert.match(source, /ACCOUNT_TRADE_STALL_TIMEOUT_MILLIS\s*=\s*12_000/)
   assert.match(source, /tradeOrderVoList/)
+  assert.match(source, /ACCOUNT_TRADE_DIRECT_URL\s*=\s*"https:\/\/ms\.jr\.jd\.com\/gw2\/generic\/cfGateway\/newna\/m\/queryTradeOrderList"/)
+  assert.match(source, /ACCOUNT_TRADE_HISTORY_START_DATE\s*=\s*"2000-01-01"/)
+  assert.match(source, /orderCreateStartDate/)
+  assert.match(source, /requestHoldingCookieBrowserPost\(ACCOUNT_TRADE_DIRECT_URL, request\)/)
+  assert.match(source, /readHoldingCookieAccountTradesDirect\(sessionCookie, holdings\)/)
+  assert.match(source, /date\.compareTo\(currentBeijingDate\(\)\) <= 0/)
+  assert.match(source, /findHoldingStartDate\(product, pageInfo, amountTemplate, minor, data\)/)
+  assert.match(source, /"firstBuyDate", "firstBuyTime"/)
   assert.match(source, /vm\.getTradeOrderData\(\)/)
   assert.match(source, /function progress\(page,rows,totalRows,allCount\)/)
   assert.match(source, /progress:true,page:page,rows:rows,totalRows:totalRows,allCount:allCount/)
@@ -37,20 +45,69 @@ test('Android capture follows JD ten-year pagination instead of a 30-day window'
   assert.match(source, /reportProgress\(\s*"reading_trades",\s*"正在读取京东交易记录：第 "/)
   assert.match(source, /response\.optString\("reason", "京东交易记录分页读取失败"\)/)
   assert.match(source, /Executors\.newFixedThreadPool\(2\)/)
+  assert.match(source, /Future<CurrentHoldingTradeResult> detailRead = gridTimelineOnly/)
+  assert.match(source, /if \(detailRead == null\) detailResult = readCurrentHoldingTrades\(sessionCookie, holdings\)/)
+  assert.match(source, /JSArray merged = mergeAccountAndDetailTrades\(accountResult\.rows, detailResult\.rows\)/)
+  assert.match(source, /int targetRank = tradeStatusRank\(target\)/)
+  assert.match(source, /boolean detailStateWins = detailRank > targetRank/)
+  assert.match(source, /boolean detailConfirmedWins = detailRank == 2 && targetRank < 3/)
+  assert.match(source, /inactive > confirmed > pending > unknown/)
+  assert.match(source, /Set<String> detailIds = tradeRowIdentifiers\(detail\)/)
+  assert.match(source, /"sourceId", "orderId", "bizOrderId", "tradeOrderId", "orderNo", "subOrderId"/)
+  assert.match(source, /!detailIds\.isEmpty\(\) && !tradeRowIdentifiers\(candidate\)\.isEmpty\(\)/)
+  assert.match(source, /if \(!identifier\.isEmpty\(\)\) item\.put\(key, identifier\)/)
+  assert.doesNotMatch(source, /row == null \|\| !isEffectiveTrade\(row\)/)
+  assert.doesNotMatch(source, /String rawTime = firstText\(row,[^;]*"confirmTime"/)
+  assert.match(source, /function emitRows\(a\).*return !!day\(x\)/)
   assert.match(source, /holding\.put\("detailExtJson", extJson\)/)
   assert.match(source, /result\.put\("closedItems", closedItems\)/)
   assert.match(source, /hasExplicitZeroPosition\(amount, shares\)/)
   assert.match(source, /mergeAccountAndDetailTrades\(accountResult\.rows, detailResult\.rows\)/)
   assert.match(source, /new FundTradeRows\(\s*request\.code,\s*new JSONArray\(\),\s*lastError/)
-  assert.match(source, /"shares", "targetShares", "status", "statusCode", "confirmTime"/)
-  assert.doesNotMatch(source, /TRADE_HISTORY_DAYS/)
+  assert.doesNotMatch(source, /TRADE_HISTORY_YEARS/)
   assert.doesNotMatch(source, /近30天京东交易记录/)
+})
+
+test('Android Cookie holdings reader retries safely without misclassifying transient failures', () => {
+  const source = readFileSync(new URL('../../android/app/src/main/java/com/fundapp/realtime/JdHoldingsPlugin.java', import.meta.url), 'utf8')
+  assert.match(source, /HOLDING_DETAIL_CONCURRENCY\s*=\s*2/)
+  assert.match(source, /HOLDING_DETAIL_MAX_ATTEMPTS\s*=\s*2/)
+  assert.match(source, /readHoldingCookieDetailWithRetry\(product, sessionCookie\)/)
+  assert.match(source, /readHoldingDetailWithRetry\(product, sessionCookie\)/)
+  assert.match(source, /if \(groupProducts == null\) throw incompleteHoldingSnapshot\(null\)/)
+  assert.match(source, /if \(product == null\) throw incompleteHoldingSnapshot\(null\)/)
+  assert.match(source, /if \(holding == null\) throw incompleteHoldingSnapshot\(null\)/)
+  assert.match(source, /已取消本次导入并保留原有持仓/)
+  assert.match(source, /replaceWebSession\(sessionCookie, \(\) -> \{[\s\S]*?reader\.loadUrl\(HOLDING_PAGE_URL\)/)
+  assert.match(source, /cookies\.removeAllCookies\(ignored -> \{[\s\S]*?cookies\.setCookie\(origin, pair, accepted ->/)
+  assert.match(source, /new AbortController\(\)[\s\S]*?c\.abort\(\)[\s\S]*?signal:c\.signal/)
+  assert.match(source, /catch \(InterruptedException error\) \{\s*Thread\.currentThread\(\)\.interrupt\(\);\s*throw error;/)
+  assert.match(source, /isRetryableHoldingDetailFailure\(error\)/)
+  assert.match(source, /status == 429[\s\S]*?京东接口请求频繁/)
+  assert.match(source, /status >= 500 && status < 600[\s\S]*?京东服务暂时繁忙/)
+  assert.match(source, /status == HttpURLConnection\.HTTP_UNAUTHORIZED \|\| status == HttpURLConnection\.HTTP_FORBIDDEN/)
+  assert.doesNotMatch(source, /containsLoginMessage/)
+  assert.doesNotMatch(source, /HTTP_FORBIDDEN \|\| status >= 300/)
 })
 
 test('accepts one Cookie header value and rejects header injection', () => {
   assert.equal(normalizeJdCookie('Cookie: pt_key=abc; pt_pin=user'), 'pt_key=abc; pt_pin=user')
   assert.equal(normalizeJdCookie('pt_key=abc\r\nX-Injected: true'), null)
   assert.equal(normalizeJdCookie('not-a-cookie'), null)
+})
+
+test('keeps Web Cookie imports ephemeral and routes them through the local API', () => {
+  const gridSource = readFileSync(new URL('../views/ValuationGrid.vue', import.meta.url), 'utf8')
+  const dialogSource = readFileSync(new URL('../components/JdCookieImportDialog.vue', import.meta.url), 'utf8')
+  const devServerSource = readFileSync(new URL('../../dev-server.mjs', import.meta.url), 'utf8')
+
+  assert.match(gridSource, /let jdPendingRefreshCookie = ''/)
+  assert.doesNotMatch(gridSource, /jdCookieStorageKey|fund-app:jd-cookie/)
+  assert.doesNotMatch(dialogSource, /localStorage/)
+  assert.match(dialogSource, /watch\(\(\) => props\.show, \(\) => \{\s*\/\/ The component remains mounted[\s\S]*?cookie\.value = ''/)
+  assert.match(dialogSource, /清除输入的 Cookie/)
+  assert.match(devServerSource, /app\.post\('\/api\/jd\/holdings\/import'/)
+  assert.match(devServerSource, /Cache-Control', 'no-store, max-age=0'/)
 })
 
 test('keeps explicit zero snapshots separate and protects pending inbound funds', () => {
@@ -90,7 +147,18 @@ test('shares JD import progress and localized native errors across pages', () =>
     message: '完成', percentage: 100
   })
   assert.equal(jdImportErrorMessage(new Error('java.lang.IllegalStateException: 京东 Cookie 已过期')), '京东 Cookie 已过期')
-  assert.equal(jdImportErrorMessage(new Error('Unauthorized')), '京东 Cookie 已过期或无效，请更新后重试')
+  assert.equal(jdImportErrorMessage(new Error('Unauthorized')), '京东认证已失效，请更新 Cookie 后重试')
+  assert.equal(jdImportErrorMessage(Object.assign(new Error('request failed'), { status: 403 })), '京东认证已失效，请更新 Cookie 后重试')
+  assert.equal(jdImportErrorMessage(new Error('java.net.SocketTimeoutException: timeout')), '京东持仓读取超时，请检查网络后重试')
+  assert.equal(jdImportErrorMessage(new Error('java.net.UnknownHostException: ms.jr.jd.com')), '京东持仓读取失败，请检查网络后重试')
+  assert.equal(jdImportErrorMessage(Object.assign(new Error('Too Many Requests'), { status: 429 })), '京东接口请求过于频繁，请稍后重试')
+  assert.equal(jdImportErrorMessage(Object.assign(new Error('HTTP 503'), { status: 503 })), '京东服务暂时不可用，请稍后重试')
+  assert.equal(jdImportErrorMessage(new Error('org.json.JSONException: Value <!doctype of type java.lang.String cannot be converted to JSONObject')), '京东返回数据格式异常，请稍后重试')
+  assert.equal(jdImportErrorMessage(new Error('IllegalStateException')), '京东持仓读取失败，请稍后重试')
+  assert.doesNotMatch(jdImportErrorMessage(new Error('TypeError: Failed to fetch')), /Cookie/)
+  assert.equal(jdDataSaveErrorMessage(new Error('Unauthorized'), '京东网格批次写入'), '京东网格批次写入失败，服务认证异常，请稍后重试')
+  assert.equal(jdDataSaveErrorMessage(new Error('TypeError: Failed to fetch'), '京东网格批次写入'), '京东网格批次写入失败，请检查网络后重试')
+  assert.doesNotMatch(jdDataSaveErrorMessage(new Error('Unauthorized'), '京东持仓保存'), /Cookie/)
 })
 
 test('preserves decoded audit rows without certifying an incomplete current cycle', () => {
@@ -269,6 +337,19 @@ test('rejects an overshooting partial capture while accepting an exact current-c
   assert.deepEqual(reconciled.adjustments.map((item) => item.id), ['opening-buy', 'partial-sell'])
 })
 
+test('requires JD current-cycle shares to match at the displayed cent precision', () => {
+  const current = [{ code: '000001', name: 'Current', shares: '100' }]
+  const oneCentShort = selectVerifiedJdCurrentTimeline(current, [
+    { id: 'short', code: '000001', type: 'add', tradeDate: '2026-07-01', shares: '99.99', statusCode: 'COMPLETE' }
+  ])
+  const subCentRounding = selectVerifiedJdCurrentTimeline(current, [
+    { id: 'rounds', code: '000001', type: 'add', tradeDate: '2026-07-01', shares: '99.996', statusCode: 'COMPLETE' }
+  ])
+
+  assert.deepEqual([...oneCentShort.verifiedCodes], [])
+  assert.deepEqual([...subCentRounding.verifiedCodes], ['000001'])
+})
+
 test('keeps amount-only rows out of current-cycle replacement when they cannot be reconciled', () => {
   const selection = selectVerifiedJdCurrentTimeline(
     [{ code: '000001', name: 'Current', shares: '60' }],
@@ -319,17 +400,49 @@ test('keeps inactive JD orders in audit input but excludes them from position re
 })
 
 test('uses JD confirmation windows for tag visibility and grid eligibility', () => {
-  const beforeClose = { id: 'before', code: '000001', type: 'add' as const, tradeDate: '2026-07-24', tradeTime: '2026-07-24 14:59:00', status: '支付成功' }
+  const beforeClose = { id: 'before', code: '000001', type: 'add' as const, tradeDate: '2026-07-24', tradeTime: '2026-07-24 14:59:00', statusCode: 'PAY_SUCC' }
   const afterClose = { id: 'after', code: '000001', type: 'add' as const, tradeDate: '2026-07-24', tradeTime: '2026-07-24 15:01:00' }
-  const completed = { ...beforeClose, status: '订单完成' }
+  const completed = { ...beforeClose, statusCode: 'COMPLETE' }
 
-  assert.equal(hasReachedJdConfirmationWindow(beforeClose, Date.parse('2026-07-25T11:59:00+08:00')), false)
-  assert.equal(hasReachedJdConfirmationWindow(beforeClose, Date.parse('2026-07-25T12:00:00+08:00')), true)
-  assert.equal(hasReachedJdConfirmationWindow(afterClose, Date.parse('2026-07-25T14:59:00+08:00')), false)
-  assert.equal(hasReachedJdConfirmationWindow(afterClose, Date.parse('2026-07-25T15:00:00+08:00')), true)
+  assert.equal(hasReachedJdConfirmationWindow(beforeClose, Date.parse('2026-07-27T12:59:59+08:00')), false)
+  assert.equal(hasReachedJdConfirmationWindow(beforeClose, Date.parse('2026-07-27T13:00:00+08:00')), true)
+  assert.equal(hasReachedJdConfirmationWindow(afterClose, Date.parse('2026-07-28T12:59:59+08:00')), false)
+  assert.equal(hasReachedJdConfirmationWindow(afterClose, Date.parse('2026-07-28T13:00:00+08:00')), true)
   assert.equal(hasReachedJdConfirmationWindow(completed, Date.parse('2026-07-24T09:00:00+08:00')), true)
-  assert.equal(getSettlementNavStartDate('2026-07-24', 'before'), '2026-07-25')
-  assert.equal(getSettlementNavStartDate('2026-07-24', 'after'), '2026-07-26')
+  assert.equal(getAdjustmentConfirmationDate('2026-07-24', 'before'), '2026-07-27')
+  assert.equal(getAdjustmentConfirmationDate('2026-07-24', 'after'), '2026-07-28')
+  assert.equal(getAdjustmentConfirmationDate('2026-07-25', 'before'), '2026-07-28')
+  assert.equal(getAdjustmentConfirmationDate('2026-07-25', 'after'), '2026-07-28')
+  assert.equal(getSettlementNavStartDate('2026-07-24', 'before'), '2026-07-24')
+  assert.equal(getSettlementNavStartDate('2026-07-24', 'after'), '2026-07-25')
+})
+
+test('uses confirmation sessions as evidence but prices with the order NAV session', () => {
+  const history = [
+    { date: '2026-07-28', netValue: 1.03, totalValue: 1.03, changeRate: 0.2 },
+    { date: '2026-07-27', netValue: 1.02, totalValue: 1.02, changeRate: 0.1 },
+    { date: '2026-07-24', netValue: 1.01, totalValue: 1.01, changeRate: 0.1 }
+  ]
+  assert.equal(findAdjustmentSettlementNav(history, '2026-07-24', 'before', '2026-07-24'), null)
+  assert.equal(findAdjustmentSettlementNav(history, '2026-07-24', 'before', '2026-07-27')?.date, '2026-07-24')
+  assert.equal(findAdjustmentSettlementNav(history, '2026-07-24', 'after', '2026-07-27'), null)
+  assert.equal(findAdjustmentSettlementNav(history, '2026-07-24', 'after', '2026-07-28')?.date, '2026-07-27')
+
+  const holidayHistory = [
+    { date: '2026-10-07', netValue: 1.06, totalValue: 1.06, changeRate: 0.2 },
+    { date: '2026-10-06', netValue: 1.05, totalValue: 1.05, changeRate: 0.1 },
+    { date: '2026-10-02', netValue: 1.04, totalValue: 1.04, changeRate: 0.1 }
+  ]
+  assert.equal(findAdjustmentSettlementNav(holidayHistory, '2026-10-02', 'before', '2026-10-06')?.date, '2026-10-02')
+  assert.equal(findAdjustmentSettlementNav(holidayHistory, '2026-10-02', 'after', '2026-10-06'), null)
+  assert.equal(findAdjustmentSettlementNav(holidayHistory, '2026-10-02', 'after', '2026-10-07')?.date, '2026-10-06')
+
+  const weekendHistory = [
+    { date: '2026-07-28', netValue: 1.08, totalValue: 1.08, changeRate: 0.2 },
+    { date: '2026-07-27', netValue: 1.07, totalValue: 1.07, changeRate: 0.1 }
+  ]
+  assert.equal(findAdjustmentSettlementNav(weekendHistory, '2026-07-25', 'before', '2026-07-27'), null)
+  assert.equal(findAdjustmentSettlementNav(weekendHistory, '2026-07-25', 'before', '2026-07-28')?.date, '2026-07-27')
 })
 
 test('uses real JD status codes and confirmation time for holding tags', () => {
@@ -359,11 +472,12 @@ test('uses real JD status codes and confirmation time for holding tags', () => {
   assert.equal(getJdAdjustmentConfirmationAt({
     ...waitingSell,
     confirmTime: '预计2026-08-05到账'
-  }), Date.parse('2026-08-05T15:00:00+08:00'))
+  }), Date.parse('2026-08-05T13:00:00+08:00'))
   assert.equal(shouldShowJdAdjustmentTag(waitingBuy, beforeConfirmation), true)
   assert.equal(shouldShowJdAdjustmentTag(waitingSell, beforeConfirmation), true)
   assert.equal(shouldShowJdAdjustmentTag(waitingConversion, beforeConfirmation), true)
-  assert.equal(shouldShowJdAdjustmentTag(waitingBuy, atConfirmation), false)
+  assert.equal(shouldShowJdAdjustmentTag(waitingBuy, atConfirmation), true)
+  assert.equal(shouldShowJdAdjustmentTag({ ...waitingBuy, status: undefined, statusCode: undefined }, atConfirmation), false)
   assert.equal(getJdAdjustmentTagLabel(waitingBuy, '000001'), '调仓·买入')
   assert.equal(getJdAdjustmentTagLabel(waitingSell, '000001'), '调仓·卖出')
   assert.equal(getJdAdjustmentTagLabel(waitingConversion, '000001'), '调仓·转换')

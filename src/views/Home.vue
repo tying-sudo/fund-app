@@ -9,14 +9,15 @@ import { useFundStore } from '@/stores/fund'
 import { useAlertStore, ALERT_TYPE_CONFIG, type AlertType } from '@/stores/alert'
 import { 
   fetchRemoteConfig, 
+  fetchAppRelease,
   getActiveAnnouncements, 
   markAnnouncementShown,
-  checkNeedUpdate,
-  type Announcement,
-  type RemoteConfig
+  isVersionLower,
+  type Announcement
 } from '@/api/remote'
 import { APP_VERSION } from '@/config/version'
 import { showConfirmDialog, showToast, showSuccessToast, showLoadingToast, closeToast } from 'vant'
+import { downloadAndInstallAppUpdate } from '@/utils/inAppUpdate'
 import FundCard from '@/components/FundCard.vue'
 import DataSourceSelector from '@/components/DataSourceSelector.vue'
 import { DATA_SOURCE_CONFIG, type DataSource } from '@/types/fund'
@@ -106,6 +107,7 @@ onMounted(async () => {
   await alertStore.requestNotificationPermission()
   // 加载远程配置
   loadRemoteConfig()
+  void loadAppRelease()
   // [WHAT] 点击外部关闭下拉菜单
   document.addEventListener('click', closeTypeDropdown)
 })
@@ -127,17 +129,6 @@ async function loadRemoteConfig() {
     const config = await fetchRemoteConfig()
     if (!config) return
     
-    // 检查更新
-    const { needUpdate, forceUpdate } = checkNeedUpdate(APP_VERSION, config)
-    if (needUpdate) {
-      updateInfo.value = {
-        needUpdate,
-        forceUpdate,
-        latestVersion: config.version,
-        updateUrl: config.updateUrl
-      }
-    }
-    
     // 获取有效公告
     remoteAnnouncements.value = getActiveAnnouncements(config)
     
@@ -148,6 +139,17 @@ async function loadRemoteConfig() {
     }
   } catch (err) {
     console.warn('加载远程配置失败:', err)
+  }
+}
+
+async function loadAppRelease() {
+  const release = await fetchAppRelease()
+  if (!release?.available || !release.apkUrl || !isVersionLower(APP_VERSION, release.version)) return
+  updateInfo.value = {
+    needUpdate: true,
+    forceUpdate: release.forceUpdate || isVersionLower(APP_VERSION, release.minimumVersion),
+    latestVersion: release.version,
+    updateUrl: release.apkUrl
   }
 }
 
@@ -171,9 +173,21 @@ function closeAnnouncement() {
 }
 
 // [WHAT] 跳转更新
-function goToUpdate() {
-  if (updateInfo.value?.updateUrl) {
-    window.open(updateInfo.value.updateUrl, '_blank')
+async function goToUpdate() {
+  const url = updateInfo.value?.updateUrl
+  if (!url) return
+  showLoadingToast({ message: '正在下载更新...', forbidClick: true, duration: 0 })
+  try {
+    const result = await downloadAndInstallAppUpdate(url)
+    closeToast()
+    if (result.needsPermission) {
+      showToast('请允许“安装未知应用”，然后再次点击更新')
+      return
+    }
+    showSuccessToast('下载完成，正在打开安装')
+  } catch (error) {
+    closeToast()
+    showToast(error instanceof Error ? error.message : '更新下载失败')
   }
 }
 
