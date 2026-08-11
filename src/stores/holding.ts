@@ -30,6 +30,11 @@ import { getFundTypes } from '@/api/fund'
 import { persistCache } from '@/api/tiantianApi'
 import { fetchLatestValuationSettlement, rememberValuationSettlement } from '@/api/valuationGrid'
 import { resolveWatchlistSnapshot } from '@/utils/watchlistSnapshot'
+import {
+  buildSettlementEstimate,
+  normalizeSettlementDate,
+  shouldApplyValuationSettlement
+} from '@/utils/valuationSettlement'
 
 // 新增模块导入
 import {
@@ -522,7 +527,7 @@ export const useHoldingStore = defineStore('holding', () => {
           if (shouldAttemptAdjustmentSettlement(realData?.date, confirmationSessionDate)) {
             await confirmPendingAdjustments(code, realData?.date, confirmationSessionDate)
           }
-          await hydrateHoldingSettlementIfMissing(code)
+          await hydrateHoldingSettlementIfMissing(code, data, usableRealData)
           successCount++
           
           const fundDuration = Math.round(performance.now() - fundStart)
@@ -582,25 +587,46 @@ export const useHoldingStore = defineStore('holding', () => {
     }
   }
 
-  async function hydrateHoldingSettlementIfMissing(code: string) {
-    const holding = holdings.value.find((item) => item.code === code)
+  async function hydrateHoldingSettlementIfMissing(
+    code: string,
+    baseEstimate: FundEstimate,
+    dailyReturn: FundRealDayChange | null
+  ) {
+    let holding = holdings.value.find((item) => item.code === code)
     if (!holding) return
-    const current = getValuationComparisonState({
+    let current = getValuationComparisonState({
       realChange: holding.realChange,
       realChangeDate: holding.realChangeDate,
       estimateChange: holding.estimateChange,
       estimateTime: holding.estimateTime,
       fundName: holding.name
     })
-    if (current.isTrading || current.hasActualDiff) return
-    // Post-midnight providers can return an estimate stamped for the new
-    // calendar day before that market has opened. Recover the completed
-    // previous-day pair instead of combining those two dates.
-    if (isEstimateDateToday(holding.estimateTime || '', getTodayStr()) &&
-      hasUsableEstimateChange(holding.estimateChange) && !current.isPreOpen) return
+    const hasCompleteValuation = [holding.marketValue, holding.profit, holding.todayProfit]
+      .every((value) => value !== undefined && value !== null && Number.isFinite(Number(value)))
+    if (current.isTrading || (current.hasActualDiff && hasCompleteValuation)) return
 
     const settlement = await fetchLatestValuationSettlement(code)
     if (!settlement) return
+
+    // Re-read after the network request so a concurrent refresh cannot make
+    // this settlement overwrite newer holding data.
+    holding = holdings.value.find((item) => item.code === code)
+    if (!holding) return
+    current = getValuationComparisonState({
+      realChange: holding.realChange,
+      realChangeDate: holding.realChangeDate,
+      estimateChange: holding.estimateChange,
+      estimateTime: holding.estimateTime,
+      fundName: holding.name
+    })
+    const refreshedValuationComplete = [holding.marketValue, holding.profit, holding.todayProfit]
+      .every((value) => value !== undefined && value !== null && Number.isFinite(Number(value)))
+    if (current.isTrading || (current.hasActualDiff && refreshedValuationComplete)) return
+    if (!shouldApplyValuationSettlement({
+      settlementDate: settlement.date,
+      estimateTime: holding.estimateTime,
+      isPreOpen: current.isPreOpen
+    })) return
 
     const comparison = getValuationComparisonState({
       realChange: settlement.realChange,
@@ -611,15 +637,39 @@ export const useHoldingStore = defineStore('holding', () => {
     })
     if (!comparison.hasActualDiff) return
 
-    Object.assign(holding, {
-      estimateChange: settlement.estimateChange.toFixed(4),
-      estimateTime: `${settlement.date} 15:00`,
-      realChange: settlement.realChange,
-      realChangeDate: settlement.date,
-      todayChange: '--',
-      isRealChangeToday: false,
-      loading: false
+    const matchingDailyReturn = dailyReturn?.isFresh !== false &&
+      normalizeSettlementDate(dailyReturn?.date) === settlement.date
+      ? dailyReturn
+      : null
+    const estimateKind = (baseEstimate as FundEstimate & { kind?: string }).kind
+    const estimateIsOfficial = baseEstimate.source === 'market_snapshot' ||
+      baseEstimate.valuationType === 'actual_nav' || estimateKind === 'official_nav'
+    const estimateOfficialNav = estimateIsOfficial &&
+      normalizeSettlementDate(baseEstimate.gztime) === settlement.date
+      ? Number(baseEstimate.gsz)
+      : NaN
+    const officialNav = Number.isFinite(Number(settlement.officialNav)) && Number(settlement.officialNav) > 0
+      ? Number(settlement.officialNav)
+      : matchingDailyReturn && Number.isFinite(Number(matchingDailyReturn.nav)) && matchingDailyReturn.nav > 0
+        ? matchingDailyReturn.nav
+        : estimateOfficialNav
+    const completed = buildSettlementEstimate({
+      code,
+      name: holding.name,
+      settlement,
+      officialNav
     })
+    if (!completed) return
+
+    updateHoldingWithNewEngine(
+      code,
+      completed.estimate,
+      settlement.realChange,
+      settlement.date,
+      completed.officialNav,
+      matchingDailyReturn?.previous,
+      matchingDailyReturn?.isCurrentPublication ?? (settlement.date === getTodayStr())
+    )
   }
 
   /**

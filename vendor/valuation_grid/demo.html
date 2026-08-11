@@ -1328,6 +1328,7 @@
         let hostHoldings = [];
         let quickAddLookupSequence = 0;
         let quickAddCollapsed = false;
+        let sellRequestSequence = 0;
         const valuationAddLookupSequence = Object.create(null);
         const fundNameCache = Object.create(null);
         const pendingFundNameLookups = Object.create(null);
@@ -3485,10 +3486,15 @@
 
             try {
                 let data, statusMsg;
+                const requestId = `demo-sell-${Date.now()}-${++sellRequestSequence}`;
 
                 if (mode === 'fifo') {
                     // FIFO 模式：调用新接口，自动按先进先出拆分
-                    const body = { total_sell_shares: sellShares };
+                    const body = {
+                        total_sell_shares: sellShares,
+                        request_id: requestId,
+                        confirmation: `SELL ${code} ${sellShares.toFixed(2)}`
+                    };
                     if (sellNav) body.sell_nav = sellNav;
                     if (sellDate) body.sell_date = sellDate;
 
@@ -3509,7 +3515,12 @@
                     const batchId = document.getElementById('sellBatchSelect').value;
                     if (!batchId) { showStatus('请选择卖出批次', 'error'); return; }
 
-                    const body = { batch_id: batchId, sell_shares: sellShares };
+                    const body = {
+                        batch_id: batchId,
+                        sell_shares: sellShares,
+                        request_id: requestId,
+                        confirmation: `SELL ${code} ${sellShares.toFixed(2)}`
+                    };
                     if (sellNav) body.sell_nav = sellNav;
                     if (sellDate) body.sell_date = sellDate;
 

@@ -1,11 +1,12 @@
 import { API_BASE_URL } from '@/config/api'
+import {
+  attachNativeOfficialNav,
+  parseValuationSettlement,
+  recoverNativeValuationSettlement,
+  type ValuationSettlement
+} from '@/utils/valuationSettlement'
 
-export interface ValuationSettlement {
-  date: string
-  estimateChange: number
-  realChange: number
-  source?: 'grid' | 'native-recovery' | 'local-cache'
-}
+export type { ValuationSettlement } from '@/utils/valuationSettlement'
 
 interface ValuationSettlementResponse {
   date?: unknown
@@ -22,19 +23,9 @@ function settlementCacheKey(code: string) {
   return `${settlementCachePrefix}${code}`
 }
 
-function parseSettlement(value: unknown): ValuationSettlement | null {
-  if (!value || typeof value !== 'object') return null
-  const data = value as Partial<ValuationSettlement>
-  const date = typeof data.date === 'string' ? data.date : ''
-  const estimateChange = Number(data.estimateChange)
-  const realChange = Number(data.realChange)
-  if (!date || !Number.isFinite(estimateChange) || !Number.isFinite(realChange)) return null
-  return { date, estimateChange, realChange, source: data.source }
-}
-
 export function getCachedValuationSettlement(code: string): ValuationSettlement | null {
   try {
-    return parseSettlement(JSON.parse(localStorage.getItem(settlementCacheKey(code)) || 'null'))
+    return parseValuationSettlement(JSON.parse(localStorage.getItem(settlementCacheKey(code)) || 'null'))
   } catch {
     return null
   }
@@ -56,27 +47,10 @@ export function forgetValuationSettlement(code: string): void {
   }
 }
 
-async function recoverSettlementFromNativeSources(code: string, signal: AbortSignal): Promise<ValuationSettlement | null> {
+async function fetchNativeValuationSources(code: string, signal: AbortSignal): Promise<unknown> {
   const response = await fetch(`${API_BASE_URL}/api/fund-estimate-sources?code=${encodeURIComponent(code)}`, { signal })
   if (!response.ok) return null
-  const payload = await response.json() as {
-    data?: { sources?: Record<string, { gszzl?: unknown; gztime?: unknown }> }
-  }
-  const sources = payload.data?.sources || {}
-  const official = sources.market_snapshot
-  const date = typeof official?.gztime === 'string' ? official.gztime.slice(0, 10) : ''
-  const realChange = Number(official?.gszzl)
-  if (!date || !Number.isFinite(realChange)) return null
-
-  for (const sourceName of ['fundgz', 'holdings_weighted', 'sina_ds2', 'sina_ds3']) {
-    const source = sources[sourceName]
-    const estimateDate = typeof source?.gztime === 'string' ? source.gztime.slice(0, 10) : ''
-    const estimateChange = Number(source?.gszzl)
-    if (estimateDate === date && Number.isFinite(estimateChange)) {
-      return { date, estimateChange, realChange, source: 'native-recovery' }
-    }
-  }
-  return null
+  return response.json()
 }
 
 /** Fetch a completed estimate/NAV pair only for non-trading fallback display. */
@@ -86,22 +60,31 @@ export async function fetchLatestValuationSettlement(code: string): Promise<Valu
   const controller = new AbortController()
   const timeout = window.setTimeout(() => controller.abort(), 5000)
   try {
+    // Run the source snapshot alongside the grid request. Both endpoints then
+    // receive the full timeout instead of serially sharing the same five seconds.
+    const nativePayloadPromise = fetchNativeValuationSources(code, controller.signal).catch(() => null)
+    const getNativePayload = () => nativePayloadPromise
     const url = new URL(`/v1/fund/${code}/settlement`, gridApiBaseUrl)
     const response = await fetch(url, { signal: controller.signal })
     if (response.ok) {
       const data = await response.json() as ValuationSettlementResponse
-      const settlement = parseSettlement({
+      let settlement = parseValuationSettlement({
         date: data.date,
         estimateChange: data.estimate_change,
         realChange: data.real_change,
         source: 'grid'
       })
       if (settlement) {
+        try {
+          settlement = attachNativeOfficialNav(settlement, await getNativePayload())
+        } catch {
+          // The grid pair remains valid; callers may already have the official NAV.
+        }
         rememberValuationSettlement(code, settlement)
         return settlement
       }
 
-      const recovered = await recoverSettlementFromNativeSources(code, controller.signal)
+      const recovered = recoverNativeValuationSettlement(await getNativePayload())
       if (recovered) {
         rememberValuationSettlement(code, recovered)
         return recovered
@@ -113,7 +96,7 @@ export async function fetchLatestValuationSettlement(code: string): Promise<Valu
       forgetValuationSettlement(code)
       return null
     }
-    const recovered = await recoverSettlementFromNativeSources(code, controller.signal)
+    const recovered = recoverNativeValuationSettlement(await getNativePayload())
     if (recovered) {
       rememberValuationSettlement(code, recovered)
       return recovered

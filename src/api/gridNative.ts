@@ -54,6 +54,7 @@ export interface GridSignal {
   _portfolio_buy_peers?: string[]
   rebuy_recommendation?: GridRebuyRecommendation
   all_signals?: GridSignal[]
+  fifo_sell_plan?: GridFifoSellPlan
   market_regime?: 'bull' | 'neutral' | 'bear' | string
   regime_source?: 'auto' | 'manual' | string
   market_analysis?: {
@@ -85,6 +86,35 @@ export interface GridSignal {
     decision_note?: string
     strategy_params?: GridStrategyParams
   }
+}
+
+/** The source grid's authoritative sell instruction, generated from its batch plan. */
+export interface GridFifoSellPlan {
+  total_shares?: number
+  batch_count?: number
+  steps?: GridFifoSellStep[]
+  total_estimated_fee?: number
+  total_estimated_profit?: number | null
+  has_passthrough?: boolean
+  passthrough_warning?: string | null
+  passthrough_loss_total?: number | null
+  instruction?: string
+}
+
+export interface GridFifoSellStep {
+  batch_id?: string
+  buy_date?: string
+  sell_shares?: number
+  batch_total_shares?: number
+  is_full_sell?: boolean
+  is_passthrough?: boolean
+  hold_days?: number
+  fee_rate?: number
+  profit_pct?: number | null
+  estimated_fee?: number
+  estimated_net_profit?: number | null
+  reason?: string
+  note?: string
 }
 
 export interface GridMutationResult {
@@ -253,8 +283,16 @@ const apiBase = import.meta.env.VITE_VALUATION_GRID_API_BASE
 
 async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   const response = await fetch(`${apiBase}${path}`, init)
-  if (!response.ok) throw new Error(`请求失败 (${response.status})`)
+  if (!response.ok) {
+    const body = await response.json().catch(() => null)
+    const detail = typeof body?.detail === 'string' ? body.detail : ''
+    throw new Error(detail ? `请求失败 (${response.status})：${detail}` : `请求失败 (${response.status})`)
+  }
   return response.json() as Promise<T>
+}
+
+function sellConfirmation(fundCode: string, shares: number) {
+  return `SELL ${fundCode} ${Number(shares).toFixed(2)}`
 }
 
 export function fetchGridState() {
@@ -408,17 +446,19 @@ export function createGridWatch(fundCode: string, input: { max_position: number;
   })
 }
 
-export function sellGridPositionFifo(fundCode: string, input: { total_sell_shares: number; sell_nav?: number; sell_date?: string }) {
+export function sellGridPositionFifo(fundCode: string, input: { total_sell_shares: number; request_id?: string; sell_nav?: number; sell_date?: string }) {
   return request<GridMutationResult>(`/v1/position/${encodeURIComponent(fundCode)}/sell-fifo`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify(input)
+    body: JSON.stringify({ ...input, confirmation: sellConfirmation(fundCode, input.total_sell_shares) })
   })
 }
 
 export function sellGridBatch(fundCode: string, input: { batch_id: string; sell_shares: number; sell_nav?: number; sell_date?: string }) {
   return request<GridMutationResult>(`/v1/position/${encodeURIComponent(fundCode)}/sell`, {
-    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(input)
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ ...input, confirmation: sellConfirmation(fundCode, input.sell_shares) })
   })
 }
 

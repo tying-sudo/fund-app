@@ -3,6 +3,7 @@ positions.py - 持仓记录管理（data/positions.json）
 """
 import hashlib
 import json
+import math
 import os
 import threading
 import time
@@ -585,7 +586,7 @@ def sell_batch(fund_code: str, batch_id: str, sell_shares: float,
 
     # === 生成卖出记录（无论全部/部分卖出都生成） ===
     sell_records = fund.setdefault("sell_records", [])
-    sell_record_id = f"s{sd.strftime('%Y%m%d')}{chr(ord('a') + len([r for r in sell_records if r.get('sell_date') == sd.strftime('%Y-%m-%d')]))}"
+    sell_record_id = _next_sell_record_id(sell_records, sd.strftime("%Y-%m-%d"))
     sell_record = {
         "id": sell_record_id,
         "batch_id": batch_id,
@@ -855,7 +856,8 @@ def update_fund_config(fund_code: str, max_position: int = None, fund_name: str 
 
 @position_write
 def sell_fifo(fund_code: str, total_sell_shares: float,
-              sell_nav: float = None, sell_date: str = None) -> dict:
+              sell_nav: float = None, sell_date: str = None,
+              request_id: str = None) -> dict:
     """
     按 FIFO（先进先出）顺序卖出指定总份额。
     模拟支付宝实际行为：用户只输入总份额，系统从最早批次开始依次扣减。
@@ -865,7 +867,39 @@ def sell_fifo(fund_code: str, total_sell_shares: float,
         total_fee, total_net, total_profit
     }
     """
+    if not math.isfinite(total_sell_shares) or total_sell_shares <= 0:
+        raise ValueError("卖出份额必须大于0")
+    if sell_nav is not None and (not math.isfinite(sell_nav) or sell_nav <= 0):
+        raise ValueError("卖出净值必须大于0或留空")
+    if sell_date and not _is_valid_date(sell_date):
+        raise ValueError("卖出日期必须为 YYYY-MM-DD")
+
+    normalized_request_id = str(request_id or "").strip()
+    if request_id is not None and not normalized_request_id:
+        raise ValueError("request_id 不能为空")
+    if len(normalized_request_id) > 200:
+        raise ValueError("request_id 不能超过200个字符")
+
     data = load_positions()
+    request_ledger = None
+    request_fingerprint = None
+    if normalized_request_id:
+        request_fingerprint = _fifo_sell_request_fingerprint(
+            fund_code, total_sell_shares, sell_nav, sell_date
+        )
+        request_ledger = data.setdefault("processed_position_requests", {})
+        if not isinstance(request_ledger, dict):
+            raise PositionDataError("processed_position_requests 必须是对象")
+    if request_ledger is not None and normalized_request_id in request_ledger:
+        prior = request_ledger[normalized_request_id]
+        if (prior.get("operation") != "sell_fifo"
+                or prior.get("fingerprint") != request_fingerprint):
+            raise ValueError("request_id 已用于不同的持仓请求")
+        prior_result = prior.get("result")
+        if not isinstance(prior_result, dict):
+            raise PositionDataError("request_id 对应的历史卖出结果损坏")
+        return {**prior_result, "idempotent_replay": True}
+
     fund = data.get("funds", {}).get(fund_code)
     if not fund:
         raise ValueError(f"基金 {fund_code} 不存在")
@@ -877,7 +911,7 @@ def sell_fifo(fund_code: str, total_sell_shares: float,
     if total_sell_shares > total_available + 0.01:
         raise ValueError(f"卖出份额 {total_sell_shares} 超过持有总份额 {total_available:.2f}")
 
-    if sell_date and _is_valid_date(sell_date):
+    if sell_date:
         sd = datetime.strptime(sell_date, "%Y-%m-%d").date()
     else:
         sd = beijing_now().date()
@@ -926,7 +960,7 @@ def sell_fifo(fund_code: str, total_sell_shares: float,
 
         # === 生成卖出记录 ===
         sell_records = fund.setdefault("sell_records", [])
-        sell_record_id = f"s{sd.strftime('%Y%m%d')}{chr(ord('a') + len([r for r in sell_records if r.get('sell_date') == sd.strftime('%Y-%m-%d')]))}"
+        sell_record_id = _next_sell_record_id(sell_records, sd.strftime("%Y-%m-%d"))
         sell_record = {
             "id": sell_record_id,
             "batch_id": batch["id"],
@@ -944,6 +978,8 @@ def sell_fifo(fund_code: str, total_sell_shares: float,
             "sell_fee_rate": fee_rate,
             "note": batch.get("note", ""),
         }
+        if normalized_request_id:
+            sell_record["request_id"] = normalized_request_id
         sell_records.append(sell_record)
         batch_details[-1]["sell_record_id"] = sell_record_id
 
@@ -977,15 +1013,11 @@ def sell_fifo(fund_code: str, total_sell_shares: float,
         fund["supplement_count"] = 0
         print(f"[Position] {fund_code} 全部清仓，重置补仓计数")
 
-    save_positions(data)
-
     total_fee = sum(d["fee"] for d in batch_details if d["fee"] is not None)
     total_net = sum(d["net"] for d in batch_details if d["net"] is not None)
     total_profit = sum(d["profit"] for d in batch_details if d["profit"] is not None)
 
-    print(f"[Position] FIFO卖出 {fund_code}: 总份额{total_sell_shares}, 涉及{len(batch_details)}个批次")
-
-    return {
+    result = {
         "total_sell_shares": round(total_sell_shares, 2),
         "batch_count": len(batch_details),
         "batch_details": batch_details,
@@ -993,6 +1025,142 @@ def sell_fifo(fund_code: str, total_sell_shares: float,
         "total_net": round(total_net, 2) if any(d["net"] is not None for d in batch_details) else None,
         "total_profit": round(total_profit, 2) if any(d["profit"] is not None for d in batch_details) else None,
         "nav_pending": sell_nav is None or sell_nav <= 0,
+    }
+    if normalized_request_id:
+        result["request_id"] = normalized_request_id
+        request_ledger[normalized_request_id] = {
+            "operation": "sell_fifo",
+            "fingerprint": request_fingerprint,
+            "processed_at": beijing_now().strftime("%Y-%m-%d %H:%M:%S"),
+            "result": result,
+        }
+
+    save_positions(data)
+    print(f"[Position] FIFO卖出 {fund_code}: 总份额{total_sell_shares}, 涉及{len(batch_details)}个批次")
+    return result
+
+
+def _next_sell_record_id(records: list, sell_date: str) -> str:
+    """Return the next per-batch sale id without colliding with existing lots."""
+    prefix = f"s{sell_date.replace('-', '')}"
+    existing = {str(record.get("id", "")) for record in records}
+    index = 0
+    while True:
+        suffix = chr(ord("a") + index) if index < 26 else str(index + 1)
+        candidate = f"{prefix}{suffix}"
+        if candidate not in existing:
+            return candidate
+        index += 1
+
+
+def _fifo_sell_request_fingerprint(fund_code: str, total_sell_shares: float,
+                                   sell_nav: float | None, sell_date: str | None) -> str:
+    payload = {
+        "operation": "sell_fifo",
+        "fund_code": fund_code,
+        "total_sell_shares": round(float(total_sell_shares), 2),
+        "sell_nav": round(float(sell_nav), 4) if sell_nav and sell_nav > 0 else None,
+        "sell_date": sell_date or None,
+    }
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+
+@position_write
+def split_fifo_aggregate_sell_records(fund_code: str | None = None) -> dict:
+    """Expand legacy aggregate FIFO rows into the original per-source-batch ledger."""
+    data = load_positions()
+    funds = data.get("funds", {})
+    target_codes = [fund_code] if fund_code else sorted(funds)
+    migrated_records = 0
+    created_records = 0
+    skipped_records = []
+
+    for code in target_codes:
+        fund = funds.get(code)
+        if not fund:
+            continue
+        records = list(fund.get("sell_records", []))
+        replacement = []
+        batch_by_id = {batch.get("id"): batch for batch in fund.get("batches", [])}
+        reserved_ids = {str(record.get("id", "")) for record in records}
+        changed = False
+
+        for record in records:
+            allocations = record.get("allocations")
+            if record.get("sale_type") != "fifo_aggregate" or not isinstance(allocations, list) or not allocations:
+                replacement.append(record)
+                continue
+
+            sale_date = str(record.get("sell_date", "")).strip()
+            if not _is_valid_date(sale_date):
+                replacement.append(record)
+                skipped_records.append({"fund_code": code, "record_id": record.get("id"), "reason": "invalid_sell_date"})
+                continue
+
+            invalid_reason = None
+            for allocation in allocations:
+                if not isinstance(allocation, dict):
+                    invalid_reason = "invalid_allocation"
+                    break
+                batch_id = allocation.get("batch_id")
+                try:
+                    sell_shares = float(allocation.get("sell_shares", 0) or 0)
+                except (TypeError, ValueError):
+                    sell_shares = 0
+                if not batch_id:
+                    invalid_reason = "missing_batch_id"
+                    break
+                if batch_id not in batch_by_id:
+                    invalid_reason = "unknown_batch_id"
+                    break
+                if not math.isfinite(sell_shares) or sell_shares <= 0:
+                    invalid_reason = "invalid_sell_shares"
+                    break
+
+            if invalid_reason:
+                replacement.append(record)
+                skipped_records.append({"fund_code": code, "record_id": record.get("id"), "reason": invalid_reason})
+                continue
+
+            for allocation in allocations:
+                batch_id = allocation["batch_id"]
+                batch = batch_by_id.get(batch_id, {})
+                generated_id = _next_sell_record_id(
+                    [{"id": record_id} for record_id in reserved_ids], sale_date
+                )
+                reserved_ids.add(generated_id)
+                replacement.append({
+                    "id": generated_id,
+                    "batch_id": batch_id,
+                    "sell_date": sale_date,
+                    "sell_shares": round(float(allocation.get("sell_shares", 0) or 0), 2),
+                    "buy_nav": allocation.get("buy_nav"),
+                    "sell_nav": record.get("sell_nav"),
+                    "cost": allocation.get("cost"),
+                    "gross": allocation.get("gross"),
+                    "fee": allocation.get("fee"),
+                    "net": allocation.get("net"),
+                    "profit": allocation.get("profit"),
+                    "profit_pct": allocation.get("profit_pct"),
+                    "hold_days": allocation.get("hold_days"),
+                    "sell_fee_rate": allocation.get("sell_fee_rate", 0),
+                    "note": batch.get("note", record.get("note", "")),
+                    "migrated_from": record.get("id"),
+                })
+                created_records += 1
+            migrated_records += 1
+            changed = True
+
+        if changed:
+            fund["sell_records"] = replacement
+
+    if migrated_records:
+        save_positions(data)
+    return {
+        "migrated_records": migrated_records,
+        "created_records": created_records,
+        "skipped_records": skipped_records,
     }
 
 
@@ -1033,8 +1201,7 @@ def _sell_fifo_in_data(data: dict, fund_code: str, total_sell_shares: float,
         net = round(gross - fee, 2) if gross is not None else None
         profit = round(net - cost, 2) if net is not None else None
         profit_pct = round(profit / cost * 100, 1) if profit is not None and cost > 0 else None
-        same_day = [record for record in sell_records if record.get("sell_date") == sell_date]
-        record_id = f"s{sell_date.replace('-', '')}{chr(ord('a') + min(len(same_day), 25))}"
+        record_id = _next_sell_record_id(sell_records, sell_date)
         sell_records.append({
             "id": record_id,
             "batch_id": batch["id"],

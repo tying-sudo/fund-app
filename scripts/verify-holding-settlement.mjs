@@ -13,6 +13,129 @@ import {
 import { calculateHoldingProfit, calculateOfficialHoldingProfit, getValuationComparisonState, hasUsableCurrentEstimate, hasUsableEstimateChange, isDelayedSettlementQdiiFund, isFundPreOpen, isFundTradingHours, isJdYesterdaySummaryCurrent, isLunchBreak, isRetainedMarketEstimate, selectLatestRealChange, shouldRetainCompletedEstimate, shouldRetainCurrentDayEstimate, shouldRetainCurrentIntradayEstimate, shouldUseDelayedQdiiPublishedChange, shouldUseGridEstimateFallback } from '../src/utils/holdingCalculator.ts'
 import { deriveHoldingImportBasis } from '../src/utils/holdingImport.ts'
 import { resolveWatchlistSnapshot } from '../src/utils/watchlistSnapshot.ts'
+import {
+  attachNativeOfficialNav,
+  buildSettlementEstimate,
+  parseValuationSettlement,
+  recoverNativeValuationSettlement,
+  shouldApplyValuationSettlement
+} from '../src/utils/valuationSettlement.ts'
+
+const nativeValuationPayload = {
+  data: {
+    profile: {
+      snapshot: {
+        nav: 0.8766,
+        previousNav: 0.866,
+        changePercent: 1.22,
+        navDate: '2026-08-10'
+      }
+    },
+    sources: {
+      tiantian: {
+        kind: 'estimate',
+        gsz: '0.8779',
+        gszzl: '1.38',
+        gztime: '2026-08-10 16:00'
+      },
+      eastmoney: {
+        kind: 'official_nav',
+        gsz: '0.8766',
+        gszzl: '1.22',
+        gztime: '2026-08-10 15:00'
+      }
+    }
+  }
+}
+assert.deepEqual(recoverNativeValuationSettlement(nativeValuationPayload), {
+  date: '2026-08-10',
+  estimateChange: 1.38,
+  realChange: 1.22,
+  officialNav: 0.8766,
+  source: 'native-recovery'
+})
+const gridSettlement = parseValuationSettlement({
+  date: '2026-08-10',
+  estimateChange: 1.2923,
+  realChange: 1.22,
+  source: 'grid'
+})
+assert.ok(gridSettlement)
+assert.equal(attachNativeOfficialNav(gridSettlement, nativeValuationPayload).officialNav, 0.8766)
+assert.equal(shouldApplyValuationSettlement({
+  settlementDate: '2026-08-10',
+  estimateTime: '2026-08-10 16:00',
+  isPreOpen: false
+}), true)
+assert.equal(shouldApplyValuationSettlement({
+  settlementDate: '2026-08-07',
+  estimateTime: '2026-08-10 00:08',
+  isPreOpen: false
+}), false)
+assert.equal(shouldApplyValuationSettlement({
+  settlementDate: '2026-08-07',
+  estimateTime: '2026-08-10 00:08',
+  isPreOpen: true
+}), true)
+
+const completedSettlement = buildSettlementEstimate({
+  code: '002112',
+  name: '德邦鑫星价值灵活配置混合C',
+  settlement: {
+    date: '2026-08-10',
+    estimateChange: -3.7826,
+    realChange: -2.8,
+    officialNav: 4.6419,
+    source: 'grid'
+  }
+})
+assert.ok(completedSettlement)
+assert.equal(completedSettlement.estimate.gsz, '4.6419')
+const repairedSettlementResult = calculateHoldingProfit({
+  holding: {
+    code: '002112',
+    name: '德邦鑫星价值灵活配置混合C',
+    shareClass: 'C',
+    amount: 450,
+    buyNetValue: 4.5,
+    costPrice: 4.5,
+    shares: 100,
+    buyDate: '2026-07-01',
+    holdingDays: 40,
+    createdAt: 0
+  },
+  estimate: completedSettlement.estimate,
+  realChange: -2.8,
+  realChangeDate: '2026-08-10',
+  realNav: completedSettlement.officialNav,
+  realChangeIsCurrentPublication: true,
+  now: new Date('2026-08-10T13:00:00.000Z')
+})
+assert.equal(repairedSettlementResult.currentValue, 4.6419)
+assert.equal(repairedSettlementResult.marketValue, 464.19)
+assert.equal(repairedSettlementResult.profit, 14.19)
+assert.equal(repairedSettlementResult.todayProfit, -13.37)
+const nextDayPreOpenSettlementResult = calculateHoldingProfit({
+  holding: {
+    code: '002112',
+    name: '德邦鑫星价值灵活配置混合C',
+    shareClass: 'C',
+    amount: 450,
+    buyNetValue: 4.5,
+    costPrice: 4.5,
+    shares: 100,
+    buyDate: '2026-07-01',
+    holdingDays: 41,
+    createdAt: 0
+  },
+  estimate: completedSettlement.estimate,
+  realChange: -2.8,
+  realChangeDate: '2026-08-10',
+  realNav: completedSettlement.officialNav,
+  now: new Date('2026-08-10T17:00:00.000Z')
+})
+assert.equal(nextDayPreOpenSettlementResult.currentValue, 4.6419)
+assert.equal(nextDayPreOpenSettlementResult.todayProfit, 0)
 
 const history = [
   { date: '2026-07-21', netValue: 1.024, totalValue: 0, changeRate: 0.3 },

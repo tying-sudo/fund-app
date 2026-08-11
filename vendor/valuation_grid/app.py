@@ -340,6 +340,7 @@ class SellRequest(BaseModel):
     sell_shares: float              # 卖出份额（必填）
     sell_nav: Optional[float] = None  # 确认净值（选填，待确认时不填）
     sell_date: Optional[str] = None   # 卖出日期 YYYY-MM-DD
+    confirmation: str = ""
 
 class FundConfigRequest(BaseModel):
     max_position: Optional[int] = None
@@ -363,6 +364,11 @@ def _strategy_snapshot(fund_code: str) -> dict:
         # next normal strategy refresh retry signal generation.
         snapshot["signal_error"] = str(exc)
     return snapshot
+
+
+def _required_sell_confirmation(fund_code: str, shares: float) -> str:
+    """Bind a destructive sale request to the exact fund key and share count."""
+    return f"SELL {fund_code} {float(shares):.2f}"
 
 
 @app.get("/v1/positions")
@@ -409,6 +415,8 @@ def watch_fund(fund_code: str, req: WatchFundRequest):
 @app.post("/v1/position/{fund_code}/sell")
 def sell_fund(fund_code: str, req: SellRequest):
     """卖出批次（按份额）"""
+    if req.confirmation != _required_sell_confirmation(fund_code, req.sell_shares):
+        raise HTTPException(status_code=400, detail="sale confirmation is invalid")
     if req.sell_shares <= 0:
         raise HTTPException(status_code=400, detail="卖出份额必须大于0")
     try:
@@ -479,8 +487,10 @@ class UpdateSellNavRequest(BaseModel):
 
 class SellFifoRequest(BaseModel):
     total_sell_shares: float
+    request_id: Optional[str] = None
     sell_nav: Optional[float] = None
     sell_date: Optional[str] = None
+    confirmation: str = ""
 
 
 class JdGridAdjustment(BaseModel):
@@ -1072,11 +1082,13 @@ def _legacy_import_jd_positions(req: JdGridImportRequest):
 @app.post("/v1/position/{fund_code}/sell-fifo")
 def sell_fund_fifo(fund_code: str, req: SellFifoRequest):
     """按FIFO顺序卖出指定总份额（模拟支付宝先进先出行为）"""
+    if req.confirmation != _required_sell_confirmation(fund_code, req.total_sell_shares):
+        raise HTTPException(status_code=400, detail="sale confirmation is invalid")
     if req.total_sell_shares <= 0:
         raise HTTPException(status_code=400, detail="卖出份额必须大于0")
     try:
         result = sell_fifo(fund_code, req.total_sell_shares,
-                           req.sell_nav, req.sell_date)
+                           req.sell_nav, req.sell_date, req.request_id)
         return {"success": True, **result, "fund_key": fund_code, **_strategy_snapshot(fund_code)}
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))

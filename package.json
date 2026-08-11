@@ -8,7 +8,7 @@
     "dev:api": "node dev-server.mjs",
     "dev:all": "concurrently \"npm run dev:api\" \"npm run dev\"",
     "build": "vite build",
-    "test:holding": "node --experimental-strip-types scripts/verify-holding-settlement.mjs",
+    "test:holding": "node --experimental-strip-types scripts/verify-holding-settlement.mjs && node scripts/verify-holding-store-settlement.mjs",
     "test:grid-trade-import": "node --experimental-strip-types --test src/utils/gridTradeImport.test.ts",
     "test:grid-jd-import": "node --experimental-strip-types --test src/utils/gridJdImport.test.ts",
     "test:grid-jd-pending-refresh": "node --experimental-strip-types --test src/utils/gridJdPendingRefresh.test.ts",

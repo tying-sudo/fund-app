@@ -25,6 +25,12 @@ import JdCookieImportDialog from '@/components/JdCookieImportDialog.vue'
 import JdImportProgress from '@/components/JdImportProgress.vue'
 import { mergeStrategyOrder, sortByStrategyOrder } from '@/utils/gridStrategyOrder'
 import {
+  gridStrategyConditionSections,
+  gridStrategyMetricSnapshot,
+  gridStrategySignalLabel,
+  gridStrategySignalTone
+} from '@/utils/gridStrategyPresentation'
+import {
   calculateGridConversionTransferIn,
   resolveGridTradeConfirmationDate,
   resolveGridTradeDirection
@@ -59,6 +65,7 @@ import {
   updateGridPositionConfig,
   updateGridSellNav,
   type GridFeeScheduleItem,
+  type GridFifoSellPlan,
   type GridFitness,
   type GridBatch,
   type GridMutationResult,
@@ -157,7 +164,7 @@ const positionForm = reactive({
   isRebuy: false,
   pendingRebuyId: ''
 })
-const sellForm = reactive({ shares: '', nav: '', sellDate: todayString() })
+const sellForm = reactive({ shares: '', nav: '', sellDate: todayString(), requestId: '' })
 const maxPositionForm = reactive({ value: '5000' })
 const feeScheduleForm = reactive({ value: '7:1.5,30:0.5,0:0' })
 const volSensitivity = ref<GridVolSensitivity>({})
@@ -328,6 +335,20 @@ function formatPercent(value?: number | null) {
 
 function formatMoney(value?: number | null, digits = 2) {
   return Number.isFinite(value) ? `¥${Number(value).toFixed(digits)}` : '--'
+}
+
+function fifoSellPlan(signal: GridSignal): GridFifoSellPlan | null {
+  const candidates = [signal, ...(signal.all_signals || [])]
+  for (const candidate of candidates) {
+    const plan = candidate.fifo_sell_plan
+    if (plan && Number(plan.total_shares) > 0) return plan
+  }
+  return null
+}
+
+function fifoSellPlanNetProfit(plan: GridFifoSellPlan) {
+  const value = Number(plan.total_estimated_profit)
+  return Number.isFinite(value) ? value : null
 }
 
 function changeClass(value?: number | null) {
@@ -1046,9 +1067,7 @@ async function openHistory(fund: GridFund) {
 }
 
 function actionClass(signal: GridSignal) {
-  if (signal.action === 'sell') return 'sell'
-  if (signal.action === 'buy') return 'buy'
-  return signal.alert ? 'alert' : 'hold'
+  return gridStrategySignalTone(signal)
 }
 
 function signalName(row: { code: string; position?: GridPosition }) {
@@ -1698,7 +1717,10 @@ async function importRecognizedTrades() {
               amount: Number(row.amount), nav: Number(row.nav), note, buy_date: row.navDate, owner
             })
           : await sellGridPositionFifo(fundKey, {
-              total_sell_shares: Number(row.shares), sell_nav: Number(row.nav), sell_date: row.navDate
+              total_sell_shares: Number(row.shares),
+              request_id: `grid-trade-import-${fundKey}-${row.id}`,
+              sell_nav: Number(row.nav),
+              sell_date: row.navDate
             })
         applyStrategyMutation(result, fundKey)
         row.status = 'imported'
@@ -1795,6 +1817,7 @@ async function savePosition() {
 
 async function openSellEditor(fundKey: string, position?: GridPosition, suggestedShares?: number | null) {
   activePositionKey.value = fundKey
+  sellForm.requestId = crypto.randomUUID()
   try {
     activePosition.value = await fetchGridPosition(fundKey)
   } catch {
@@ -1810,6 +1833,27 @@ async function openSellEditor(fundKey: string, position?: GridPosition, suggeste
   else sellEditorOpen.value = true
 }
 
+async function executeSignalFifoSell(row: { signal: GridSignal; position?: GridPosition }) {
+  const plan = fifoSellPlan(row.signal)
+  if (!plan || !Number.isFinite(Number(plan.total_shares)) || Number(plan.total_shares) <= 0) {
+    return showToast('源项目未给出可执行的 FIFO 卖出计划')
+  }
+  activePositionKey.value = row.signal.fund_code
+  sellForm.requestId = crypto.randomUUID()
+  sellForm.shares = Number(plan.total_shares).toFixed(2)
+  sellForm.nav = ''
+  sellForm.sellDate = todayString()
+  try {
+    activePosition.value = await fetchGridPosition(row.signal.fund_code)
+  } catch {
+    activePosition.value = row.position || null
+  }
+  if (Number(plan.total_shares) > availableShares() + 0.001) {
+    return showToast('源项目计划份额已超过当前可卖持仓，请刷新信号后重试')
+  }
+  sellEditorOpen.value = true
+}
+
 function availableShares() {
   return activePosition.value?.batches
     ?.filter((batch) => batch.status === 'holding')
@@ -1819,14 +1863,21 @@ function availableShares() {
 async function saveSell() {
   const shares = Number(sellForm.shares)
   const nav = sellForm.nav.trim() ? Number(sellForm.nav) : undefined
+  if (!sellForm.requestId) return showToast('卖出请求标识缺失，请关闭后重新打开卖出窗口')
   if (!Number.isFinite(shares) || shares <= 0) return showToast('请输入有效卖出份额')
   if (shares > availableShares() + 0.001) return showToast('卖出份额不能超过当前持仓')
   if (nav !== undefined && (!Number.isFinite(nav) || nav <= 0)) return showToast('确认净值必须大于 0')
   sellSaving.value = true
   try {
-    const result = await sellGridPositionFifo(activePositionKey.value, { total_sell_shares: shares, sell_nav: nav, sell_date: sellForm.sellDate })
+    const result = await sellGridPositionFifo(activePositionKey.value, {
+      total_sell_shares: shares,
+      request_id: sellForm.requestId,
+      sell_nav: nav,
+      sell_date: sellForm.sellDate
+    })
     applyStrategyMutation(result, activePositionKey.value)
     sellEditorOpen.value = false
+    sellForm.requestId = ''
     showToast('FIFO 卖出已录入')
     void refreshStrategy(true)
   } catch (error) {
@@ -1890,7 +1941,12 @@ async function saveBatchSell() {
   if (nav !== undefined && (!Number.isFinite(nav) || nav <= 0)) return showToast('确认净值必须大于 0')
   batchSellSaving.value = true
   try {
-    const result = await sellGridBatch(activePositionKey.value, { batch_id: batch.id, sell_shares: shares, sell_nav: nav, sell_date: batchSellForm.sellDate })
+    const result = await sellGridBatch(activePositionKey.value, {
+      batch_id: batch.id,
+      sell_shares: shares,
+      sell_nav: nav,
+      sell_date: batchSellForm.sellDate
+    })
     applyStrategyMutation(result, activePositionKey.value)
     batchSellOpen.value = false
     showToast('该批次卖出已录入')
@@ -2401,7 +2457,7 @@ onBeforeUnmount(() => {
             <span v-if="collapsedStrategyFunds.has(row.signal.fund_code)" class="drag-indicator" title="长按拖动排序"><van-icon name="bars" /></span>
             <span v-if="row.signal._is_rebuy || row.signal.rebuy_recommendation" class="rebuy-badge">{{ rebuyLabel(row.signal) }}</span>
             <span class="regime-signal-icon" :title="`${regimeLabel(row.signal.market_analysis?.market_regime || row.signal.market_regime)}${row.signal.market_analysis?.regime_source === 'manual' ? '（手动）' : '（自动）'}`">{{ regimeIcon(row.signal.market_analysis?.market_regime || row.signal.market_regime) }}</span>
-            <span class="signal-badge" :class="actionClass(row.signal)">{{ row.signal.signal_name || '观察' }}</span>
+            <span class="signal-badge" :class="actionClass(row.signal)">{{ gridStrategySignalLabel(row.signal) }}</span>
           </div>
         </header>
         <div v-if="!collapsedStrategyFunds.has(row.signal.fund_code)" class="signal-body">
@@ -2411,8 +2467,23 @@ onBeforeUnmount(() => {
             <div class="rebuy-command"><strong>建议回补 {{ formatMoney(row.signal.amount || row.signal.rebuy_recommendation?.amount) }}</strong><button type="button" @click="openRebuy(row)">执行回补</button></div>
           </div>
           <div v-if="row.signal.action === 'buy' && row.signal.amount" class="signal-command buy">建议买入 ¥{{ row.signal.amount.toFixed(2) }}</div>
-          <div v-else-if="row.signal.action === 'sell'" class="signal-command sell">建议卖出 {{ row.signal.sell_shares || '--' }} 份</div>
+          <div v-else-if="row.signal.action === 'sell' && !fifoSellPlan(row.signal)" class="signal-command sell">建议卖出 {{ row.signal.sell_shares || '--' }} 份</div>
           <div v-else-if="row.signal.alert" class="signal-command alert">{{ row.signal.alert_msg || '风险提示' }}</div>
+
+          <section v-if="fifoSellPlan(row.signal)" class="fifo-sell-plan">
+            <header>
+              <strong>{{ fifoSellPlan(row.signal)?.instruction || `在支付宝输入卖出 ${Number(fifoSellPlan(row.signal)?.total_shares || 0).toFixed(2)} 份` }}</strong>
+              <span>涉及 {{ fifoSellPlan(row.signal)?.batch_count || fifoSellPlan(row.signal)?.steps?.length || 0 }} 个批次</span>
+            </header>
+            <p v-if="fifoSellPlan(row.signal)?.has_passthrough" class="fifo-warning">{{ fifoSellPlan(row.signal)?.passthrough_warning || '支付宝按先进先出扣减，中间批次会被穿过一并卖出' }}</p>
+            <div v-for="step in fifoSellPlan(row.signal)?.steps || []" :key="`${step.batch_id}-${step.buy_date}`" class="fifo-sell-step" :class="{ passthrough: step.is_passthrough }">
+              <span><b v-if="step.is_passthrough">[穿过]</b> {{ step.batch_id }} · {{ step.buy_date }} · 持有{{ step.hold_days }}天 · {{ step.reason || row.signal.signal_name }}</span>
+              <em>{{ Number(step.sell_shares || 0).toFixed(2) }}份 · 费率{{ Number(step.fee_rate || 0) }}% · <b :class="changeClass(step.estimated_net_profit)">{{ formatMoney(step.estimated_net_profit) }}</b></em>
+            </div>
+            <footer>
+              <b>合计</b><span>手续费 {{ formatMoney(fifoSellPlan(row.signal)?.total_estimated_fee) }} · 净收益 <strong :class="changeClass(fifoSellPlanNetProfit(fifoSellPlan(row.signal)!))">{{ formatMoney(fifoSellPlanNetProfit(fifoSellPlan(row.signal)!)) }}</strong></span>
+            </footer>
+          </section>
 
           <div class="signal-meta signal-meta-highlight">
             <span v-if="strategyParams(row.signal).regime_first_build_ratio">建仓 {{ Math.round(Number(strategyParams(row.signal).regime_first_build_ratio) * 100) }}%</span>
@@ -2429,10 +2500,10 @@ onBeforeUnmount(() => {
               <span v-if="row.signal.market_analysis?.current_nav"><b>估算净值</b><em>{{ row.signal.market_analysis.current_nav.toFixed(4) }}</em></span>
             </div>
             <div class="signal-quality-stats">
-              <span v-if="Number.isFinite(row.signal.market_analysis?.confidence)"><b>置信度</b><em>{{ Math.round(Number(row.signal.market_analysis?.confidence) * 100) }}%</em></span>
+              <span><b>置信度</b><em>{{ gridStrategyMetricSnapshot(row.signal).confidence === null ? '--' : `${Math.round(Number(gridStrategyMetricSnapshot(row.signal).confidence) * 100)}%` }}</em></span>
               <span v-if="strategyScoreFor(row) !== null"><b>基金适配评分</b><em>{{ strategyScoreFor(row) }}</em></span>
               <span v-if="row.signal.market_analysis?.strategy_params?.risk_multiplier" class="risk-multiplier"><b>风险系数</b><em>{{ row.signal.market_analysis.strategy_params.risk_multiplier }}x</em></span>
-              <button class="inline-parameter" type="button" @click="openVolSensitivityEditor(row.signal.fund_code, row.position)">灵敏度 {{ strategyParams(row.signal).vol_sensitivity ?? 1 }}x</button>
+              <button class="inline-parameter" type="button" :title="`参数来源：${gridStrategyMetricSnapshot(row.signal).sensitivitySourceLabel}`" @click="openVolSensitivityEditor(row.signal.fund_code, row.position)">灵敏度 {{ gridStrategyMetricSnapshot(row.signal).sensitivity === null ? '--' : `${Number(gridStrategyMetricSnapshot(row.signal).sensitivity).toFixed(2)}x` }}<sup>{{ gridStrategyMetricSnapshot(row.signal).sensitivitySourceLabel }}</sup></button>
               <button class="strategy-info-button" type="button" title="策略条件说明" @click="openStrategyInfo(row.signal)">?</button>
             </div>
           </div>
@@ -2453,7 +2524,8 @@ onBeforeUnmount(() => {
 
           <div class="signal-actions position-actions">
             <button class="action-button" type="button" @click="openPositionEditor(row.signal.fund_code)"><van-icon name="plus" /> 买入观察</button>
-            <button v-if="holdingBatchCount(row.position)" class="action-button sell" type="button" @click="openSellEditor(row.signal.fund_code, row.position, row.signal.sell_shares)"><van-icon name="cash-back-record" /> 买入卖出</button>
+            <button v-if="holdingBatchCount(row.position)" class="action-button sell" type="button" @click="openSellEditor(row.signal.fund_code, row.position)"><van-icon name="cash-back-record" /> 录入卖出</button>
+            <button v-if="fifoSellPlan(row.signal) && holdingBatchCount(row.position)" class="action-button execute-sell" type="button" @click="executeSignalFifoSell(row)"><van-icon name="cash-back-record" /> 执行卖出({{ Number(fifoSellPlan(row.signal)?.total_shares || 0).toFixed(2) }}份)</button>
             <button class="action-button danger" type="button" @click="deletePosition(row.signal.fund_code)"><van-icon name="delete-o" /> 移除</button>
           </div>
           <div v-if="positionBatches(row.position).length || sellRecords(row.position).length || row.position?.jd_baseline_missing_date" class="position-table-scroll">
@@ -2639,9 +2711,7 @@ onBeforeUnmount(() => {
     <van-popup v-model:show="strategyInfoOpen" position="bottom" round :style="{ maxHeight: '72vh' }">
       <div class="native-dialog strategy-info-dialog">
         <div class="dialog-title">策略条件 <van-icon name="cross" @click="strategyInfoOpen = false" /></div>
-        <div class="strategy-rule"><b>买入</b><span>大跌 {{ strategyParams(strategyInfoSignal).dip_buy_threshold ?? '--' }}%，连续下跌、补仓间隔和趋势条件共同确认；延迟回补在触发净值回落后才执行。</span></div>
-        <div class="strategy-rule"><b>卖出</b><span>冲高止盈、慢涨止盈、回撤止盈、趋势走弱与止损共同计算；实际卖出按选定批次或 FIFO 记录。</span></div>
-        <div class="strategy-rule"><b>风控</b><span>止损阈值 {{ strategyParams(strategyInfoSignal).stop_loss_base ?? '--' }}%，灾难阈值 {{ strategyParams(strategyInfoSignal).disaster_loss_threshold ?? '--' }}%，风险系数 {{ strategyParams(strategyInfoSignal).risk_multiplier ?? 1 }}x，灵敏度 {{ strategyParams(strategyInfoSignal).vol_sensitivity ?? 1 }}x。</span></div>
+        <div v-for="section in gridStrategyConditionSections(strategyParams(strategyInfoSignal))" :key="section.key" class="strategy-rule" :class="section.key"><b>{{ section.label }}</b><span>{{ section.detail }}</span></div>
       </div>
     </van-popup>
 
@@ -2705,7 +2775,7 @@ onBeforeUnmount(() => {
 .regime-strip { display: flex; align-items: center; gap: 6px; margin: 0 14px 10px; padding: 8px 10px; border: 1px solid var(--border-color); border-radius: 5px; background: var(--bg-secondary); font-size: 11px; }.regime-strip > span { flex: 0 0 auto; color: var(--text-secondary); margin-right: 2px; white-space: nowrap; }.regime-strip button { flex: 0 0 auto; min-height: 26px; padding: 0 9px; border: 1px solid var(--border-color); border-radius: 4px; color: var(--text-secondary); background: transparent; font-size: 11px; line-height: 1; white-space: nowrap; cursor: pointer; }.regime-strip button.active { border-color: var(--color-primary); color: var(--color-primary); background: var(--color-primary-bg); }.regime-strip small { min-width: 0; overflow: hidden; margin-left: auto; color: var(--text-secondary); text-overflow: ellipsis; white-space: nowrap; }
 .budget-strip { display: flex; align-items: center; gap: 7px; padding: 5px 14px; border-bottom: 1px solid var(--border-color); color: var(--text-secondary); font-size: 10px; }.budget-strip b { color: #059669; }.budget-track { flex: 1; height: 4px; overflow: hidden; border-radius: 2px; background: var(--border-color); }.budget-track i { display: block; height: 100%; border-radius: inherit; background: #f59e0b; }.strategy-commands { display: flex; align-items: center; gap: 5px; }.signal-card { margin: 0 10px 9px; border: 1px solid var(--border-color); border-radius: 6px; background: var(--bg-secondary); overflow: hidden; }.signal-header { display: flex; align-items: center; justify-content: space-between; gap: 10px; min-height: 42px; padding: 0 12px; border-bottom: 1px solid var(--border-color); }.signal-name { color: var(--text-primary); font-size: 13px; font-weight: 650; }.owner-tag { display: inline-flex; margin-left: 5px; padding: 1px 5px; border-radius: 3px; color: #4338ca; background: #e0e7ff; font-size: 9px; font-weight: 650; }.signal-badge { flex: 0 0 auto; padding: 3px 7px; border-radius: 3px; font-size: 10px; font-weight: 650; }.signal-badge.buy { color: #047857; background: rgba(16,185,129,.16); }.signal-badge.sell { color: #dc2626; background: rgba(239,68,68,.14); }.signal-badge.alert { color: #b45309; background: rgba(245,158,11,.16); }.signal-badge.hold { color: var(--text-secondary); background: var(--bg-primary); }.signal-body { padding: 10px 12px; }.signal-reason, .decision-note { margin: 0; color: var(--text-secondary); font-size: 12px; line-height: 18px; }.decision-note { margin-top: 9px; font-size: 11px; }.signal-command { margin-top: 8px; padding: 7px 9px; border-radius: 4px; font-size: 12px; font-weight: 650; }.signal-command.buy { color: #047857; background: rgba(16,185,129,.12); }.signal-command.sell { color: #dc2626; background: rgba(239,68,68,.12); }.signal-command.alert { color: #b45309; background: rgba(245,158,11,.12); }.rebuy-panel { display: grid; gap: 6px; margin-top: 8px; padding: 8px 9px; border: 1px solid #c7d2fe; border-radius: 5px; color: #4338ca; background: #eef2ff; font-size: 11px; }.rebuy-panel div:first-child { display: grid; gap: 2px; }.rebuy-command { display: flex; align-items: center; justify-content: space-between; gap: 8px; }.rebuy-command button { min-height: 25px; padding: 0 8px; border: 0; border-radius: 4px; color: #fff; background: #4f46e5; font-size: 10px; font-weight: 650; }.signal-meta, .signal-stats { display: flex; flex-wrap: wrap; gap: 8px 14px; margin-top: 9px; color: var(--text-secondary); font-size: 10px; }.inline-parameter, .summary-parameter, .watch-parameter { padding: 0; border: 0; color: inherit; background: transparent; font: inherit; cursor: pointer; }.inline-parameter, .summary-parameter { border-bottom: 1px dashed var(--text-secondary); }.summary-parameter b { color: var(--text-primary); font-variant-numeric: tabular-nums; }.watch-parameter { color: #4338ca; border-bottom: 1px dashed #4338ca; }.signal-actions { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 10px; }.action-button { display: inline-flex; align-items: center; gap: 4px; min-height: 27px; padding: 0 8px; border: 1px solid var(--border-color); border-radius: 4px; color: var(--text-secondary); background: var(--bg-primary); font-size: 10px; cursor: pointer; }.action-button.sell, .action-button.danger { color: #dc2626; }.signal-stats { align-items: center; padding-top: 8px; border-top: 1px solid var(--border-color); }.signal-stats span { display: flex; gap: 5px; }.signal-stats b { color: var(--text-secondary); font-weight: 500; }.signal-stats em { font-style: normal; font-weight: 650; }.strategy-info-button { width: 18px; height: 18px; border: 1px solid var(--border-color); border-radius: 50%; color: var(--text-secondary); background: transparent; font-size: 10px; cursor: pointer; }.trend-chart { display: flex; align-items: stretch; gap: 3px; height: 76px; margin-top: 10px; padding: 2px 0; border-bottom: 1px solid var(--border-color); }.trend-day { display: grid; flex: 1; grid-template-rows: 18px 1fr 14px; align-items: end; min-width: 0; text-align: center; }.trend-day em { overflow: hidden; color: var(--text-secondary); font-size: 7px; font-style: normal; text-overflow: clip; white-space: nowrap; }.trend-day i { justify-self: center; width: min(100%, 13px); border-radius: 1px 1px 0 0; background: var(--text-secondary); }.trend-day.up i { background: var(--color-up); }.trend-day.down i { background: var(--color-down); }.trend-day small { overflow: hidden; color: var(--text-secondary); font-size: 7px; white-space: nowrap; }.position-summary { display: flex; flex-wrap: wrap; gap: 7px 12px; margin-top: 9px; padding: 8px; border: 1px solid var(--border-color); border-radius: 4px; color: var(--text-secondary); background: var(--bg-primary); font-size: 10px; }.position-summary span { white-space: nowrap; }.position-summary b { color: var(--text-primary); font-variant-numeric: tabular-nums; }.watch-summary { margin-top: 9px; padding: 8px; border: 1px solid #c7d2fe; border-radius: 4px; color: #4338ca; background: #eef2ff; font-size: 11px; line-height: 17px; }.position-table-scroll { overflow-x: auto; margin: 9px -12px -10px; }.position-table { width: 100%; min-width: 660px; border-collapse: collapse; color: var(--text-secondary); font-size: 10px; }.position-table th, .position-table td { padding: 6px 7px; border-top: 1px solid var(--border-color); text-align: left; white-space: nowrap; }.position-table th { color: var(--text-secondary); font-weight: 500; background: var(--bg-primary); }.position-table td:first-child { color: var(--text-primary); font-family: ui-monospace, monospace; font-size: 9px; }.sold-label td { color: var(--text-secondary) !important; font-family: inherit !important; background: var(--bg-primary); }.sold-row { color: var(--text-secondary); }.table-action { margin-right: 5px; padding: 1px 4px; border: 1px solid #f59e0b; border-radius: 3px; color: #b45309; background: transparent; font-size: 9px; cursor: pointer; }.table-action.sell, .table-action.danger { border-color: transparent; color: #dc2626; }.table-action.danger { color: #9ca3af; }
 .jd-import-feedback { display: flex; align-items: flex-start; gap: 7px; margin: 0 0 6px; padding: 8px 10px; border: 1px solid #a7f3d0; border-radius: 4px; color: #047857; background: #ecfdf5; font-size: 11px; line-height: 17px; overflow-wrap: anywhere; }.jd-import-feedback .van-icon { flex: 0 0 auto; margin-top: 2px; }.jd-import-feedback.warning { border-color: #fcd34d; color: #92400e; background: #fffbeb; }
-.native-dialog, .history-panel { padding: 16px; background: var(--bg-secondary); }.dialog-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; color: var(--text-primary); font-size: 15px; font-weight: 650; }.dialog-title :deep(.van-icon) { color: var(--text-secondary); cursor: pointer; }.info-dialog p, .form-hint { margin: 0; color: var(--text-secondary); font-size: 12px; line-height: 19px; }.parameter-menu { display: grid; gap: 8px; }.parameter-menu button { display: grid; grid-template-columns: minmax(0, 1fr) auto 16px; align-items: center; gap: 8px; min-height: 42px; padding: 0 10px; border: 1px solid var(--border-color); border-radius: 4px; color: var(--text-primary); background: var(--bg-primary); font-size: 12px; text-align: left; cursor: pointer; }.parameter-menu button b { overflow: hidden; max-width: 180px; color: var(--text-secondary); font-size: 10px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }.parameter-menu button :deep(.van-icon) { color: var(--text-secondary); }.batch-sell-context { display: flex; flex-wrap: wrap; gap: 5px 10px; padding: 8px; border: 1px solid var(--border-color); border-radius: 4px; color: var(--text-secondary); background: var(--bg-primary); font-size: 10px; font-variant-numeric: tabular-nums; }.batch-sell-context span { white-space: nowrap; }.strategy-info-dialog { display: grid; gap: 9px; }.strategy-rule { display: grid; grid-template-columns: 34px 1fr; gap: 8px; color: var(--text-secondary); font-size: 12px; line-height: 18px; }.strategy-rule b { align-self: start; padding: 1px 4px; border-radius: 3px; color: #4338ca; background: #eef2ff; font-size: 10px; text-align: center; }.form-dialog { display: grid; gap: 10px; }.form-dialog label { display: grid; gap: 5px; color: var(--text-secondary); font-size: 11px; }.form-dialog input { width: 100%; height: 34px; box-sizing: border-box; padding: 0 9px; border: 1px solid var(--border-color); border-radius: 4px; outline: none; color: var(--text-primary); background: var(--bg-primary); font-size: 13px; }.form-dialog input:focus { border-color: var(--color-primary); }.form-dialog .command-button { margin-top: 2px; }.history-list { max-height: 56vh; overflow-y: auto; }.history-row { display: grid; grid-template-columns: 1.2fr 1fr .8fr; min-height: 38px; align-items: center; border-bottom: 1px solid var(--border-color); color: var(--text-secondary); font-size: 12px; }.history-row b { text-align: right; font-variant-numeric: tabular-nums; }
+.native-dialog, .history-panel { padding: 16px; background: var(--bg-secondary); }.dialog-title { display: flex; align-items: center; justify-content: space-between; margin-bottom: 12px; color: var(--text-primary); font-size: 15px; font-weight: 650; }.dialog-title :deep(.van-icon) { color: var(--text-secondary); cursor: pointer; }.info-dialog p, .form-hint { margin: 0; color: var(--text-secondary); font-size: 12px; line-height: 19px; }.parameter-menu { display: grid; gap: 8px; }.parameter-menu button { display: grid; grid-template-columns: minmax(0, 1fr) auto 16px; align-items: center; gap: 8px; min-height: 42px; padding: 0 10px; border: 1px solid var(--border-color); border-radius: 4px; color: var(--text-primary); background: var(--bg-primary); font-size: 12px; text-align: left; cursor: pointer; }.parameter-menu button b { overflow: hidden; max-width: 180px; color: var(--text-secondary); font-size: 10px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }.parameter-menu button :deep(.van-icon) { color: var(--text-secondary); }.batch-sell-context { display: flex; flex-wrap: wrap; gap: 5px 10px; padding: 8px; border: 1px solid var(--border-color); border-radius: 4px; color: var(--text-secondary); background: var(--bg-primary); font-size: 10px; font-variant-numeric: tabular-nums; }.batch-sell-context span { white-space: nowrap; }.strategy-info-dialog { display: grid; max-height: 72vh; overflow-y: auto; gap: 9px; }.strategy-rule { display: grid; grid-template-columns: 34px minmax(0, 1fr); gap: 8px; color: var(--text-secondary); font-size: 12px; line-height: 18px; }.strategy-rule span { overflow-wrap: anywhere; }.strategy-rule b { align-self: start; padding: 1px 4px; border-radius: 3px; font-size: 10px; text-align: center; }.strategy-rule.buy b { color: #047857; background: #d1fae5; }.strategy-rule.sell b { color: #dc2626; background: #fee2e2; }.strategy-rule.risk b { color: #92400e; background: #fef3c7; }.form-dialog { display: grid; gap: 10px; }.form-dialog label { display: grid; gap: 5px; color: var(--text-secondary); font-size: 11px; }.form-dialog input { width: 100%; height: 34px; box-sizing: border-box; padding: 0 9px; border: 1px solid var(--border-color); border-radius: 4px; outline: none; color: var(--text-primary); background: var(--bg-primary); font-size: 13px; }.form-dialog input:focus { border-color: var(--color-primary); }.form-dialog .command-button { margin-top: 2px; }.history-list { max-height: 56vh; overflow-y: auto; }.history-row { display: grid; grid-template-columns: 1.2fr 1fr .8fr; min-height: 38px; align-items: center; border-bottom: 1px solid var(--border-color); color: var(--text-secondary); font-size: 12px; }.history-row b { text-align: right; font-variant-numeric: tabular-nums; }
 .dialog-actions { display: flex; align-items: center; gap: 3px; }.dialog-actions .icon-button { width: 28px; height: 28px; }
 .trade-import-dialog { display: flex; height: 100%; box-sizing: border-box; flex-direction: column; }.trade-import-context { display: flex; flex-wrap: wrap; gap: 5px 14px; margin-bottom: 8px; color: var(--text-secondary); font-size: 11px; }.trade-import-context b { color: var(--text-primary); }.loading-state.compact { min-height: 100px; }.trade-import-status { flex: 0 0 auto; padding-bottom: 8px; }.trade-import-list { flex: 1; min-height: 0; overflow-y: auto; border-top: 1px solid var(--border-color); }.trade-import-row { padding: 10px 0; border-bottom: 1px solid var(--border-color); }.trade-import-row.status-imported { opacity: .62; }.trade-import-row.status-failed { border-left: 3px solid #ef4444; padding-left: 8px; }.trade-import-row-head { display: grid; grid-template-columns: 24px 70px minmax(126px, 1fr) minmax(112px, .8fr) auto; align-items: end; gap: 6px; }.trade-import-row-head label, .trade-import-confirmation label { display: grid; gap: 3px; color: var(--text-secondary); font-size: 10px; }.trade-import-row-head select, .trade-import-row-head input, .trade-import-confirmation input, .trade-import-values input { width: 100%; height: 32px; box-sizing: border-box; padding: 0 7px; border: 1px solid var(--border-color); border-radius: 4px; outline: none; color: var(--text-primary); background: var(--bg-primary); font-size: 12px; }.trade-import-description { overflow: hidden; margin: 7px 0; color: var(--text-secondary); font-size: 10px; line-height: 15px; text-overflow: ellipsis; white-space: nowrap; }.trade-import-confirmation { display: flex; align-items: end; gap: 10px; margin: 7px 0; color: var(--text-secondary); font-size: 10px; }.trade-import-confirmation label { width: min(160px, 48%); }.trade-import-values { display: grid; grid-template-columns: repeat(auto-fit, minmax(108px, 1fr)); gap: 6px; }.trade-import-values label { display: grid; gap: 4px; color: var(--text-secondary); font-size: 10px; }.import-state { font-size: 10px; white-space: nowrap; }.import-state.success { color: #059669; }.import-state.failed { color: #dc2626; }
 .signal-title-group { display: flex; min-width: 0; align-items: center; gap: 5px; overflow: hidden; white-space: nowrap; }.strategy-title { display: inline-flex; flex: 0 0 auto; align-items: center; gap: 5px; min-height: 28px; padding: 0; border: 0; color: var(--text-primary); background: transparent; cursor: pointer; }.strategy-code { color: var(--text-secondary); font-family: ui-monospace, monospace; font-size: 10px; font-weight: 500; text-decoration: none; }.strategy-code:hover { color: var(--color-primary); }.strategy-fund-name { min-width: 0; overflow: hidden; padding: 0; border: 0; color: var(--text-primary); background: transparent; font-size: 13px; font-weight: 650; text-align: left; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; }.strategy-fund-name:hover { color: var(--color-primary); }.signal-header-state { display: flex; flex: 0 0 auto; align-items: center; gap: 5px; }.rebuy-badge { max-width: 140px; overflow: hidden; padding: 3px 7px; border-radius: 10px; color: #047857; background: #d1fae5; font-size: 10px; font-weight: 650; text-overflow: ellipsis; white-space: nowrap; }
@@ -2872,6 +2942,7 @@ onBeforeUnmount(() => {
 .signal-quality-stats { justify-content: center; }
 .signal-quality-stats .risk-multiplier { flex-basis: auto; }
 .signal-quality-stats .inline-parameter { color: var(--text-secondary); }
+.signal-quality-stats .inline-parameter sup { margin-left: 2px; color: #94a3b8; font-size: 7px; }
 .regime-signal-icon { font-size: 14px; line-height: 1; }
 .position-actions { margin-top: 10px; margin-bottom: 2px; }
 :global([data-theme="dark"]) .signal-meta-highlight { background: rgba(120, 84, 20, .16); border-color: rgba(245, 158, 11, .42); }
@@ -3015,6 +3086,18 @@ onBeforeUnmount(() => {
 .signal-card-ghost { opacity: .35; }
 .signal-card-dragging { border-color: #f59e0b; box-shadow: 0 8px 22px rgba(15, 23, 42, .2); }
 .drag-indicator { display: inline-flex; align-items: center; color: var(--text-secondary); font-size: 14px; }
+.fifo-sell-plan { margin-top: 8px; padding: 8px 9px; border: 1px solid #fecaca; border-radius: 5px; color: #475569; background: #fff1f2; font-size: 10px; line-height: 16px; }
+.fifo-sell-plan header, .fifo-sell-plan footer { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.fifo-sell-plan header strong { color: #dc2626; font-size: 12px; }
+.fifo-sell-plan header span { color: #94a3b8; white-space: nowrap; }
+.fifo-warning { margin: 5px 0; padding: 3px 6px; color: #92400e; background: #fef3c7; border-radius: 3px; }
+.fifo-sell-step { display: flex; justify-content: space-between; gap: 8px; }
+.fifo-sell-step span { min-width: 0; }
+.fifo-sell-step em { flex: 0 0 auto; color: #64748b; font-style: normal; white-space: nowrap; }
+.fifo-sell-step em b, .fifo-sell-plan footer strong { color: #059669; }
+.fifo-sell-step.passthrough { color: #92400e; }
+.fifo-sell-plan footer { margin-top: 4px; padding-top: 4px; border-top: 1px solid #fecaca; color: #1f2937; }
+.action-button.execute-sell { color: #dc2626; border-color: #ef4444; font-weight: 700; }
 </style>
 
 <style scoped>
