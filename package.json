@@ -1,7 +1,7 @@
 {
   "name": "fund-app",
   "private": true,
-  "version": "1.0.144",
+  "version": "1.0.150",
   "type": "module",
   "scripts": {
     "dev": "vite",

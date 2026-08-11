@@ -108,13 +108,13 @@ const apkName = `fund-app-${version}-${versionCode}.apk`
 const manifest = {
   version,
   versionCode,
-  minimumVersion: '1.0.127',
+  minimumVersion: '1.0.144',
   forceUpdate: false,
-  title: '京东网格批次与盘中估值修复',
+  title: '网格卖出与估值结算修复',
   releaseNotes: [
-    '补抓京东账号首屏交易，详情页限制并发并自动重试，显示页数、原始行数和失败统计',
-    '只有与当前份额严格对账的完整周期才覆盖网格批次，旧待确认交易不会恢复已清仓基金',
-    '修复开盘后仍命中昨日净值缓存导致持仓页盘中估值显示为空的问题'
+    '网格卖出按源策略 FIFO 计划展示批次、费用、收益与穿透风险，并区分手工录入和策略执行',
+    '卖出接口增加确认绑定和请求幂等，避免网络重试重复扣减持仓，同时允许下一笔真实交易',
+    '持仓页补全已公布净值后的估值结算金额，修复跨日和并发刷新造成的字段缺失'
   ],
   apkFileName: apkName,
   sha256: await sha256(apkPath),
@@ -143,7 +143,7 @@ try {
     throw error
   }
 
-  const gridFiles = ['app.py', 'positions.py', 'valuation/providers.py']
+  const gridFiles = ['app.py', 'demo.html', 'positions.py', 'valuation/providers.py']
   const gridBackup = `${gridRemote}/.jd-import-backup-${releaseStamp}`
   await exec(client, `install -d -m 0755 ${gridBackup}`)
   for (const file of gridFiles) {
