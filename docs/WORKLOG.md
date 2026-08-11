@@ -6,6 +6,10 @@ Append material implementation and release milestones here. This log does not co
 
 - Released and publicly verified Android, static frontend, proxy backend, and valuation-grid backend `1.0.141 (143)`. JD grid imports now retain the complete JD account scope when a review selects only some funds, accept explicit empty account snapshots without touching manual positions, and never fabricate an acquisition date from a profit date or import day. JD sales use canonical sell records and the grid budget follows the server budget contract. Public `/api/app/version` reports `available=true` with `minimumVersion=1.0.136` and `fund-app-1.0.141-143.apk`; the independently downloaded `6,848,036`-byte APK matches the local artifact and release metadata SHA-256 `509028c7d1e5ce12d170dea6a98be9a58e35d3f146be042763e7807b2fc4d769`. Public grid, proxy, and grid-backend health checks pass. Rollbacks: `/opt/fund-app.previous-20260808T145016`, `/opt/fund-proxy/.grid-jd-backup-20260808T145016`, and `/opt/valuation-grid/.jd-import-backup-20260808T145016`.
 
+## 2026-08-10
+
+- Low-frequency grid keeps the existing Vue layout and JD batch import, but now consumes the source-grid `fifo_sell_plan` contract. Each sell signal renders the authoritative total, affected batches, passthrough warning, estimated fees, and net profit; the separate `执行卖出(份额)` action opens the FIFO sell flow with an idempotent request id, while `录入卖出` remains the manual entry path. The duplicate single-batch summary is hidden when a complete FIFO plan is available. `vue-tsc`, Vite build, 36 valuation-grid Python tests, and browser DOM verification passed; no release or remote write was performed.
+
 ## 2026-08-07
 
 - Released and publicly verified Android, static frontend, proxy backend, and valuation-grid backend `1.0.140 (142)`. JD Cookie holdings reads now use two-way detail concurrency, bounded per-fund retries, deterministic WebView Cookie seeding, explicit auth-versus-throttling/service error classification, monotonic progress, and incomplete-snapshot protection that preserves existing holdings. Public `/api/app/version` reports `available=true` with `minimumVersion=1.0.136` and `fund-app-1.0.140-142.apk`; the independently downloaded `6,848,271`-byte APK matches the local artifact and release metadata SHA-256 `672cb073b392ac3dc8cf37e0b2331c88527c2e97b75f750c545ee01c15d1ab04`. Public frontend hashes match the local production build, and proxy/grid health checks pass. Rollbacks: `/opt/fund-app.previous-20260807T144432`, `/opt/fund-proxy/.grid-jd-backup-20260807T144432`, and `/opt/valuation-grid/.jd-import-backup-20260807T144432`.
@@ -416,6 +420,11 @@ Append material implementation and release milestones here. This log does not co
 - Removed the frontend's 45-second JD grid-import abort at user request. The import request now remains active until the native reader and grid transaction complete or return their own error.
 - Remote verification with the dedicated ED25519 key: `valuation-grid-upstream.timer` is enabled and active; `valuation-grid` stayed active and `/health` returned `{"status":"ok"}`. The installed confidence file is 3,956,455 bytes with SHA-256 `145f74e3325906987f818310f16768900a2a23bf337a3950134174b1122a3b38`, matching the GitHub API raw response. The successful service log states that only the confidence file was updated and the grid was not restarted.
 - Built and installed local debug Android `1.0.94 (95)` onto device `95e24ed`, preserving app data. `npx cap sync android`, Gradle assembly, and v1/v2 signature checks passed. The APK is 6,953,343 bytes with SHA-256 `0aad22558b4abf6a8c4f155b25ab0a0dcffd99d1b351d67824aecbc4cb2c4311`; a cold launch confirmed the installed package and version.
+
+## 2026-08-11 - Valuation-grid full upstream merge
+
+- Replaced the confidence-only rule with a guarded three-way merge of all upstream source and runtime JSON files. `data/positions.json` is explicitly retained from production; it is the live portfolio ledger and must never be imported from the source repository.
+- When the same source line changed on both sides, the upstream version is selected for that overlapping hunk while Git preserves non-overlapping production changes. The candidate is JSON-validated, compiled, imported as the service account, applied with rollback files, then checked through `/health` before the upstream base advances.
 
 ## 2026-07-26 - Grid historical NAV fallback and real trade-date repair
 
